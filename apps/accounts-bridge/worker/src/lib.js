@@ -200,6 +200,44 @@ export function assertIdentifier(name, value, { maxLen = 64 } = {}) {
   return trimmed;
 }
 
+// account_uid is the primary identity of an account and MUST be a real numeric platform UID:
+// digits only, 5–32 chars. This is stricter than assertIdentifier (which allows any printable token)
+// because the account identity is what every role/binding/session/archive is scoped to.
+export function assertAccountUid(value, name = 'account_uid') {
+  if (typeof value !== 'string') throw badRequest(`${name} must be a string`, 'bad_account_uid');
+  const trimmed = value.trim();
+  if (!/^[0-9]{5,32}$/.test(trimmed)) {
+    throw badRequest(`${name} must be 5–32 digits (numeric UID only)`, 'bad_account_uid');
+  }
+  return trimmed;
+}
+
+// Secret-shaped KEY names that may NEVER appear in an account create/update body. Account metadata is
+// operator-facing, non-secret labels ONLY (notes/tags/page_label/role/status/preferred agent). Raw
+// cookies, tokens, passwords, datr, fb_dtsg, localStorage, profile archives, or any session secret
+// belong on the dedicated sealed routes — not in CRUD. Reject the whole request (400) if one appears.
+const ACCOUNT_SECRET_FIELD_RE =
+  /password|token|cookie|secret|datr|fb_dtsg|dtsg|localstorage|local_storage|session|proxy_password|access_token|c_user|\botp\b|totp|2fa|encrypted_blob/i;
+
+// Walk every (possibly nested) key of an account CRUD body and refuse any secret-shaped field name.
+// Returns the body on success. Throws HttpError(400, 'secret_field_rejected') with the offending path
+// (the value is never echoed) so the caller can audit the rejection.
+export function assertNoSecretAccountFields(body, field = 'account') {
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return body;
+  const walk = (node, prefix) => {
+    if (!node || typeof node !== 'object') return;
+    for (const [key, nested] of Object.entries(node)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (ACCOUNT_SECRET_FIELD_RE.test(key)) {
+        throw new HttpError(`Secret-shaped ${field} field rejected: ${path}`, 400, 'secret_field_rejected');
+      }
+      walk(nested, path);
+    }
+  };
+  walk(body, '');
+  return body;
+}
+
 export function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,

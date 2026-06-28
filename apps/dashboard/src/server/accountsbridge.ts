@@ -45,7 +45,14 @@ function stripSecrets(value: unknown): unknown {
 export function resolveUpstreamPath(method: string, sub: string): string | null {
   const m = method.toUpperCase()
   if (m === 'GET' && sub === '/health') return '/health'
+  // Accounts CRUD — the real Cloud Account Manager surface. All token-free / non-secret metadata only;
+  // the blob-bearing session/cookie/profile-archive routes remain deliberately unmapped.
   if (m === 'GET' && sub === '/accounts') return '/v1/accounts'
+  if (m === 'POST' && sub === '/accounts') return '/v1/accounts'
+  const account = sub.match(/^\/accounts\/([a-z]+)\/([^/]+)$/)
+  if (account && (m === 'GET' || m === 'PATCH' || m === 'DELETE')) {
+    return `/v1/accounts/${account[1]}/${account[2]}`
+  }
   if (m === 'GET' && sub === '/roles/facebook') return '/v1/roles/facebook'
   if (m === 'GET' && sub === '/agents') return '/v1/agents'
   const agentStatus = sub.match(/^\/agents\/([^/]+)\/status$/)
@@ -78,7 +85,7 @@ async function handleAccountsBridgeProxy(request: Request, env: AuthEnv): Promis
 
   const target = new URL(baseUrl + upstreamPath)
   // Forward only the safe query params we expect on the allowlisted GETs.
-  for (const key of ['agent_id', 'status', 'limit', 'platform']) {
+  for (const key of ['agent_id', 'status', 'limit', 'platform', 'include_archived']) {
     const v = url.searchParams.get(key)
     if (v != null) target.searchParams.set(key, v)
   }

@@ -23,6 +23,8 @@ import {
   assertPlatform,
   assertRole,
   assertIdentifier,
+  assertAccountUid,
+  assertNoSecretAccountFields,
   assertNoSecretMaterial,
   timingSafeEqualStr,
   json,
@@ -73,6 +75,85 @@ function assertSafeDetail(detail) {
   return detail;
 }
 
+// --- account metadata validation (non-secret operator fields only) ---------------------------------
+const ACCOUNT_ROLE_MAX = 40;
+// Statuses the API accepts on input. 'disabled' is a UI synonym for the stored 'inactive' (the DB
+// CHECK only knows active/inactive/archived — we map rather than widen the enum / rebuild the table).
+const ACCOUNT_STATUSES_IN = ['active', 'inactive', 'disabled', 'archived'];
+
+// Optional free-text metadata field: null/'' -> null, else trimmed, length-capped, control-char-free.
+function optAccountText(name, value, { maxLen, allowNewlines = false } = {}) {
+  if (value == null) return null;
+  if (typeof value !== 'string') throw badRequest(`${name} must be a string`, 'bad_field');
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  if (trimmed.length > maxLen) throw badRequest(`${name} is too long (max ${maxLen})`, 'bad_field');
+  const ctrl = allowNewlines ? /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/ : /[\x00-\x1f\x7f]/;
+  if (ctrl.test(trimmed)) throw badRequest(`${name} has invalid characters`, 'bad_field');
+  return trimmed;
+}
+
+// Normalize an input status to a stored status. Returns undefined when not provided (so PATCH can tell
+// "leave unchanged" from an explicit value); maps the UI's 'disabled' onto the stored 'inactive'.
+function normalizeAccountStatus(value) {
+  if (value == null || value === '') return undefined;
+  if (typeof value !== 'string') throw badRequest('status must be a string', 'bad_status');
+  const v = value.trim().toLowerCase();
+  if (!ACCOUNT_STATUSES_IN.includes(v)) {
+    throw badRequest(`status must be one of ${ACCOUNT_STATUSES_IN.join(', ')}`, 'bad_status');
+  }
+  return v === 'disabled' ? 'inactive' : v;
+}
+
+// Validate the tags input shape (string[] or comma/newline-separated string). The store does the
+// trim/dedupe/cap; here we only reject a wrong TYPE. Returns undefined when the key is absent.
+function validateTagsInput(value) {
+  if (value === undefined) return undefined;
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    for (const t of value) if (typeof t !== 'string') throw badRequest('tags must be strings', 'bad_tags');
+    return value;
+  }
+  if (typeof value === 'string') return value;
+  throw badRequest('tags must be a string or string array', 'bad_tags');
+}
+
+function readAccountRole(value) {
+  if (value == null || value === '') return null;
+  return assertIdentifier('account_role', value, { maxLen: ACCOUNT_ROLE_MAX });
+}
+function readPreferredAgentId(value) {
+  if (value == null || value === '') return null;
+  return assertIdentifier('preferred_agent_id', value, { maxLen: 120 });
+}
+
+// Build the metadata set for a create. All fields optional; identity (uid/platform) handled by caller.
+function readAccountMetadataForCreate(body) {
+  return {
+    display_label: optAccountText('display_label', body.display_label, { maxLen: 120 }),
+    notes: optAccountText('notes', body.notes, { maxLen: 500, allowNewlines: true }),
+    tags: validateTagsInput(body.tags) ?? null,
+    page_label: optAccountText('page_label', body.page_label, { maxLen: 120 }),
+    account_role: readAccountRole(body.account_role),
+    preferred_agent_id: readPreferredAgentId(body.preferred_agent_id)
+  };
+}
+
+// Build a sparse patch for an update: only keys actually present in the body are included, so a PATCH
+// never clobbers an unmentioned field. Identity columns (account_uid/platform) are immutable here.
+function readAccountMetadataForPatch(body) {
+  const patch = {};
+  if ('display_label' in body) patch.display_label = optAccountText('display_label', body.display_label, { maxLen: 120 });
+  if ('notes' in body) patch.notes = optAccountText('notes', body.notes, { maxLen: 500, allowNewlines: true });
+  if ('tags' in body) patch.tags = validateTagsInput(body.tags) ?? null;
+  if ('page_label' in body) patch.page_label = optAccountText('page_label', body.page_label, { maxLen: 120 });
+  if ('account_role' in body) patch.account_role = readAccountRole(body.account_role);
+  if ('preferred_agent_id' in body) patch.preferred_agent_id = readPreferredAgentId(body.preferred_agent_id);
+  const status = normalizeAccountStatus(body.status);
+  if (status !== undefined) patch.status = status;
+  return patch;
+}
+
 // Pull platform from query (?platform=) defaulting to facebook for the role/binding endpoints.
 function platformFromQuery(url, fallback = 'facebook') {
   const raw = url.searchParams.get('platform');
@@ -109,24 +190,71 @@ export async function handleRequest(request, env, deps = {}) {
       return json({ ok: true, ...result });
     }
 
-    // --- accounts ---
+    // --- accounts (real Cloud Account Manager CRUD; non-secret metadata only) ---
     if (path === '/v1/accounts' && method === 'GET') {
       const platform = url.searchParams.get('platform');
       if (platform) assertPlatform(platform);
-      return json({ accounts: await store.listAccounts(platform || undefined) });
+      const includeArchived = ['1', 'true', 'yes'].includes(String(url.searchParams.get('include_archived') || '').toLowerCase());
+      return json({ accounts: await store.listAccounts(platform || undefined, { includeArchived }) });
     }
     if (path === '/v1/accounts' && method === 'POST') {
       const body = await readJson(request);
+      // Refuse a secret-shaped field BEFORE creating anything, and audit the rejection.
+      try {
+        assertNoSecretAccountFields(body);
+      } catch (err) {
+        if (err instanceof HttpError && err.code === 'secret_field_rejected') {
+          await store.insertAudit({ event_type: 'account.rejected_secret_field', source: 'api' });
+        }
+        throw err;
+      }
       const platform = assertPlatform(body.platform);
-      const accountUid = assertIdentifier('account_uid', body.account_uid);
-      const displayLabel = body.display_label == null ? null : assertIdentifier('display_label', body.display_label, { maxLen: 120 });
-      const { account, created } = await store.createAccount({
-        account_uid: accountUid,
-        platform,
-        display_label: displayLabel
-      });
+      const accountUid = assertAccountUid(body.account_uid);
+      const status = normalizeAccountStatus(body.status) ?? 'active';
+      const meta = readAccountMetadataForCreate(body);
+      const { account, created } = await store.createAccount({ account_uid: accountUid, platform, status, ...meta });
       await store.insertAudit({ event_type: created ? 'account.created' : 'account.exists', account_uid: accountUid, platform, source: 'api' });
       return json({ account, created }, created ? 201 : 200);
+    }
+
+    // Single account: read / update mutable metadata / soft-archive.
+    const accountMatch = path.match(/^\/v1\/accounts\/([a-z]+)\/([^/]+)$/);
+    if (accountMatch) {
+      const platform = assertPlatform(accountMatch[1]);
+      const accountUid = assertAccountUid(decodeURIComponent(accountMatch[2]));
+      if (method === 'GET') {
+        const account = await store.publicAccount(platform, accountUid);
+        if (!account) return json({ ok: false, error: 'account_not_found' }, 404);
+        return json({ account });
+      }
+      if (method === 'PATCH') {
+        const body = await readJson(request);
+        try {
+          assertNoSecretAccountFields(body);
+        } catch (err) {
+          if (err instanceof HttpError && err.code === 'secret_field_rejected') {
+            await store.insertAudit({ event_type: 'account.rejected_secret_field', account_uid: accountUid, platform, source: 'api' });
+          }
+          throw err;
+        }
+        const patch = readAccountMetadataForPatch(body);
+        const account = await store.updateAccount(platform, accountUid, patch);
+        if (!account) return json({ ok: false, error: 'account_not_found' }, 404);
+        await store.insertAudit({
+          event_type: account.status === 'archived' ? 'account.archived' : 'account.updated',
+          account_uid: accountUid,
+          platform,
+          source: 'api'
+        });
+        return json({ account });
+      }
+      if (method === 'DELETE') {
+        // Soft archive by default — never deletes the account row or any profile/session/cookie bytes.
+        const account = await store.archiveAccount(platform, accountUid);
+        if (!account) return json({ ok: false, error: 'account_not_found' }, 404);
+        await store.insertAudit({ event_type: 'account.archived', account_uid: accountUid, platform, source: 'api' });
+        return json({ account, archived: true });
+      }
     }
 
     // --- facebook role mapping ---

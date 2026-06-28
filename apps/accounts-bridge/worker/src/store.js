@@ -22,6 +22,57 @@ function parseJsonColumn(value) {
   }
 }
 
+// Parse the stored tags column (a JSON array string) back to a clean string[] (never throws).
+function parseTags(value) {
+  if (value == null || value === '') return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((t) => typeof t === 'string' && t.trim() !== '').map((t) => t.trim());
+  } catch {
+    return [];
+  }
+}
+
+// Normalize caller tags input (string[] or comma/space-separated string) to a JSON array string for
+// storage, or null when empty. Each tag is trimmed, deduped, length-capped — non-secret labels only.
+function normalizeTagsToJson(input) {
+  let list = [];
+  if (Array.isArray(input)) list = input;
+  else if (typeof input === 'string') list = input.split(/[,\n]/);
+  else if (input == null) return null;
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const t = raw.trim().slice(0, 40);
+    if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    out.push(t);
+    if (out.length >= 12) break;
+  }
+  return out.length ? JSON.stringify(out) : null;
+}
+
+// Public (non-secret) shape of an accounts row. Metadata columns are operator labels only.
+function publicAccountRow(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    account_uid: r.account_uid,
+    platform: r.platform,
+    display_label: r.display_label ?? null,
+    notes: r.notes ?? null,
+    tags: parseTags(r.tags),
+    page_label: r.page_label ?? null,
+    account_role: r.account_role ?? null,
+    preferred_agent_id: r.preferred_agent_id ?? null,
+    status: r.status,
+    created_at: r.created_at,
+    updated_at: r.updated_at
+  };
+}
+
 // Public (non-secret) shape of an agent_commands row. payload/result are already non-secret JSON
 // (the API rejects secret-shaped keys/values before insert); error_message was sanitized on write.
 function publicCommand(row) {
@@ -159,20 +210,17 @@ export class AccountsStore {
   }
 
   // --- accounts ----------------------------------------------------------
-  async listAccounts(platform) {
-    const stmt = platform
-      ? this.db.prepare('SELECT * FROM accounts WHERE platform = ? ORDER BY created_at').bind(platform)
-      : this.db.prepare('SELECT * FROM accounts ORDER BY created_at');
-    const { results } = await stmt.all();
-    return results.map((r) => ({
-      id: r.id,
-      account_uid: r.account_uid,
-      platform: r.platform,
-      display_label: r.display_label ?? null,
-      status: r.status,
-      created_at: r.created_at,
-      updated_at: r.updated_at
-    }));
+  // List accounts (optionally a single platform). Archived rows are hidden unless includeArchived.
+  async listAccounts(platform, { includeArchived = false } = {}) {
+    const where = [];
+    const args = [];
+    if (platform) { where.push('platform = ?'); args.push(platform); }
+    if (!includeArchived) where.push("status != 'archived'");
+    let sql = 'SELECT * FROM accounts';
+    if (where.length) sql += ' WHERE ' + where.join(' AND ');
+    sql += ' ORDER BY created_at';
+    const { results } = await this.db.prepare(sql).bind(...args).all();
+    return results.map((r) => publicAccountRow(r));
   }
 
   async getAccount(platform, accountUid) {
@@ -182,7 +230,17 @@ export class AccountsStore {
       .first();
   }
 
-  async createAccount({ account_uid, platform, display_label = null, status = 'active' }) {
+  async createAccount({
+    account_uid,
+    platform,
+    display_label = null,
+    notes = null,
+    tags = null,
+    page_label = null,
+    account_role = null,
+    preferred_agent_id = null,
+    status = 'active'
+  }) {
     const existing = await this.getAccount(platform, account_uid);
     if (existing) {
       return { account: await this.publicAccount(platform, account_uid), created: false };
@@ -190,25 +248,72 @@ export class AccountsStore {
     const now = this.ts();
     await this.db
       .prepare(
-        'INSERT INTO accounts (id, account_uid, platform, display_label, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO accounts (id, account_uid, platform, display_label, notes, tags, page_label, account_role, preferred_agent_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
       )
-      .bind(newId('acc'), account_uid, platform, display_label, status, now, now)
+      .bind(
+        newId('acc'),
+        account_uid,
+        platform,
+        display_label,
+        notes,
+        normalizeTagsToJson(tags),
+        page_label,
+        account_role,
+        preferred_agent_id,
+        status,
+        now,
+        now
+      )
       .run();
     return { account: await this.publicAccount(platform, account_uid), created: true };
   }
 
+  // Update mutable, NON-SECRET metadata/status on an existing account. Only whitelisted fields in
+  // `patch` are touched; account_uid/platform (the identity) are immutable here. Returns the updated
+  // public account, or null when the account does not exist.
+  async updateAccount(platform, accountUid, patch = {}) {
+    const existing = await this.getAccount(platform, accountUid);
+    if (!existing) return null;
+    const sets = [];
+    const args = [];
+    const setCol = (col, val) => { sets.push(`${col} = ?`); args.push(val); };
+    if ('display_label' in patch) setCol('display_label', patch.display_label ?? null);
+    if ('notes' in patch) setCol('notes', patch.notes ?? null);
+    if ('tags' in patch) setCol('tags', normalizeTagsToJson(patch.tags));
+    if ('page_label' in patch) setCol('page_label', patch.page_label ?? null);
+    if ('account_role' in patch) setCol('account_role', patch.account_role ?? null);
+    if ('preferred_agent_id' in patch) setCol('preferred_agent_id', patch.preferred_agent_id ?? null);
+    if ('status' in patch && patch.status != null) setCol('status', patch.status);
+    if (sets.length === 0) {
+      // Nothing to change — still return the current shape (idempotent no-op PATCH).
+      return this.publicAccount(platform, accountUid);
+    }
+    const now = this.ts();
+    setCol('updated_at', now);
+    args.push(platform, accountUid);
+    await this.db
+      .prepare(`UPDATE accounts SET ${sets.join(', ')} WHERE platform = ? AND account_uid = ?`)
+      .bind(...args)
+      .run();
+    return this.publicAccount(platform, accountUid);
+  }
+
+  // Soft-archive an account: status='archived'. NEVER deletes the row or any profile/session/cookie/
+  // archive bytes — those sealed records keep their own lifecycle. Returns the archived public account
+  // or null when the account does not exist.
+  async archiveAccount(platform, accountUid) {
+    const existing = await this.getAccount(platform, accountUid);
+    if (!existing) return null;
+    const now = this.ts();
+    await this.db
+      .prepare("UPDATE accounts SET status = 'archived', updated_at = ? WHERE platform = ? AND account_uid = ?")
+      .bind(now, platform, accountUid)
+      .run();
+    return this.publicAccount(platform, accountUid);
+  }
+
   async publicAccount(platform, accountUid) {
-    const r = await this.getAccount(platform, accountUid);
-    if (!r) return null;
-    return {
-      id: r.id,
-      account_uid: r.account_uid,
-      platform: r.platform,
-      display_label: r.display_label ?? null,
-      status: r.status,
-      created_at: r.created_at,
-      updated_at: r.updated_at
-    };
+    return publicAccountRow(await this.getAccount(platform, accountUid));
   }
 
   // --- roles -------------------------------------------------------------

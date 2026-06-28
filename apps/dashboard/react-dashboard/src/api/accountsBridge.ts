@@ -122,9 +122,34 @@ export interface CloudAccount {
   account_uid: string
   platform: string
   display_label: string | null
+  // Non-secret operator metadata (never cookies/tokens/passwords/datr/fb_dtsg/sessions).
+  notes: string | null
+  tags: string[]
+  page_label: string | null
+  account_role: string | null
+  preferred_agent_id: string | null
   status: string
   created_at?: string
   updated_at?: string
+}
+
+// Input shape for create/update. Identity (account_uid/platform) is only set on create.
+export interface CloudAccountInput {
+  account_uid?: string
+  platform?: string
+  display_label?: string | null
+  notes?: string | null
+  tags?: string[] | string | null
+  page_label?: string | null
+  account_role?: string | null
+  preferred_agent_id?: string | null
+  status?: string | null
+}
+
+// account_uid is a numeric platform UID (5–32 digits). The server is the source of truth, but we
+// validate client-side too so the form can give immediate Thai feedback before any round-trip.
+export function isValidAccountUid(uid: string): boolean {
+  return /^[0-9]{5,32}$/.test(uid.trim())
 }
 
 export type AgentStatus = 'online' | 'idle' | 'busy' | 'error' | 'offline'
@@ -160,9 +185,47 @@ export function fetchCloudHealth(signal?: AbortSignal): Promise<CloudHealth> {
   return bridgeFetch<CloudHealth>('/health', { signal })
 }
 
-export async function fetchCloudAccounts(signal?: AbortSignal): Promise<CloudAccount[]> {
-  const data = await bridgeFetch<{ accounts?: CloudAccount[] }>('/accounts', { searchParams: { platform: 'facebook' }, signal })
+export async function fetchCloudAccounts(signal?: AbortSignal, includeArchived = false): Promise<CloudAccount[]> {
+  const searchParams: Record<string, string> = { platform: 'facebook' }
+  if (includeArchived) searchParams.include_archived = '1'
+  const data = await bridgeFetch<{ accounts?: CloudAccount[] }>('/accounts', { searchParams, signal })
   return data.accounts ?? []
+}
+
+// Create a new cloud account (non-secret metadata only). The dashboard proxy injects the API key
+// server-side; this never holds it. Returns the created (or pre-existing) public account.
+export async function createCloudAccount(input: CloudAccountInput): Promise<{ account: CloudAccount; created: boolean }> {
+  const body: CloudAccountInput = { platform: 'facebook', ...input }
+  const data = await bridgeFetch<{ account: CloudAccount; created: boolean }>('/accounts', {
+    method: 'POST',
+    body,
+    timeoutMs: 15000,
+  })
+  return data
+}
+
+// Update mutable metadata/status on an existing account. account_uid/platform are immutable identity.
+export async function updateCloudAccount(
+  platform: string,
+  accountUid: string,
+  patch: CloudAccountInput,
+): Promise<CloudAccount> {
+  const data = await bridgeFetch<{ account: CloudAccount }>(`/accounts/${platform}/${accountUid}`, {
+    method: 'PATCH',
+    body: patch,
+    timeoutMs: 15000,
+  })
+  return data.account
+}
+
+// Soft-archive an account (status='archived'). NEVER deletes the account or any sealed session/cookie/
+// profile archive — those keep their own lifecycle. Returns the archived public account.
+export async function archiveCloudAccount(platform: string, accountUid: string): Promise<CloudAccount> {
+  const data = await bridgeFetch<{ account: CloudAccount; archived: boolean }>(`/accounts/${platform}/${accountUid}`, {
+    method: 'DELETE',
+    timeoutMs: 15000,
+  })
+  return data.account
 }
 
 export async function fetchCloudAgents(signal?: AbortSignal): Promise<CloudAgent[]> {

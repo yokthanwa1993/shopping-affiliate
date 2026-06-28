@@ -33,9 +33,9 @@ test('every /v1 endpoint rejects a missing or wrong API key with 401', async () 
     ['GET', '/v1/sessions/status?account_uid=x&role=ads_power_editor'],
     ['POST', '/v1/cookies'],
     ['POST', '/v1/audit/events'],
-    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/status'],
-    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/download'],
-    ['POST', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/upload?version=v1&source=local']
+    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/100000000000001/status'],
+    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/100000000000001/download'],
+    ['POST', '/v1/profile-archives/facebook/page_posting_facebook_lite/100000000000001/upload?version=v1&source=local']
   ];
   for (const [method, p] of probes) {
     const missing = await handleRequest(req(method, p), env);
@@ -82,17 +82,17 @@ test('no GET response over a populated DB ever contains the ciphertext or the en
   const post = (p, body) => handleRequest(req('POST', p, { key: KEY, body }), env);
   const put = (p, body) => handleRequest(req('PUT', p, { key: KEY, body }), env);
 
-  await post('/v1/accounts', { account_uid: 'uidPost', platform: 'facebook' });
-  await put('/v1/roles/facebook', { roles: { page_posting_facebook_lite: 'uidPost' } });
-  await put('/v1/pages/777/binding', { account_uid: 'uidPost', role: 'page_posting_facebook_lite' });
-  await post('/v1/sessions', { account_uid: 'uidPost', platform: 'facebook', role: 'page_posting_facebook_lite', version: 'v1', source: 's', encrypted_blob: CIPHER });
-  await post('/v1/cookies', { account_uid: 'uidPost', platform: 'facebook', version: 'v1', source: 's', encrypted_blob: CIPHER });
+  await post('/v1/accounts', { account_uid: '100000000000001', platform: 'facebook' });
+  await put('/v1/roles/facebook', { roles: { page_posting_facebook_lite: '100000000000001' } });
+  await put('/v1/pages/777/binding', { account_uid: '100000000000001', role: 'page_posting_facebook_lite' });
+  await post('/v1/sessions', { account_uid: '100000000000001', platform: 'facebook', role: 'page_posting_facebook_lite', version: 'v1', source: 's', encrypted_blob: CIPHER });
+  await post('/v1/cookies', { account_uid: '100000000000001', platform: 'facebook', version: 'v1', source: 's', encrypted_blob: CIPHER });
 
   const gets = [
     '/v1/accounts',
     '/v1/roles/facebook',
     '/v1/pages/777/binding',
-    '/v1/sessions/status?account_uid=uidPost&role=page_posting_facebook_lite&platform=facebook'
+    '/v1/sessions/status?account_uid=100000000000001&role=page_posting_facebook_lite&platform=facebook'
   ];
   for (const p of gets) {
     const res = await handleRequest(req('GET', p, { key: KEY }), env);

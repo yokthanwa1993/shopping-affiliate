@@ -15,7 +15,7 @@ function sealedEnvelope(seed = 7) {
   return new Uint8Array([...magic, ...payload]);
 }
 
-const ARCHIVE_PATH = '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost';
+const ARCHIVE_PATH = '/v1/profile-archives/facebook/page_posting_facebook_lite/100000000000001';
 
 async function call(env, method, path, { body, key, raw } = {}) {
   const headers = {};
@@ -43,8 +43,8 @@ async function asJson(res) {
 async function seedOwner(env) {
   const post = (p, b) => handleRequest(new Request('https://bridge.local' + p, { method: 'POST', headers: { 'x-accounts-bridge-key': env.ACCOUNTS_BRIDGE_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify(b) }), env);
   const put = (p, b) => handleRequest(new Request('https://bridge.local' + p, { method: 'PUT', headers: { 'x-accounts-bridge-key': env.ACCOUNTS_BRIDGE_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify(b) }), env);
-  await post('/v1/accounts', { account_uid: 'uidPost', platform: 'facebook' });
-  await put('/v1/roles/facebook', { roles: { page_posting_facebook_lite: 'uidPost' } });
+  await post('/v1/accounts', { account_uid: '100000000000001', platform: 'facebook' });
+  await put('/v1/roles/facebook', { roles: { page_posting_facebook_lite: '100000000000001' } });
 }
 
 test('status is absent before any upload', async () => {
@@ -136,7 +136,7 @@ test('upload rejects bytes missing the ABENC1 envelope header', async () => {
 test('upload for an account that does not hold the role is refused 409', async () => {
   const env = makeEnv();
   // Account exists but holds no role.
-  await handleRequest(new Request('https://bridge.local/v1/accounts', { method: 'POST', headers: { 'x-accounts-bridge-key': env.ACCOUNTS_BRIDGE_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify({ account_uid: 'uidPost', platform: 'facebook' }) }), env);
+  await handleRequest(new Request('https://bridge.local/v1/accounts', { method: 'POST', headers: { 'x-accounts-bridge-key': env.ACCOUNTS_BRIDGE_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify({ account_uid: '100000000000001', platform: 'facebook' }) }), env);
   const { status, json } = await asJson(await call(env, 'POST', ARCHIVE_PATH + '/upload?version=v1&source=local', { raw: sealedEnvelope() }));
   assert.equal(status, 409);
   assert.equal(json.error, 'role_mismatch');

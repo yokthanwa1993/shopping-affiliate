@@ -50,10 +50,10 @@ test('every new agent/command endpoint rejects a missing or wrong API key with 4
 test('enqueue -> poll(claim) -> complete lifecycle works and is non-secret end to end', async () => {
   const env = makeEnv();
   // Seed the targeted account so open_profile is a believable command (not strictly required).
-  await call(env, 'POST', '/v1/accounts', { body: { account_uid: 'uidPost', platform: 'facebook', display_label: 'Chanalai' } });
+  await call(env, 'POST', '/v1/accounts', { body: { account_uid: '100000000000001', platform: 'facebook', display_label: 'Chanalai' } });
 
   const enq = await call(env, 'POST', '/v1/commands', {
-    body: { agent_id: AGENT, action: 'open_profile', platform: 'facebook', account_uid: 'uidPost', payload: { visible: true, note: 'operator open' } }
+    body: { agent_id: AGENT, action: 'open_profile', platform: 'facebook', account_uid: '100000000000001', payload: { visible: true, note: 'operator open' } }
   });
   assert.equal(enq.status, 201);
   assert.equal(enq.json.command.status, 'queued');
@@ -143,7 +143,7 @@ test('complete result with a secret-shaped key is refused', async () => {
 
 test('a sanitized error message + code survives, but a token-shaped message is redacted', async () => {
   const env = makeEnv();
-  const enq = await call(env, 'POST', '/v1/commands', { body: { agent_id: AGENT, action: 'open_profile', account_uid: 'uidPost' } });
+  const enq = await call(env, 'POST', '/v1/commands', { body: { agent_id: AGENT, action: 'open_profile', account_uid: '100000000000001' } });
   await call(env, 'POST', `/v1/agents/${AGENT}/poll`);
   const res = await call(env, 'POST', `/v1/commands/${enq.json.command.id}/complete`, {
     body: { status: 'failed', error_code: 'profile_already_open', error_message: 'leaked EAAB0123456789abcdef in window' }
