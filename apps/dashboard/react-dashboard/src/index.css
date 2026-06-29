@@ -70,6 +70,21 @@
     height: 100%;
   }
 
+  /* Lock the document/window so only the dashboard's own main scroll container
+     scrolls. Without this, dragging the scrollbar to the very bottom lets the
+     body rubber-band/overscroll and the fixed AppShell header appears to bounce.
+     overscroll-behavior:none kills the rubber-band; overflow:hidden pins the
+     window so the 56px header stays put. */
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  #root {
+    overflow: hidden;
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
   }

@@ -713,3 +713,77 @@ export function isBridgeAutoSyncAllowed(lastAttemptMs: number | undefined, nowMs
     if (!(ttlMs > 0)) return true
     return (nowMs - last) >= ttlMs
 }
+
+// ---- Posting auth-failure circuit breaker (anti-automation cooldown) -------
+// A stored/Facebook Lite page whose token is invalidated will fail to publish on every cron pass
+// (every ~30 min). Each failure currently re-mints a fresh token (a Facebook LOGIN) through
+// BrowserSaving / the bridge / auto-sync. Re-logging-in on every pass is precisely what trips
+// Facebook's "automated behavior" / checkpoint detection and can lock the account. These pure
+// predicates back a per-page circuit breaker: once a token recovery fails after actually reaching
+// Facebook, stop attempting re-mints for a cooldown window (longer for a checkpoint/automation
+// signal than for a plain auth/190 failure) and return a sanitized reason. Token-free throughout.
+
+// A Facebook error string that signals a checkpoint / automated-behavior / rate-limit block — NOT a
+// simple invalidated token. These mean Facebook has flagged the account, so re-minting must back off
+// HARD (a much longer cooldown) instead of retrying soon. Operates only on already-sanitized/redacted
+// error strings the worker stores — never a raw token/cookie.
+export function isFacebookCheckpointOrAutomationFailure(error: unknown): boolean {
+    const msg = String(error ?? '').toLowerCase()
+    if (!msg) return false
+    return (
+        msg.includes('checkpoint') ||
+        msg.includes('automated behavior') ||
+        msg.includes('automated behaviour') ||
+        msg.includes('unusual activity') ||
+        msg.includes('temporarily blocked') ||
+        msg.includes('temporarily locked') ||
+        msg.includes('confirm your identity') ||
+        msg.includes('confirm that you') ||
+        msg.includes('verify your identity') ||
+        msg.includes('we limit how often') ||
+        msg.includes('try again later') ||
+        msg.includes('account has been locked') ||
+        msg.includes('account has been disabled') ||
+        msg.includes('login_rate_limit') ||
+        /\(#368\)/.test(msg) || // Graph (#368) blocked for abusive behavior
+        /(^|[^0-9])(?:code["']?\s*[:=]\s*)368(\D|$)/.test(msg)
+    )
+}
+
+// Reasons that mean the recovery NEVER actually reached Facebook (config / transport / throttle).
+// Arming a cooldown for these would needlessly block recovery WITHOUT having hammered Facebook, so
+// the breaker must ignore them. Everything else (an auth/checkpoint rejection from a real mint
+// attempt) arms the cooldown.
+const NON_FACEBOOK_CONTACT_COOLDOWN_REASONS = [
+    'bridge_not_configured',
+    'sync_secret_missing',
+    'invalid_namespace',
+    'bridge_auto_sync_unreachable',
+    'auto_sync_throttled',
+    'auth_failure_cooldown',
+]
+
+export function shouldArmPostingAuthCooldown(reason: unknown): boolean {
+    const r = String(reason ?? '').trim().toLowerCase()
+    if (!r) return true
+    return !NON_FACEBOOK_CONTACT_COOLDOWN_REASONS.some((x) => r.includes(x))
+}
+
+// Pick the cooldown window length: a checkpoint/automation signal earns the longer window; a plain
+// auth/190 failure earns the shorter one. The checkpoint window is never shorter than the auth one.
+export function resolvePostingAuthCooldownMs(params: {
+    checkpoint: boolean
+    authCooldownMs: number
+    checkpointCooldownMs: number
+}): number {
+    const auth = Number(params.authCooldownMs) > 0 ? Number(params.authCooldownMs) : 0
+    const checkpoint = Number(params.checkpointCooldownMs) > 0 ? Number(params.checkpointCooldownMs) : 0
+    return params.checkpoint ? Math.max(checkpoint, auth) : auth
+}
+
+// Is the breaker still open at `nowMs`? `untilMs` is the timestamp the cooldown expires (0/undefined
+// = breaker closed / never armed). A non-positive `untilMs` disables the breaker.
+export function isPostingAuthCooldownActive(untilMs: number | undefined, nowMs: number): boolean {
+    const until = Number(untilMs || 0)
+    return until > 0 && nowMs < until
+}

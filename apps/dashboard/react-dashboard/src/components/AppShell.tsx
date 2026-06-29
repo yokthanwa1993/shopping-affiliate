@@ -216,8 +216,11 @@ function AppShellLayout({
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-[#f5f5f5]">
       {/* Full-width 56px Shopee-style header: white, thin border, brand pinned
-          to the 200px sidebar column on the left so it aligns with the nav. */}
-      <header className="flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
+          to the 200px sidebar column on the left so it aligns with the nav.
+          `shrink-0` inside this `overflow-hidden` flex column keeps it locked at
+          the top — combined with the window scroll-lock in index.css it never
+          shifts/bounces when the main content is scrolled to the bottom. */}
+      <header className="z-20 flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
         <div className="hidden w-[200px] shrink-0 items-center gap-2 md:flex">
           <div className="flex h-8 w-8 items-center justify-center rounded-[2px] bg-[#ee4d2d] text-sm font-bold text-white">
             P
@@ -283,7 +286,9 @@ function AppShellLayout({
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-y-auto bg-[#f5f5f5] p-6">{children}</main>
+        {/* The ONLY scroll container. `overscroll-contain` stops a bottom-of-page
+            scroll from chaining to the (locked) window and bouncing the header. */}
+        <main className="min-w-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f5f5] p-6">{children}</main>
       </div>
     </div>
   )

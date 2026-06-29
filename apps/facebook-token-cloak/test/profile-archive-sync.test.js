@@ -111,3 +111,98 @@ test('uploadAfterClose seals tarball and uploads ciphertext only', async () => {
   assert.equal(uploaded.subarray(0, 6).toString('ascii'), 'ABENC1');
   assert.equal(uploaded.includes(Buffer.from('raw-cookie-value')), false);
 });
+
+// --- Logged-out archive guard (requirement: never overwrite cloud archive with a logged-out profile) ---
+
+function makeCookiesDb(filePath, names) {
+  // Build a minimal Chromium-shaped cookies table with NAMES only (no value column needed for the
+  // guard, which inspects names exclusively). host_key uses the leading-dot facebook.com form.
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(filePath);
+  db.exec('CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)');
+  for (const name of names) {
+    const stmt = db.prepare('INSERT INTO cookies (host_key, name, encrypted_value) VALUES (?, ?, ?)');
+    stmt.run('.facebook.com', name, Buffer.from('ENCRYPTED-NEVER-READ'));
+  }
+  db.close();
+}
+
+test('inspectFacebookCookieNames detects a logged-in session (c_user + xs) by NAME only', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-cookie-'));
+  const sync = freshModule(root);
+  const profile = path.join(root, 'p1');
+  fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+  makeCookiesDb(path.join(profile, 'Default', 'Cookies'), ['datr', 'c_user', 'xs', 'fr']);
+  const presence = sync.inspectFacebookCookieNames(profile);
+  assert.equal(presence.status, 'inspected');
+  assert.equal(presence.hasCUser, true);
+  assert.equal(presence.hasXs, true);
+  assert.deepEqual(sync.decideArchiveUpload(presence), { proceed: true, reason: 'logged_in' });
+});
+
+test('inspectFacebookCookieNames flags a logged-out profile (no c_user/xs) → upload skipped', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-cookie-'));
+  const sync = freshModule(root);
+  const profile = path.join(root, 'p2');
+  fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+  makeCookiesDb(path.join(profile, 'Default', 'Cookies'), ['datr', 'fr']);
+  const presence = sync.inspectFacebookCookieNames(profile);
+  assert.equal(presence.status, 'inspected');
+  assert.equal(presence.hasCUser, false);
+  assert.equal(presence.hasXs, false);
+  assert.deepEqual(sync.decideArchiveUpload(presence), { proceed: false, reason: 'logged_out_archive_skipped' });
+});
+
+test('decideArchiveUpload: missing cookies DB → skip; unreadable/engine-missing → proceed (preserve behavior)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-cookie-'));
+  const sync = freshModule(root);
+  // No cookies DB at all → definitely logged out → skip.
+  assert.equal(sync.decideArchiveUpload({ status: 'no_cookies_db' }).proceed, false);
+  assert.equal(sync.decideArchiveUpload({ status: 'no_cookies_db' }).reason, 'logged_out_archive_skipped');
+  // Cannot inspect (older runtime / locked DB) → cannot prove logged-out → proceed.
+  assert.equal(sync.decideArchiveUpload({ status: 'engine_unavailable' }).proceed, true);
+  assert.equal(sync.decideArchiveUpload({ status: 'read_error' }).proceed, true);
+});
+
+test('uploadAfterClose SKIPS upload for a logged-out profile and never calls the upload endpoint', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-cookie-'));
+  const sync = freshModule(root);
+  const profile = path.join(root, 'uidloggedout');
+  fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+  // Logged-out cookies DB (no c_user/xs) plus some allowlisted state that WOULD otherwise archive.
+  makeCookiesDb(path.join(profile, 'Default', 'Cookies'), ['datr']);
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), '{}');
+  const calls = [];
+  global.fetch = async (url, opts) => {
+    calls.push(String(url));
+    if (String(url).endsWith('/v1/accounts')) return { ok: true, status: 201, json: async () => ({}) };
+    if (String(url).endsWith('/v1/roles/facebook')) return { ok: true, status: 200, json: async () => ({}) };
+    return { ok: true, status: 201, json: async () => ({}) };
+  };
+  const r = await sync.uploadAfterClose('UIDLOGGEDOUT');
+  assert.equal(r.ok, false);
+  assert.equal(r.skipped, true);
+  assert.equal(r.reason, 'logged_out_archive_skipped');
+  // Critically: the upload endpoint was never hit (the cloud archive is untouched).
+  assert.equal(calls.some(u => u.includes('/upload')), false);
+});
+
+test('uploadAfterClose PROCEEDS to upload for a logged-in profile (c_user + xs present)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-cookie-'));
+  const sync = freshModule(root);
+  const profile = path.join(root, 'uidloggedin');
+  fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+  makeCookiesDb(path.join(profile, 'Default', 'Cookies'), ['c_user', 'xs']);
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), '{}');
+  let uploaded = false;
+  global.fetch = async (url, opts) => {
+    if (String(url).endsWith('/v1/accounts')) return { ok: true, status: 201, json: async () => ({}) };
+    if (String(url).endsWith('/v1/roles/facebook')) return { ok: true, status: 200, json: async () => ({}) };
+    if (String(url).includes('/upload')) { uploaded = true; return { ok: true, status: 201, json: async () => ({ archive: { blob_digest: 'abcdef1234567890' } }) }; }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const r = await sync.uploadAfterClose('UIDLOGGEDIN');
+  assert.equal(r.ok, true);
+  assert.equal(r.uploaded, true);
+  assert.equal(uploaded, true);
+});

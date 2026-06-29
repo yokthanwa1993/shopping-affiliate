@@ -22,6 +22,10 @@ import {
     buildBridgeAutoSyncRequestBody,
     parseBridgeAutoSyncResponse,
     isBridgeAutoSyncAllowed,
+    isFacebookCheckpointOrAutomationFailure,
+    shouldArmPostingAuthCooldown,
+    resolvePostingAuthCooldownMs,
+    isPostingAuthCooldownActive,
     parseAccountFallbackMap,
     resolveBridgeFallbackAccounts,
     isFacebookLitePageToken,
@@ -566,4 +570,47 @@ test('isBridgeAutoSyncAllowed: first attempt allowed, repeat within TTL blocked,
     assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_200_000, 60_000), true)
     // TTL<=0 disables throttling (test override).
     assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_000_001, 0), true)
+})
+
+test('isFacebookCheckpointOrAutomationFailure: flags checkpoint/automation/rate-limit, not a plain 190', () => {
+    // Checkpoint / automation / lock signals → true (earns the long cooldown).
+    assert.equal(isFacebookCheckpointOrAutomationFailure('Account requires a checkpoint'), true)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('We detected automated behavior on your account'), true)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('unusual activity detected'), true)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('Your account has been temporarily blocked'), true)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('Please confirm your identity'), true)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('(#368) blocked for abusive behavior'), true)
+    // Plain invalidated-token / generic errors → false (short cooldown path).
+    assert.equal(isFacebookCheckpointOrAutomationFailure('error validating access token: session invalidated (code 190)'), false)
+    assert.equal(isFacebookCheckpointOrAutomationFailure('all_post_tokens_failed'), false)
+    assert.equal(isFacebookCheckpointOrAutomationFailure(''), false)
+    assert.equal(isFacebookCheckpointOrAutomationFailure(undefined), false)
+})
+
+test('shouldArmPostingAuthCooldown: arm on a real FB-contact failure, never on config/transport reasons', () => {
+    // Reached Facebook and got rejected → arm.
+    assert.equal(shouldArmPostingAuthCooldown('auto_sync_no_pages'), true)
+    assert.equal(shouldArmPostingAuthCooldown('refresh_failed'), true)
+    assert.equal(shouldArmPostingAuthCooldown(''), true)
+    // Never reached Facebook (config/transport/throttle) → do NOT arm (would only block recovery).
+    assert.equal(shouldArmPostingAuthCooldown('bridge_not_configured'), false)
+    assert.equal(shouldArmPostingAuthCooldown('sync_secret_missing'), false)
+    assert.equal(shouldArmPostingAuthCooldown('bridge_auto_sync_unreachable'), false)
+    assert.equal(shouldArmPostingAuthCooldown('auto_sync_throttled'), false)
+    assert.equal(shouldArmPostingAuthCooldown('auth_failure_cooldown'), false)
+})
+
+test('resolvePostingAuthCooldownMs: checkpoint earns the longer window, never shorter than auth', () => {
+    assert.equal(resolvePostingAuthCooldownMs({ checkpoint: false, authCooldownMs: 1800_000, checkpointCooldownMs: 21600_000 }), 1800_000)
+    assert.equal(resolvePostingAuthCooldownMs({ checkpoint: true, authCooldownMs: 1800_000, checkpointCooldownMs: 21600_000 }), 21600_000)
+    // Checkpoint window can never resolve shorter than the auth window even if misconfigured.
+    assert.equal(resolvePostingAuthCooldownMs({ checkpoint: true, authCooldownMs: 1800_000, checkpointCooldownMs: 60_000 }), 1800_000)
+})
+
+test('isPostingAuthCooldownActive: open while now<until, closed at/after until or when unset', () => {
+    assert.equal(isPostingAuthCooldownActive(2_000_000, 1_000_000), true)
+    assert.equal(isPostingAuthCooldownActive(1_000_000, 1_000_000), false)
+    assert.equal(isPostingAuthCooldownActive(1_000_000, 1_500_000), false)
+    assert.equal(isPostingAuthCooldownActive(0, 1_000_000), false)
+    assert.equal(isPostingAuthCooldownActive(undefined, 1_000_000), false)
 })

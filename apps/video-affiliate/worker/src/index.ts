@@ -246,6 +246,10 @@ import {
     buildBridgeAutoSyncRequestBody,
     parseBridgeAutoSyncResponse,
     isBridgeAutoSyncAllowed,
+    isFacebookCheckpointOrAutomationFailure,
+    shouldArmPostingAuthCooldown,
+    resolvePostingAuthCooldownMs,
+    isPostingAuthCooldownActive,
     parseAccountFallbackMap,
     resolveBridgeFallbackAccounts,
     isFacebookLitePageToken,
@@ -29850,6 +29854,12 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     // that other namespace) is left intact and a structured { skipped: true, conflict } result is
     // returned. Normal /token/export and token-refresh callers omit this and keep moving rows.
     importMode?: string
+    // Guarded refresh-only mode (requirement: a stale-token refresh must never create/move a page).
+    // When true, the upsert refreshes the token of an EXISTING row in THIS namespace only — it never
+    // INSERTs a brand-new (active) page and never MOVES a page out of another namespace; if the page
+    // is absent here it returns { skipped:true } without touching anything. Default false keeps the
+    // existing create/move behavior for onboarding/export callers.
+    updateOnly?: boolean
 }): Promise<{
     created: boolean
     updated: boolean
@@ -29923,6 +29933,18 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
             'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime(\"now\") WHERE id = ? AND bot_id = ?'
         ).bind(nextPrimaryToken, pageAvatarUrl, pageName, pageId, namespaceId).run()
         updated = true
+    } else if (params.updateOnly) {
+        // Guarded refresh-only: the page does not exist in THIS namespace. A token refresh must never
+        // create a new active page or move one out of another namespace, so skip without touching
+        // anything (and report the conflicting owner namespace if the page lives elsewhere).
+        const existingInOtherNamespace = await env.DB.prepare(
+            'SELECT bot_id FROM pages WHERE id = ? LIMIT 1'
+        ).bind(pageId).first() as { bot_id?: string } | null
+        const otherNamespaceId = String(existingInOtherNamespace?.bot_id || '').trim()
+        console.log(`[PAGE-PROFILE-SYNC] update-only refresh skipped (page absent in ns) page=${pageId} ns=${namespaceId}${otherNamespaceId && otherNamespaceId !== namespaceId ? ` owner_ns=${otherNamespaceId}` : ''}`)
+        skipped = true
+        if (otherNamespaceId && otherNamespaceId !== namespaceId) conflictNamespaceId = otherNamespaceId
+        return { created, updated, moved, skipped, conflictNamespaceId }
     } else {
         const existingInOtherNamespace = await env.DB.prepare(
             'SELECT bot_id, access_token FROM pages WHERE id = ? LIMIT 1'
@@ -30993,6 +31015,59 @@ const BRIDGE_AUTO_SYNC_TTL_MS = (() => {
 })()
 const bridgeAutoSyncLastAttemptByNamespace = new Map<string, number>()
 
+// Per-page POSTING auth-failure circuit breaker. The per-namespace auto-sync TTL above only throttles
+// tier-3 auto-sync, and at 5 min it re-arms before the ~30-min posting cron fires again — so every
+// cron pass still re-mints (a Facebook LOGIN) for an invalidated page, which is exactly what trips
+// Facebook's automated-behavior/checkpoint detection. This breaker sits in FRONT of the WHOLE
+// posting-token recovery (all three tiers): once a recovery fails after actually reaching Facebook,
+// it opens for a cooldown window (longer for a checkpoint/automation signal) so subsequent cron
+// passes skip every re-mint for that page and return a sanitized `auth_failure_cooldown`. A
+// successful recovery clears it immediately. In-memory only (mirrors the auto-sync TTL map); an
+// isolate recycle resets it, which only makes the breaker more lenient, never more aggressive.
+const POSTING_AUTH_COOLDOWN_MS = (() => {
+    const raw = Number(((globalThis as { POSTING_AUTH_COOLDOWN_MS_OVERRIDE?: number }).POSTING_AUTH_COOLDOWN_MS_OVERRIDE) ?? NaN)
+    return Number.isFinite(raw) && raw >= 0 ? raw : 30 * 60 * 1000
+})()
+const POSTING_AUTH_CHECKPOINT_COOLDOWN_MS = (() => {
+    const raw = Number(((globalThis as { POSTING_AUTH_CHECKPOINT_COOLDOWN_MS_OVERRIDE?: number }).POSTING_AUTH_CHECKPOINT_COOLDOWN_MS_OVERRIDE) ?? NaN)
+    return Number.isFinite(raw) && raw >= 0 ? raw : 6 * 60 * 60 * 1000
+})()
+const postingAuthCircuitByPage = new Map<string, { until: number; reason: string }>()
+function postingAuthCircuitKey(namespaceId: string, pageId: string): string {
+    return `${String(namespaceId || '').trim()}::${String(pageId || '').trim()}`
+}
+// Read the breaker for a page. Open → recovery must be skipped (no Facebook contact at all). Expired
+// entries are pruned so the map cannot grow unbounded across pages.
+function getPostingAuthCircuit(namespaceId: string, pageId: string, nowMs: number): { open: boolean; reason: string; until: number } {
+    const key = postingAuthCircuitKey(namespaceId, pageId)
+    const entry = postingAuthCircuitByPage.get(key)
+    if (!entry) return { open: false, reason: '', until: 0 }
+    if (!isPostingAuthCooldownActive(entry.until, nowMs)) {
+        postingAuthCircuitByPage.delete(key)
+        return { open: false, reason: '', until: 0 }
+    }
+    return { open: true, reason: entry.reason, until: entry.until }
+}
+// Arm the breaker after a recovery that actually reached Facebook and still failed. Checkpoint /
+// automation signals earn the longer cooldown. `reason` is a short sanitized hint, never a token.
+function armPostingAuthCircuit(namespaceId: string, pageId: string, params: { checkpoint: boolean; reason: string; nowMs: number }): number {
+    const cooldownMs = resolvePostingAuthCooldownMs({
+        checkpoint: params.checkpoint,
+        authCooldownMs: POSTING_AUTH_COOLDOWN_MS,
+        checkpointCooldownMs: POSTING_AUTH_CHECKPOINT_COOLDOWN_MS,
+    })
+    if (!(cooldownMs > 0)) return 0
+    const until = params.nowMs + cooldownMs
+    postingAuthCircuitByPage.set(postingAuthCircuitKey(namespaceId, pageId), {
+        until,
+        reason: String(params.reason || (params.checkpoint ? 'checkpoint' : 'auth')).slice(0, 60),
+    })
+    return until
+}
+function clearPostingAuthCircuit(namespaceId: string, pageId: string): void {
+    postingAuthCircuitByPage.delete(postingAuthCircuitKey(namespaceId, pageId))
+}
+
 // AUTOMATIC true-bridge recovery. When a stored/Facebook Lite token has been invalidated (190 /
 // "session has been invalidated"), the Worker asks the local Facebook Lite bridge to re-mint a fresh
 // token from the stored credentials/session and refresh every matching page token in this namespace's
@@ -31089,8 +31164,23 @@ async function refreshFacebookLitePostingTokenForPage(params: {
     // request targets this exact account as profile_id / candidate_profile_ids. Blank → unchanged
     // auto-discovery behavior (the bridge finds the credentialed profile that owns the page).
     configuredPostingProfileUid?: string
+    // The sanitized publish error that triggered this refresh. Used ONLY to classify the cooldown
+    // severity (checkpoint/automation vs plain auth) when arming the circuit breaker — never logged raw.
+    originalError?: string
+    // Test seam for the auth-failure circuit breaker clock. Omitted → Date.now().
+    nowMs?: number
     logPrefix: string
 }): Promise<{ refreshed: boolean; synced: boolean; via: string; reason: string }> {
+    const now = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now()
+    // Circuit breaker: if a recent recovery for this page already failed after reaching Facebook,
+    // skip EVERY re-mint tier (BrowserSaving login, bridge /pages, auto-sync) until the cooldown
+    // expires. This is the anti-automation guard — it stops the ~30-min cron from re-logging-in on a
+    // checkpointed/invalidated account. Returns a sanitized reason; no Facebook contact whatsoever.
+    const circuit = getPostingAuthCircuit(params.namespaceId, params.pageId, now)
+    if (circuit.open) {
+        console.log(`[${params.logPrefix}] posting-token refresh skipped page=${params.pageId} (auth_failure_cooldown active until=${new Date(circuit.until).toISOString()} reason=${circuit.reason})`)
+        return { refreshed: false, synced: false, via: 'auth_cooldown', reason: 'auth_failure_cooldown' }
+    }
     const configuredProfileUid = sanitizePostingProfileUid(params.configuredPostingProfileUid)
     // Prepend the configured UID so it is tried first as both an explicit candidate profile id and a
     // candidate login id, without discarding any caller-supplied candidates. Blank → no override.
@@ -31110,6 +31200,7 @@ async function refreshFacebookLitePostingTokenForPage(params: {
         logPrefix: `${params.logPrefix} POST-REFRESH`,
     }).catch((e) => ({ refreshed: false, synced: false, profileCount: 0, reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
     if (bs.synced) {
+        clearPostingAuthCircuit(params.namespaceId, params.pageId)
         return { refreshed: true, synced: true, via: 'browsersaving', reason: bs.reason }
     }
 
@@ -31128,8 +31219,12 @@ async function refreshFacebookLitePostingTokenForPage(params: {
                 pageName: params.pageName,
                 accessToken: bridge.token,
                 commentToken: bridge.token,
+                // Token REFRESH must never materialize a brand-new active page — only refresh the token
+                // of a row that already exists in this namespace. If the page is gone, skip (no create).
+                updateOnly: true,
             })
             console.log(`[${params.logPrefix}] bridge token synced into pool page=${params.pageId} via=bridge_token_pages`)
+            clearPostingAuthCircuit(params.namespaceId, params.pageId)
             return { refreshed: true, synced: true, via: 'bridge_token_pages', reason: 'bridge_token_synced' }
         } catch (e) {
             const reason = (e instanceof Error ? e.message : String(e)).slice(0, 120)
@@ -31156,10 +31251,28 @@ async function refreshFacebookLitePostingTokenForPage(params: {
         logPrefix: `${params.logPrefix} BRIDGE-AUTOSYNC`,
     })
     if (autoSync.synced) {
+        clearPostingAuthCircuit(params.namespaceId, params.pageId)
         return { refreshed: true, synced: true, via: 'bridge_auto_sync', reason: autoSync.reason }
     }
 
-    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: autoSync.reason || bs.reason }
+    // Every recovery tier failed. Arm the circuit breaker so the next ~30-min cron pass backs off
+    // instead of re-minting (re-logging-in) again — UNLESS the failure never reached Facebook
+    // (bridge unreachable / not configured / throttled), in which case cooling down would only block
+    // recovery without preventing any hammering. A checkpoint/automation signal in the original
+    // publish error (or the recovery reason) earns the much longer cooldown.
+    const failureReason = autoSync.reason || bs.reason
+    if (shouldArmPostingAuthCooldown(failureReason)) {
+        const checkpoint =
+            isFacebookCheckpointOrAutomationFailure(params.originalError) ||
+            isFacebookCheckpointOrAutomationFailure(autoSync.reason) ||
+            isFacebookCheckpointOrAutomationFailure(bs.reason)
+        const until = armPostingAuthCircuit(params.namespaceId, params.pageId, { checkpoint, reason: checkpoint ? 'checkpoint' : 'auth', nowMs: now })
+        if (until > 0) {
+            console.warn(`[${params.logPrefix}] posting-token recovery failed page=${params.pageId} — armed auth_failure_cooldown (${checkpoint ? 'checkpoint' : 'auth'}) until=${new Date(until).toISOString()}`)
+        }
+    }
+
+    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: failureReason }
 }
 
 async function initReelUploadWithPostingTokenAutoRecover(params: {
@@ -37623,6 +37736,9 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             pageName: params.pageName,
             candidateLoginIds: params.candidateLoginIds,
             configuredPostingProfileUid: params.configuredPostingProfileUid,
+            // Forward the sanitized publish error so the breaker can tell a checkpoint/automation block
+            // (long cooldown) from a plain invalidated token (short cooldown).
+            originalError: message,
             logPrefix: params.logPrefix,
         }).catch((e) => ({ refreshed: false, synced: false, via: 'error', reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
         if (!refresh.synced) {

@@ -163,6 +163,68 @@ function extractTarGz(profileDir, tarGz) {
 function publicSkip(reason) { return { ok: false, skipped: true, reason }; }
 function publicError(code) { return { ok: false, skipped: false, reason: code || 'archive_sync_failed' }; }
 
+// ---- Logged-out archive guard --------------------------------------------
+// Overwriting the sealed cloud archive with a profile whose Facebook session has been cleared/logged
+// out would DESTROY the good saved session. Before uploadAfterClose seals/uploads, inspect ONLY the
+// cookie NAMES in the Chromium Cookies SQLite DB (never a value): a logged-in Facebook session has
+// BOTH `c_user` and `xs` cookies for facebook.com. If those are absent we skip the upload. Cookie
+// values are never read or logged — the encrypted value blob column is never selected.
+function cookiesDbPathFor(profileDir) {
+  // Chromium keeps the cookies DB under Default/Cookies (and a bare Cookies on some channels).
+  const candidates = [path.join(profileDir, 'Default', 'Cookies'), path.join(profileDir, 'Cookies')];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p) && fs.statSync(p).size > 0) return p; } catch { /* ignore */ }
+  }
+  return '';
+}
+
+// Inspect cookie NAMES only. Returns a token-free presence summary:
+//   status 'inspected'         — the DB was read; hasCUser/hasXs reflect the facebook.com cookie names.
+//   status 'no_cookies_db'     — no non-empty Cookies DB exists → definitely no session.
+//   status 'engine_unavailable'— node:sqlite is missing (older runtime) → cannot prove logged-out.
+//   status 'read_error'        — DB present but unreadable (locked/corrupt) → cannot prove logged-out.
+// Never reads/returns/logs a cookie value; only the `host_key` + `name` columns are queried.
+function inspectFacebookCookieNames(profileDir) {
+  const dbPath = cookiesDbPathFor(profileDir);
+  if (!dbPath) return { status: 'no_cookies_db', hasCUser: false, hasXs: false, hasFacebookHost: false };
+  let DatabaseSync;
+  try { ({ DatabaseSync } = require('node:sqlite')); }
+  catch { return { status: 'engine_unavailable', hasCUser: false, hasXs: false, hasFacebookHost: false }; }
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    // NAMES ONLY — host_key + name. The encrypted_value blob is never touched.
+    const rows = db.prepare("SELECT host_key, name FROM cookies WHERE host_key LIKE '%facebook.com'").all();
+    let hasCUser = false;
+    let hasXs = false;
+    for (const r of rows) {
+      const name = String((r && r.name) || '');
+      if (name === 'c_user') hasCUser = true;
+      else if (name === 'xs') hasXs = true;
+    }
+    return { status: 'inspected', hasCUser, hasXs, hasFacebookHost: rows.length > 0 };
+  } catch (e) {
+    return { status: 'read_error', hasCUser: false, hasXs: false, hasFacebookHost: false, error: e && (e.code || e.name) };
+  } finally {
+    try { if (db) db.close(); } catch { /* ignore */ }
+  }
+}
+
+// Pure decision from a presence summary. We SKIP the upload only when we can positively conclude the
+// session is logged out (cookies inspected and c_user/xs absent, or no cookies DB at all). When we
+// genuinely cannot inspect (engine unavailable / read error) we PROCEED, preserving the prior upload
+// behavior rather than silently disabling archive sync on an inconclusive read.
+function decideArchiveUpload(presence) {
+  const p = presence || {};
+  if (p.status === 'inspected') {
+    const loggedIn = !!(p.hasFacebookHost && p.hasCUser && p.hasXs);
+    return loggedIn ? { proceed: true, reason: 'logged_in' } : { proceed: false, reason: 'logged_out_archive_skipped' };
+  }
+  if (p.status === 'no_cookies_db') return { proceed: false, reason: 'logged_out_archive_skipped' };
+  // engine_unavailable / read_error → cannot prove logged-out; keep existing behavior.
+  return { proceed: true, reason: p.status === 'engine_unavailable' ? 'cookie_check_engine_unavailable' : 'cookie_check_unreadable' };
+}
+
 async function restoreBeforeOpen(rawAccount) {
   const cfg = configured();
   if (!cfg.configured) return publicSkip('not_configured');
@@ -190,6 +252,13 @@ async function uploadAfterClose(rawAccount) {
   const profileDir = profileDirFor(key);
   try {
     if (!fs.existsSync(profileDir)) return publicSkip('profile_missing');
+    // Logged-out guard: never overwrite the good cloud archive with a logged-out/cleared profile.
+    const presence = inspectFacebookCookieNames(profileDir);
+    const decision = decideArchiveUpload(presence);
+    if (!decision.proceed) {
+      console.log(`[profile-archive] upload skipped key=${key} role=${role} reason=${decision.reason} cookie_status=${presence.status}`);
+      return publicSkip(decision.reason);
+    }
     await ensureWorkerAccountRole(cfg, role, key);
     const { tarGz, manifest } = makeTarGz(profileDir);
     if (!tarGz) return publicSkip('archive_empty');
@@ -209,4 +278,4 @@ async function uploadAfterClose(rawAccount) {
   }
 }
 
-module.exports = { restoreBeforeOpen, uploadAfterClose, buildManifest, sealArchive, unsealArchive, configured, roleForAccount };
+module.exports = { restoreBeforeOpen, uploadAfterClose, buildManifest, sealArchive, unsealArchive, configured, roleForAccount, inspectFacebookCookieNames, decideArchiveUpload };
