@@ -5,12 +5,13 @@ import {
   Check,
   ChevronDown,
   Facebook,
-  Film,
   LayoutDashboard,
+  Library,
   Link2,
   PackageOpen,
   PenSquare,
   Settings,
+  Sparkles,
   UserCog,
   Users,
 } from 'lucide-react'
@@ -24,6 +25,9 @@ type NavItem = {
   icon: ComponentType<{ className?: string }>
   exact: boolean
   activePaths?: readonly string[]
+  // Placeholder folder with no destination yet — rendered as a greyed,
+  // non-navigating row instead of a Link so it never points at the wrong page.
+  disabled?: boolean
 }
 
 type NavGroup = {
@@ -47,12 +51,16 @@ const NAV_GROUPS: readonly NavGroup[] = [
   {
     title: 'คอนเทนต์ · Studio',
     items: [
-      // Two folder-level entries. "คลิปจีน" opens the Chinese-clip workspace
-      // (Source Inventory → Processing → Gallery), which carries its own
-      // top-level StudioSectionTabs to switch between those three views. "คลิป AI"
-      // opens the AI-generated media library. The per-view rows (Source
-      // Inventory / Processing / Gallery / Media Library) were collapsed into
-      // these folders to declutter the sidebar.
+      // Three folder-level entries:
+      // 1) "คลิปจีน" opens the Chinese-clip workspace (Source Inventory →
+      //    Processing → Gallery), which carries its own top-level
+      //    StudioSectionTabs to switch between those three views.
+      // 2) "คลิป AI" is a placeholder folder for AI-generated clips. There is
+      //    no dedicated AI-clips route yet, so it stays disabled (non-navigating)
+      //    rather than pointing at the Facebook media library.
+      // 3) "คลังสื่อ Facebook" opens the Facebook media/content library at
+      //    /media-library — this is Facebook media, NOT Chinese clips and NOT
+      //    AI clips.
       {
         to: '/source-inventory',
         label: 'คลิปจีน',
@@ -61,7 +69,14 @@ const NAV_GROUPS: readonly NavGroup[] = [
         exact: false,
         activePaths: ['/source-inventory', '/source-processing', '/processing', '/gallery'],
       },
-      { to: '/media-library', label: 'คลิป AI', sublabel: 'AI Clips', icon: Film, exact: false },
+      { to: '/media-library', label: 'คลิป AI', sublabel: 'AI Clips', icon: Sparkles, exact: false, disabled: true },
+      {
+        to: '/media-library',
+        label: 'คลังสื่อ Facebook',
+        sublabel: 'Facebook Media Library',
+        icon: Library,
+        exact: false,
+      },
     ],
   },
   {
@@ -103,6 +118,25 @@ const SETTINGS_NAV: NavItem = {
 // icon inherits `currentColor`, so it flips orange together with the label.
 function NavLink({ item }: { item: NavItem }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
+
+  // Placeholder folder (e.g. คลิป AI): greyed, non-navigating row so it can sit
+  // in the sidebar as a sibling folder without routing anywhere yet.
+  if (item.disabled) {
+    return (
+      <div
+        aria-disabled="true"
+        title="เร็วๆ นี้"
+        className="flex cursor-not-allowed items-center gap-2.5 border-r-[3px] border-transparent px-4 py-2 text-[#cccccc]"
+      >
+        <item.icon className="h-[18px] w-[18px] shrink-0" />
+        <span className="flex flex-col leading-tight">
+          <span className="text-[13px] font-medium">{item.sublabel}</span>
+          <span className="text-[11px] font-normal text-[#cccccc]">{item.label}</span>
+        </span>
+      </div>
+    )
+  }
+
   const isFolderActive = item.activePaths?.some((path) => pathname === path || pathname.startsWith(`${path}/`)) ?? false
   const folderActiveClass = isFolderActive ? ' !border-r-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]' : ''
 
