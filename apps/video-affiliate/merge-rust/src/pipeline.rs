@@ -35,6 +35,21 @@ const GEMINI_STRICT_FPS: u32 = 15;
 const GEMINI_STRICT_MIN_VIDEO_BITRATE_KBPS: u32 = 40;
 const GEMINI_STRICT_MAX_VIDEO_BITRATE_KBPS: u32 = 360;
 const SUBTITLE_BURN_TIMEOUT_SECS: u64 = 300;
+// Cloudflare Workers reject request bodies larger than the account plan limit
+// (100 MB on Free/Pro) with HTTP 413 *before* the request reaches our
+// `/api/r2-upload/:key` route, so the Worker cannot raise it. Large processed
+// MP4 outputs therefore fail the final upload. We re-encode the
+// already-subtitle-burned final MP4 down to a safe size before uploading;
+// subtitles are pixel-burned so re-encoding preserves them. The ceiling is
+// overridable via the `R2_UPLOAD_MAX_BYTES` env var (e.g. lower it for a
+// smaller plan) without a code/version change.
+const R2_UPLOAD_MAX_BYTES_DEFAULT: usize = 95 * 1024 * 1024;
+// Compression target leaves headroom below the hard ceiling so a single pass
+// reliably lands under it.
+const R2_UPLOAD_COMPRESS_TARGET_BYTES: usize = 85 * 1024 * 1024;
+const FINAL_COMPRESS_TIMEOUT_SECS: u64 = 600;
+const FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS: u32 = 300;
+const FINAL_COMPRESS_AUDIO_BITRATE_KBPS: u32 = 96;
 // Fast bounded budgets for the cosmetic horizontal-flip preprocessing step. The
 // primary flip re-encodes (ultrafast/high-CRF) so even long LINE videos finish
 // well inside the budget; if it still times out or fails we fall back to a
@@ -149,6 +164,7 @@ async fn r2_put(
     content_type: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/api/r2-upload/{}", worker_url, key);
+    let payload_bytes = data.len();
     let client = Client::new();
     let res = client
         .put(&url)
@@ -158,10 +174,197 @@ async fn r2_put(
         .body(data)
         .send()
         .await?;
-    if !res.status().is_success() {
-        return Err(format!("R2 upload failed: {}", res.status()).into());
+    let status = res.status();
+    if !status.is_success() {
+        // Surface the local payload size + the upload ceiling on 413 so the
+        // failure is diagnosable without leaking tokens/URLs.
+        if status.as_u16() == 413 {
+            return Err(format!(
+                "R2 upload failed: 413 Payload Too Large (payload {} bytes, upload ceiling {} bytes)",
+                payload_bytes,
+                r2_upload_max_bytes()
+            )
+            .into());
+        }
+        return Err(format!("R2 upload failed: {}", status).into());
     }
     Ok(())
+}
+
+/// Hard ceiling (in bytes) for the final-MP4 Worker PUT body. Defaults to a
+/// conservative value below the Cloudflare 100 MB Free/Pro request-body limit,
+/// overridable via `R2_UPLOAD_MAX_BYTES` (only honored when >= 8 MB so a stray
+/// tiny value cannot brick uploads).
+fn r2_upload_max_bytes() -> usize {
+    std::env::var("R2_UPLOAD_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 8 * 1024 * 1024)
+        .unwrap_or(R2_UPLOAD_MAX_BYTES_DEFAULT)
+}
+
+/// Average video bitrate (kbps) that fits `duration_secs` of video plus the
+/// AAC audio track inside `target_bytes`, clamped to a sane floor so we never
+/// destroy short outputs into mush.
+fn final_compress_video_bitrate_kbps(target_bytes: usize, duration_secs: f64) -> u32 {
+    let dur = duration_secs.max(1.0);
+    let total_kbps = (target_bytes as f64 * 8.0 / 1000.0) / dur;
+    let video_kbps = total_kbps - FINAL_COMPRESS_AUDIO_BITRATE_KBPS as f64;
+    video_kbps
+        .max(FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS as f64)
+        .round() as u32
+}
+
+/// Build a size-targeting re-encode of an already-subtitle-burned MP4. Subtitles
+/// are pixel-burned in the source, so no subtitle handling is needed here. The
+/// optional `max_long_side` downscales the longest dimension (aspect-preserving,
+/// even dims) and `fps_cap` limits frame rate; both only ever shrink.
+fn build_final_compress_ffmpeg_args(
+    input_str: &str,
+    output_str: &str,
+    video_bitrate_kbps: u32,
+    max_long_side: Option<u32>,
+    fps_cap: Option<u32>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    push_ffmpeg_args(&mut args, &["-y", "-i", input_str]);
+
+    let mut filters: Vec<String> = Vec::new();
+    if let Some(side) = max_long_side {
+        // Clamp the longest side to `side`, keep aspect, force even dimensions
+        // (-2). When the source is already smaller, min() is a no-op.
+        filters.push(format!(
+            "scale=w='if(gt(iw,ih),min(iw,{side}),-2)':h='if(gt(iw,ih),-2,min(ih,{side}))'",
+            side = side
+        ));
+    }
+    if let Some(fps) = fps_cap {
+        filters.push(format!("fps={}", fps));
+    }
+    filters.push("format=yuv420p".to_string());
+    let vf = filters.join(",");
+    push_ffmpeg_args(&mut args, &["-vf", &vf]);
+
+    let maxrate = video_bitrate_kbps * 115 / 100;
+    let bufsize = video_bitrate_kbps * 2;
+    push_ffmpeg_args(&mut args, &["-c:v", "libx264", "-preset", "medium"]);
+    push_ffmpeg_args(&mut args, &["-b:v", &format!("{}k", video_bitrate_kbps)]);
+    push_ffmpeg_args(&mut args, &["-maxrate", &format!("{}k", maxrate)]);
+    push_ffmpeg_args(&mut args, &["-bufsize", &format!("{}k", bufsize)]);
+    push_ffmpeg_args(&mut args, &["-pix_fmt", "yuv420p"]);
+    push_ffmpeg_args(
+        &mut args,
+        &[
+            "-c:a",
+            "aac",
+            "-b:a",
+            &format!("{}k", FINAL_COMPRESS_AUDIO_BITRATE_KBPS),
+        ],
+    );
+    push_ffmpeg_args(&mut args, &["-movflags", "+faststart", output_str]);
+    args
+}
+
+/// Ensure the final MP4 at `output_mp4` is small enough for the Worker PUT body.
+/// If it already fits, this is a no-op. Otherwise it re-encodes in escalating
+/// tiers (each more aggressive on resolution/fps) until the result is both
+/// smaller than the original *and* under the ceiling, then replaces the file in
+/// place under the same path. Returns a distinct, non-retryable error if no tier
+/// succeeds so the job fails cleanly instead of re-attempting the same category.
+async fn ensure_final_mp4_within_upload_limit(
+    output_mp4: &Path,
+    tmp_path: &Path,
+    duration_secs: f64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let max_bytes = r2_upload_max_bytes();
+    let original_len = fs::metadata(output_mp4).await?.len() as usize;
+    if original_len <= max_bytes {
+        return Ok(());
+    }
+    println!(
+        "[PIPELINE] final mp4 {} bytes exceeds upload ceiling {} bytes; compressing",
+        original_len, max_bytes
+    );
+
+    let target_bytes = R2_UPLOAD_COMPRESS_TARGET_BYTES.min(max_bytes);
+    // (max_long_side, fps_cap) — escalate only if a tier is still over the
+    // ceiling. Vertical shorts stay sharp at 1280; later tiers protect very
+    // long/high-bitrate sources.
+    let tiers: [(Option<u32>, Option<u32>); 3] = [
+        (Some(1280), Some(30)),
+        (Some(854), Some(30)),
+        (Some(640), Some(24)),
+    ];
+    let compressed = tmp_path.join("final_compressed.mp4");
+
+    for (i, (side, fps)) in tiers.iter().enumerate() {
+        let bitrate = final_compress_video_bitrate_kbps(target_bytes, duration_secs);
+        let args = build_final_compress_ffmpeg_args(
+            output_mp4.to_str().ok_or("invalid_output_path")?,
+            compressed.to_str().ok_or("invalid_compressed_path")?,
+            bitrate,
+            *side,
+            *fps,
+        );
+        let _ = fs::remove_file(&compressed).await;
+        let result = tokio::time::timeout(Duration::from_secs(FINAL_COMPRESS_TIMEOUT_SECS), {
+            let mut command = Command::new("ffmpeg");
+            command.kill_on_drop(true).args(&args);
+            command.output()
+        })
+        .await;
+        let ok = match result {
+            Err(_) => {
+                println!("[PIPELINE] final compress tier {} timed out", i);
+                false
+            }
+            Ok(Err(e)) => {
+                println!("[PIPELINE] final compress tier {} process error: {}", i, e);
+                false
+            }
+            Ok(Ok(out)) => match ffmpeg_nonzero_status_reason(&out) {
+                Some(reason) => {
+                    println!("[PIPELINE] final compress tier {} failed: {}", i, reason);
+                    false
+                }
+                None => true,
+            },
+        };
+        if !ok {
+            continue;
+        }
+        let new_len = match fs::metadata(&compressed).await {
+            Ok(m) => m.len() as usize,
+            Err(_) => continue,
+        };
+        if new_len == 0 || new_len >= original_len {
+            println!(
+                "[PIPELINE] final compress tier {} not smaller ({} -> {} bytes); escalating",
+                i, original_len, new_len
+            );
+            continue;
+        }
+        if new_len <= max_bytes {
+            fs::remove_file(output_mp4).await.ok();
+            fs::rename(&compressed, output_mp4).await?;
+            println!(
+                "[PIPELINE] final mp4 compressed {} -> {} bytes (tier {})",
+                original_len, new_len, i
+            );
+            return Ok(());
+        }
+        println!(
+            "[PIPELINE] final compress tier {} still over ceiling ({} > {} bytes); escalating",
+            i, new_len, max_bytes
+        );
+    }
+
+    let _ = fs::remove_file(&compressed).await;
+    Err(format!(
+        "final mp4 exceeds upload ceiling after compression (original {} bytes, ceiling {} bytes)",
+        original_len, max_bytes
+    )
+    .into())
 }
 
 fn looks_like_html_document(bytes: &[u8]) -> bool {
@@ -310,6 +513,12 @@ fn pipeline_error_category(err: &str) -> &'static str {
         "gemini_file_wait_timeout"
     } else if normalized.contains("gemini") {
         "gemini_pipeline_failed"
+    } else if normalized.contains("exceeds upload ceiling after compression") {
+        // Output is irreducibly too large for the Worker PUT body even after the
+        // most aggressive compression tier — terminal, not worth retrying.
+        "final_upload_too_large"
+    } else if normalized.contains("413 payload too large") {
+        "r2_upload_payload_too_large"
     } else if normalized.contains("ffmpeg") && normalized.contains("timed out") {
         "ffmpeg_timeout"
     } else {
@@ -2203,9 +2412,11 @@ mod tests {
         GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
         GeminiPreflightError, GeminiTranscodeProfile, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
         VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
-        build_avatar_compose_filter_complex, build_final_merge_ffmpeg_args,
-        build_flip_fallback_remux_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
-        build_gemini_inline_video_part,
+        FINAL_COMPRESS_AUDIO_BITRATE_KBPS, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS,
+        build_avatar_compose_filter_complex, build_final_compress_ffmpeg_args,
+        build_final_merge_ffmpeg_args, build_flip_fallback_remux_ffmpeg_args,
+        build_flip_processing_input_ffmpeg_args, build_gemini_inline_video_part,
+        final_compress_video_bitrate_kbps,
         build_gemini_transcode_ffmpeg_args, build_gemini_transcode_filter,
         build_srt_from_lines_with_timing, build_tts_payload, convert_to_ass,
         extract_speech_srt_time_span, extract_srt_payload, ffmpeg_nonzero_status_reason,
@@ -2218,6 +2429,63 @@ mod tests {
         srt.lines()
             .filter_map(|l| parse_srt_time_range(l))
             .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn final_compress_bitrate_fits_target_and_respects_floor() {
+        // 30 MB target over 60s → well above the floor, derived from size.
+        let kbps = final_compress_video_bitrate_kbps(30 * 1024 * 1024, 60.0);
+        let expected_total = (30.0 * 1024.0 * 1024.0 * 8.0 / 1000.0) / 60.0;
+        let expected_video = (expected_total - FINAL_COMPRESS_AUDIO_BITRATE_KBPS as f64).round() as u32;
+        assert_eq!(kbps, expected_video);
+        assert!(kbps > FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS);
+
+        // Tiny target over a long video must never fall below the floor.
+        let floored = final_compress_video_bitrate_kbps(1024 * 1024, 600.0);
+        assert_eq!(floored, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS);
+
+        // Zero/negative duration must not panic or divide by zero.
+        let safe = final_compress_video_bitrate_kbps(10 * 1024 * 1024, 0.0);
+        assert!(safe >= FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn final_compress_args_target_size_and_preserve_burned_frames() {
+        let args =
+            build_final_compress_ffmpeg_args("/tmp/in.mp4", "/tmp/out.mp4", 1200, Some(1280), Some(30));
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+        };
+        assert_eq!(value_after("-i"), Some("/tmp/in.mp4"));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/out.mp4"));
+        assert_eq!(value_after("-c:v"), Some("libx264"));
+        assert_eq!(value_after("-b:v"), Some("1200k"));
+        // maxrate = 115%, bufsize = 200% of the target bitrate.
+        assert_eq!(value_after("-maxrate"), Some("1380k"));
+        assert_eq!(value_after("-bufsize"), Some("2400k"));
+        assert_eq!(value_after("-movflags"), Some("+faststart"));
+        // Audio is re-encoded (subtitles are pixel-burned; no -sn/subtitle args).
+        assert_eq!(value_after("-c:a"), Some("aac"));
+        assert!(!args.iter().any(|a| a == "-sn"));
+        // vf clamps the longest side and caps fps.
+        let vf = value_after("-vf").expect("vf present");
+        assert!(vf.contains("1280"), "vf should clamp long side: {vf}");
+        assert!(vf.contains("fps=30"), "vf should cap fps: {vf}");
+    }
+
+    #[test]
+    fn final_compress_args_without_scaling_still_normalizes_pixfmt() {
+        let args = build_final_compress_ffmpeg_args("/tmp/in.mp4", "/tmp/out.mp4", 800, None, None);
+        let vf = args
+            .iter()
+            .position(|a| a == "-vf")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .expect("vf present");
+        assert_eq!(vf, "format=yuv420p");
     }
 
     #[test]
@@ -3682,6 +3950,9 @@ async fn rust_pipeline(
         "📤 กำลังอัพโหลดผลลัพธ์...",
     )
     .await;
+    // Shrink oversize outputs (subtitles already pixel-burned) so the Worker PUT
+    // body stays under Cloudflare's 413 request-body ceiling.
+    ensure_final_mp4_within_upload_limit(&output_mp4, &tmp_path, duration).await?;
     let final_bytes = fs::read(&output_mp4).await?;
     r2_put(
         worker_url,

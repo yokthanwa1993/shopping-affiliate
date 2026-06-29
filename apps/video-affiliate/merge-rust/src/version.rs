@@ -1,1 +1,1 @@
-pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-20.ffmpeg-flip-fallback.01";
+pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-29.final-upload-compress.01";
