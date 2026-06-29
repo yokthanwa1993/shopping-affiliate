@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { createRootRoute, createRoute, createRouter, Outlet } from '@tanstack/react-router'
 import { AppShell } from '@/components/AppShell'
 import { OverviewPage } from '@/routes/overview'
@@ -61,8 +61,20 @@ const sourceInventoryRoute = page('/source-inventory', SourceInventoryPage)
 // legacy /inbox + /source-processing slugs — alias them to the same page.
 const inboxRoute = page('/inbox', SourceInventoryPage)
 const sourceProcessingRoute = page('/source-processing', SourceInventoryPage)
-// Dedicated AI Clips workspace — operator-uploaded AI videos, separate from Chinese/LINE.
-const aiClipsRoute = page('/ai-clips', AiClipsPage)
+// Media workspace — operator-uploaded AI videos, separate from Chinese/LINE.
+const mediaRoute = page('/media', AiClipsPage)
+
+function LegacyAiClipsRedirect() {
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const prefix = basepath === '/' ? '' : basepath
+    window.location.replace(`${prefix}/media${window.location.search}${window.location.hash}`)
+  }, [])
+  return <AiClipsPage />
+}
+
+// Legacy alias: keep old bookmarks working but move the browser to /dashboard/media.
+const aiClipsRoute = page('/ai-clips', LegacyAiClipsRedirect)
 // Explore — search-first view over the cached page-video endpoint, sits above
 // "คลังต้นฉบับ" (/ai-clips) in the Studio nav group.
 const exploreRoute = page('/explore', ExplorePage)
@@ -89,6 +101,7 @@ const routeTree = rootRoute.addChildren([
   sourceInventoryRoute,
   inboxRoute,
   sourceProcessingRoute,
+  mediaRoute,
   aiClipsRoute,
   exploreRoute,
   processingRoute,
