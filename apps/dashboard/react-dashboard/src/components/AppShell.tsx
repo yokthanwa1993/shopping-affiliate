@@ -4,6 +4,7 @@ import { Link, useRouterState } from '@tanstack/react-router'
 import {
   Check,
   ChevronDown,
+  Compass,
   Facebook,
   Images,
   LayoutDashboard,
@@ -61,6 +62,15 @@ const NAV_GROUPS: readonly NavGroup[] = [
       //    workspace views) — only the labels are generic now.
       // 3) "Media Library" stays at /media-library — Facebook media, NOT the AI
       //    upload workspace.
+      // Explore sits above "คลังต้นฉบับ": a search-first view over the cached
+      // page-video endpoint for finding posts/videos from configured pages.
+      {
+        to: '/explore',
+        label: 'สำรวจโพสต์',
+        sublabel: 'Explore',
+        icon: Compass,
+        exact: false,
+      },
       {
         to: '/ai-clips',
         label: 'คลังต้นฉบับ',

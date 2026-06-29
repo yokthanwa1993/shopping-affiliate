@@ -6,6 +6,7 @@ import { GalleryPage } from '@/routes/gallery'
 import { MediaLibraryPage } from '@/routes/media-library'
 import { SourceInventoryPage } from '@/routes/source-inventory'
 import { AiClipsPage } from '@/routes/ai-clips'
+import { ExplorePage } from '@/routes/explore'
 import { ProcessingPage } from '@/routes/processing'
 import { PagePostsPage } from '@/routes/page-posts'
 import { CustomLinkPage } from '@/routes/custom-link'
@@ -62,6 +63,9 @@ const inboxRoute = page('/inbox', SourceInventoryPage)
 const sourceProcessingRoute = page('/source-processing', SourceInventoryPage)
 // Dedicated AI Clips workspace — operator-uploaded AI videos, separate from Chinese/LINE.
 const aiClipsRoute = page('/ai-clips', AiClipsPage)
+// Explore — search-first view over the cached page-video endpoint, sits above
+// "คลังต้นฉบับ" (/ai-clips) in the Studio nav group.
+const exploreRoute = page('/explore', ExplorePage)
 const processingRoute = page('/processing', ProcessingPage)
 const pagePostsRoute = page('/page-posts', PagePostsPage)
 // Production nav links to /page_posts (underscore); keep it as an alias.
@@ -86,6 +90,7 @@ const routeTree = rootRoute.addChildren([
   inboxRoute,
   sourceProcessingRoute,
   aiClipsRoute,
+  exploreRoute,
   processingRoute,
   pagePostsRoute,
   pagePostsAliasRoute,
