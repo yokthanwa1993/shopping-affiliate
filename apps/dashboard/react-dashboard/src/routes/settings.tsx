@@ -2073,7 +2073,7 @@ export function PageDetailView({
 
       {/* Token edit modal — write-only, never prefilled with the existing token */}
       {editingToken ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-6" onClick={() => setEditingToken(false)}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black px-6" onClick={() => setEditingToken(false)}>
           <div className="w-full max-w-md space-y-4 rounded-2xl bg-card p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-center text-base font-bold text-foreground">Facebook Lite token (โพสต์)</h3>
             <textarea

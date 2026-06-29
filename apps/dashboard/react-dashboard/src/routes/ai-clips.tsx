@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, ShoppingBag, Sparkles, Trash2, Upload, X } from 'lucide-react'
 import {
@@ -78,9 +79,9 @@ function UploadDialog({
     })
   }
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black px-4 py-4 sm:py-6"
       onClick={() => !isUploading && onClose()}
       role="dialog"
       aria-modal="true"
@@ -177,7 +178,7 @@ function UploadDialog({
         </div>
       </form>
     </div>
-  )
+  , document.body)
 }
 
 function ProductLinkRow({ label, href, accent }: { label: string; href: string; accent: string }) {
@@ -294,9 +295,9 @@ function AiDetailModal({
     return () => document.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black px-4 py-4 sm:py-6"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
@@ -365,7 +366,7 @@ function AiDetailModal({
         </div>
       </div>
     </div>
-  )
+  , document.body)
 }
 
 export function AiClipsPage() {
