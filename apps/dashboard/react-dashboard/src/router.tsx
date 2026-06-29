@@ -7,7 +7,6 @@ import { MediaLibraryPage } from '@/routes/media-library'
 import { SourceInventoryPage } from '@/routes/source-inventory'
 import { AiClipsPage } from '@/routes/ai-clips'
 import { ExplorePage } from '@/routes/explore'
-import { ProcessingPage } from '@/routes/processing'
 import { PagePostsPage } from '@/routes/page-posts'
 import { CustomLinkPage } from '@/routes/custom-link'
 import { CampaignsPage } from '@/routes/campaigns'
@@ -64,7 +63,7 @@ const sourceProcessingRoute = page('/source-processing', SourceInventoryPage)
 // Media workspace — operator-uploaded AI videos, separate from Chinese/LINE.
 const mediaRoute = page('/media', AiClipsPage)
 
-function LegacyAiClipsRedirect() {
+function RedirectToMedia() {
   useEffect(() => {
     if (typeof window === 'undefined') return
     const prefix = basepath === '/' ? '' : basepath
@@ -74,11 +73,12 @@ function LegacyAiClipsRedirect() {
 }
 
 // Legacy alias: keep old bookmarks working but move the browser to /dashboard/media.
-const aiClipsRoute = page('/ai-clips', LegacyAiClipsRedirect)
+const aiClipsRoute = page('/ai-clips', RedirectToMedia)
 // Explore — search-first view over the cached page-video endpoint, sits above
 // "คลังต้นฉบับ" (/ai-clips) in the Studio nav group.
 const exploreRoute = page('/explore', ExplorePage)
-const processingRoute = page('/processing', ProcessingPage)
+// Processing is folded into Media cards; keep the old URL as a redirect.
+const processingRoute = page('/processing', RedirectToMedia)
 const pagePostsRoute = page('/page-posts', PagePostsPage)
 // Production nav links to /page_posts (underscore); keep it as an alias.
 const pagePostsAliasRoute = page('/page_posts', PagePostsPage)

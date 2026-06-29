@@ -15,7 +15,6 @@ import {
   Settings,
   UserCog,
   Users,
-  Wand2,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { WorkspaceProvider, useWorkspace } from '@/contexts/workspace'
@@ -58,8 +57,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
       //    operator uploads their AI-generated videos (paired with Shopee/Lazada
       //    links) here. The legacy Chinese/LINE source-inventory route still
       //    exists at /source-inventory but is no longer surfaced in the nav.
-      // 2) "Processing" / "Gallery" keep their existing routes (the Chinese-clip
-      //    workspace views) — only the labels are generic now.
+      // 2) Processing status now lives on Media cards; the old Processing nav is hidden.
       // 3) "Media Library" stays at /media-library — Facebook media, NOT the AI
       //    upload workspace.
       // Explore sits above "คลังต้นฉบับ": a search-first view over the cached
@@ -79,7 +77,6 @@ const NAV_GROUPS: readonly NavGroup[] = [
         exact: false,
         activePaths: ['/media', '/ai-clips', '/source-inventory', '/source-processing', '/inbox'],
       },
-      { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Wand2, exact: false },
       { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Images, exact: false },
       {
         to: '/media-library',
