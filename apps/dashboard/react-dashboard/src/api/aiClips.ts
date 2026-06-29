@@ -6,6 +6,7 @@ import { collect, isRecord, pick, safeString } from '@/lib/data'
 // Worker routes that only ever touch the `_ai_clips/` R2 prefix:
 //   GET  /api/dashboard/ai-clips?view=unprocessed|processed&limit=48
 //   POST /api/dashboard/ai-clips/upload  (multipart/form-data: file, optional title)
+//   DELETE /api/dashboard/ai-clips/:id
 // Both inherit the same `x-bot-id` namespace + same-origin dashboard session as every other
 // worker call, so AI clips land under the operator's existing namespace. No secrets are sent
 // or returned.
@@ -93,4 +94,32 @@ export async function uploadAiClip(
     throw new Error(message)
   }
   return { ok: true, video: normalize(json.video, 0) }
+}
+
+
+export async function deleteAiClip(id: string, signal?: AbortSignal): Promise<{ ok: boolean; id: string }> {
+  const normalized = String(id || '').trim()
+  if (!normalized) throw new Error('missing_ai_clip_id')
+  const response = await fetch(`${WORKER_API_BASE}/api/dashboard/ai-clips/${encodeURIComponent(normalized)}`, {
+    method: 'DELETE',
+    headers: { 'x-bot-id': CHIEB_NAMESPACE_ID },
+    credentials: 'same-origin',
+    signal,
+  })
+  const text = await response.text()
+  let json: Record<string, unknown> = {}
+  if (text) {
+    try {
+      json = JSON.parse(text) as Record<string, unknown>
+    } catch {
+      throw new Error(`Response is not JSON (HTTP ${response.status})`)
+    }
+  }
+  if (!response.ok || json.ok === false) {
+    const message = typeof json.error === 'string' && json.error.trim()
+      ? json.error
+      : `HTTP ${response.status} ${response.statusText}`
+    throw new Error(message)
+  }
+  return { ok: true, id: safeString(json.id) || normalized }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Sparkles, Upload } from 'lucide-react'
-import { fetchAiClips, uploadAiClip, type AiClip, type AiClipView } from '@/api/aiClips'
+import { Sparkles, Trash2, Upload } from 'lucide-react'
+import { deleteAiClip, fetchAiClips, uploadAiClip, type AiClip, type AiClipView } from '@/api/aiClips'
 import { formatThaiDateTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 
@@ -91,7 +91,17 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   )
 }
 
-function AiDetailModal({ item, onClose }: { item: AiClip; onClose: () => void }) {
+function AiDetailModal({
+  item,
+  onClose,
+  onDelete,
+  isDeleting,
+}: {
+  item: AiClip
+  onClose: () => void
+  onDelete: () => void
+  isDeleting: boolean
+}) {
   const playback = (item.originalUrl || item.previewUrl || '').trim()
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -119,9 +129,15 @@ function AiDetailModal({ item, onClose }: { item: AiClip; onClose: () => void })
             </span>
             <p className="truncate text-sm font-semibold">{item.title || item.id}</p>
           </div>
-          <Button type="button" size="sm" variant="ghost" onClick={onClose}>
-            ปิด
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button type="button" size="sm" variant="destructive" onClick={onDelete} disabled={isDeleting}>
+              <Trash2 className="mr-1 h-3.5 w-3.5" />
+              {isDeleting ? 'กำลังลบ…' : 'ลบวีดีโอ'}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={onClose}>
+              ปิด
+            </Button>
+          </div>
         </div>
 
         <div className="space-y-4 overflow-y-auto p-4">
@@ -182,6 +198,18 @@ export function AiClipsPage() {
     },
     onError: (error) => {
       setNotice({ kind: 'error', text: `อัปโหลดไม่สำเร็จ: ${error instanceof Error ? error.message : 'unknown error'}` })
+    },
+  })
+
+  const remove = useMutation({
+    mutationFn: (id: string) => deleteAiClip(id),
+    onSuccess: async (result) => {
+      setSelected(null)
+      setNotice({ kind: 'ok', text: `ลบคลิป AI สำเร็จ${result.id ? ` (${result.id})` : ''}` })
+      await queryClient.invalidateQueries({ queryKey: ['ai-clips'] })
+    },
+    onError: (error) => {
+      setNotice({ kind: 'error', text: `ลบไม่สำเร็จ: ${error instanceof Error ? error.message : 'unknown error'}` })
     },
   })
 
@@ -284,7 +312,18 @@ export function AiClipsPage() {
         </div>
       )}
 
-      {selected ? <AiDetailModal item={selected} onClose={() => setSelected(null)} /> : null}
+      {selected ? (
+        <AiDetailModal
+          item={selected}
+          onClose={() => setSelected(null)}
+          isDeleting={remove.isPending}
+          onDelete={() => {
+            if (!selected.id) return
+            const ok = window.confirm(`ลบวีดีโอ AI นี้หรือไม่?\n${selected.title || selected.id}`)
+            if (ok) remove.mutate(selected.id)
+          }}
+        />
+      ) : null}
     </div>
   )
 }

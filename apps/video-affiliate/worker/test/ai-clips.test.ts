@@ -5,6 +5,7 @@ import {
     AI_CLIP_SOURCE_LABEL,
     AI_CLIP_SOURCE_TYPE,
     aiClipNamespacePrefix,
+    aiClipOriginalAssetKey,
     aiClipRecordKey,
     aiClipStatus,
     buildAiClipResponse,
@@ -68,6 +69,13 @@ test('aiClipRecordKey lives under the dedicated namespace prefix (never _inbox/)
     assert.equal(aiClipRecordKey(ns, '../escape'), `${AI_CLIP_PREFIX}${ns}/escape.json`)
     assert.equal(aiClipRecordKey('', 'ai_123_abc'), '')
     assert.equal(aiClipRecordKey(ns, ''), '')
+})
+
+test('aiClipOriginalAssetKey is sanitized and never points at legacy inbox', () => {
+    assert.equal(aiClipOriginalAssetKey('ai_123_abc'), 'videos/ai_123_abc_original.mp4')
+    assert.equal(aiClipOriginalAssetKey('../ai_123'), 'videos/ai_123_original.mp4')
+    assert.ok(!aiClipOriginalAssetKey('ai_123_abc').startsWith('_inbox/'))
+    assert.equal(aiClipOriginalAssetKey(''), '')
 })
 
 test('sanitizeAiClipTitle trims, collapses and bounds length', () => {

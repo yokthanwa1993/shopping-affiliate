@@ -310,6 +310,7 @@ import {
 } from './avatar-settings'
 import {
     AI_CLIP_MAX_BYTES,
+    aiClipOriginalAssetKey,
     aiClipRecordKey,
     buildAiClipResponse,
     filterAiClipsByView,
@@ -10994,7 +10995,7 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
         const bucket = c.get('bucket')
         // Store the original under the SHARED asset key so /api/gallery/:id/asset/original serves it.
         // Stream the Blob straight to R2 (no full-buffer in memory).
-        const originalKey = getPrimaryOriginalVideoAssetKey(id)
+        const originalKey = aiClipOriginalAssetKey(id) || getPrimaryOriginalVideoAssetKey(id)
         await bucket.put(originalKey, file.stream(), {
             httpMetadata: { contentType: contentType || 'video/mp4' },
         })
@@ -11031,6 +11032,52 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
         return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500)
     }
 })
+
+app.delete('/api/dashboard/ai-clips/:id', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    try {
+        const namespaceId = String(c.get('botId') || '').trim()
+        if (!namespaceId || namespaceId === 'default') return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+        const id = sanitizeAiClipId(c.req.param('id'))
+        if (!id) return c.json({ ok: false, error: 'invalid_ai_clip_id' }, 400)
+
+        const bucket = c.get('bucket')
+        const recordKey = aiClipRecordKey(namespaceId, id)
+        if (!recordKey) return c.json({ ok: false, error: 'invalid_ai_clip_record_key' }, 400)
+        const existing = await bucket.get(recordKey).catch(() => null)
+        if (!existing) return c.json({ ok: false, error: 'ai_clip_not_found' }, 404)
+        const raw = await existing.json().catch(() => null) as Partial<AiClipRecord> | null
+        const record = normalizeAiClipRecord({ ...raw, namespaceId })
+        if (!record || record.id !== id || record.namespaceId !== namespaceId) {
+            return c.json({ ok: false, error: 'ai_clip_namespace_mismatch' }, 403)
+        }
+
+        const keys = [
+            recordKey,
+            aiClipOriginalAssetKey(id),
+            getOriginalThumbnailAssetKey(id),
+            getProcessedThumbnailAssetKey(id),
+            `_queue/${id}.json`,
+            `_processing/${id}.json`,
+            `videos/${id}.json`,
+            `videos/${id}.mp4`,
+        ].filter((key): key is string => !!key)
+        await Promise.all(keys.map((key) => bucket.delete(key).catch(() => { })))
+        await deleteGalleryIndexEntry(c.env.DB, namespaceId, id).catch(() => { })
+        await c.env.DB.prepare('DELETE FROM namespace_video_state WHERE namespace_id = ? AND video_id = ?')
+            .bind(namespaceId, id)
+            .run()
+            .catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+        invalidateNamespaceInventoryCache(namespaceId)
+        return c.json({ ok: true, namespace_id: namespaceId, id, deleted_keys: keys.length })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
 
 // Settings are page-scoped when `?page_id=...` is provided (or `page_id` in
 // PUT body) — each FB page has its own sub_id, comment_template, ad_account,
