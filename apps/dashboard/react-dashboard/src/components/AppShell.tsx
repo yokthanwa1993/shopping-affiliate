@@ -46,7 +46,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
     items: [{ to: '/', label: 'ภาพรวม', sublabel: 'Dashboard', icon: LayoutDashboard, exact: true }],
   },
   {
-    title: 'คอนเทนต์ · Content',
+    title: 'คอนเทนต์ · Studio',
     items: [
       { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
       { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
