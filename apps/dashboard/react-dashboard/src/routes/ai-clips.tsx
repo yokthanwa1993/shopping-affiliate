@@ -81,7 +81,7 @@ function UploadDialog({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black px-4 py-4 sm:py-6"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
       onClick={() => !isUploading && onClose()}
       role="dialog"
       aria-modal="true"
@@ -297,13 +297,13 @@ function AiDetailModal({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black px-4 py-4 sm:py-6"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
     >
       <div
-        className="my-auto flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-2xl border bg-card shadow-xl sm:max-h-[calc(100dvh-3rem)]"
+        className="my-auto flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-2xl border bg-card shadow-xl sm:max-h-[calc(100dvh-3rem)]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
@@ -325,7 +325,7 @@ function AiDetailModal({
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
-          <div className="mx-auto w-full max-w-[260px] overflow-hidden rounded-2xl border bg-black sm:max-w-[280px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(58dvh, 560px)' }}>
+          <div className="mx-auto w-full max-w-[220px] overflow-hidden rounded-2xl border bg-black sm:max-w-[240px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(46dvh, 420px)' }}>
             {playback ? (
               <video
                 src={playback}
@@ -480,7 +480,7 @@ export function AiClipsPage() {
       ) : null}
 
       {query.isLoading ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {Array.from({ length: 10 }).map((_, i) => (
             <div key={i} className="aspect-[9/16] animate-pulse rounded-2xl bg-muted" />
           ))}
@@ -496,7 +496,7 @@ export function AiClipsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {items.map((item, i) => (
             <AiCard key={item.id || i} item={item} onOpen={() => setSelected(item)} />
           ))}
