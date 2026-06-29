@@ -11000,10 +11000,22 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
         if (!isAiClipLinkValid(lazadaRaw)) return c.json({ ok: false, error: 'invalid_lazada_link' }, 400)
         const shopeeLink = sanitizeAiClipLink(shopeeRaw)
         const lazadaLink = sanitizeAiClipLink(lazadaRaw)
-        const id = sanitizeAiClipId(generateAiClipId(Date.now(), crypto.randomUUID().replace(/-/g, '')))
-        if (!id) return c.json({ ok: false, error: 'id_generation_failed' }, 500)
 
         const bucket = c.get('bucket')
+        let id = ''
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+            const candidate = sanitizeAiClipId(generateAiClipId(Date.now() + attempt, crypto.randomUUID()))
+            if (!candidate) continue
+            const candidateRecordKey = aiClipRecordKey(namespaceId, candidate)
+            if (!candidateRecordKey) continue
+            const existing = await bucket.get(candidateRecordKey).catch(() => null)
+            if (!existing) {
+                id = candidate
+                break
+            }
+        }
+        if (!id) return c.json({ ok: false, error: 'id_generation_failed' }, 500)
+
         // Store the original under the SHARED asset key so /api/gallery/:id/asset/original serves it.
         // Stream the Blob straight to R2 (no full-buffer in memory).
         const originalKey = aiClipOriginalAssetKey(id) || getPrimaryOriginalVideoAssetKey(id)

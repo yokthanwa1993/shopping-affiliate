@@ -80,13 +80,18 @@ export function aiClipOriginalAssetKey(id: string): string {
     return normalized ? `videos/${normalized}_original.mp4` : ''
 }
 
-// AI clip ids are always `ai_<base36 timestamp>_<random>` so they sort by time, are easy to
-// recognize in R2, and can never collide with legacy inbox ids. `now`/`randomToken` are
-// injected so the generator stays pure + testable.
+// AI clip ids are 7 numeric digits only, per operator UX preference. They are
+// intentionally short for manual handling/screenshots; the upload route checks the
+// namespace-scoped R2 record key and retries if this candidate already exists.
+// `now`/`randomToken` are injected so the generator stays pure + testable.
 export function generateAiClipId(now: number, randomToken: string): string {
-    const ts = Number.isFinite(now) && now > 0 ? Math.floor(now) : 0
-    const rand = String(randomToken || '').replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 10) || '0'
-    return `ai_${ts.toString(36)}_${rand}`
+    const seed = `${Number.isFinite(now) && now > 0 ? Math.floor(now) : 0}:${String(randomToken || '')}`
+    let hash = 2166136261
+    for (let i = 0; i < seed.length; i += 1) {
+        hash ^= seed.charCodeAt(i)
+        hash = Math.imul(hash, 16777619) >>> 0
+    }
+    return String(1000000 + (hash % 9000000))
 }
 
 // Strip anything that is not a safe id char so a crafted id can never escape the `_ai_clips/`
@@ -212,7 +217,7 @@ export function buildAiClipResponse(
     return {
         id: record.id,
         video_id: record.id,
-        title: record.title || record.originalFileName || `AI ${record.id}`,
+        title: record.title || record.id,
         status: processed ? 'processed' : 'unprocessed',
         sourceType: AI_CLIP_SOURCE_TYPE,
         source_type: AI_CLIP_SOURCE_TYPE,

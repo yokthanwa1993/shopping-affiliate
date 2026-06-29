@@ -49,15 +49,15 @@ test('parseAiClipView defaults to unprocessed', () => {
     assert.equal(parseAiClipView('garbage'), 'unprocessed')
 })
 
-test('generateAiClipId is time-sortable and prefixed', () => {
+test('generateAiClipId returns a short 7-digit numeric id', () => {
     const id = generateAiClipId(1_700_000_000_000, 'ABcd12==ef')
-    assert.match(id, /^ai_[a-z0-9]+_[a-z0-9]+$/)
-    assert.ok(id.startsWith('ai_'))
+    assert.match(id, /^\d{7}$/)
+    assert.notEqual(id, generateAiClipId(1_700_000_000_001, 'ABcd12==ef'))
 })
 
 test('sanitizeAiClipId strips path traversal and unsafe chars', () => {
     assert.equal(sanitizeAiClipId('../../etc/passwd'), 'etcpasswd')
-    assert.equal(sanitizeAiClipId('ai_123_abc'), 'ai_123_abc')
+    assert.equal(sanitizeAiClipId('1234567'), '1234567')
     assert.equal(sanitizeAiClipId('a b/c'), 'abc')
     assert.equal(sanitizeAiClipId(''), '')
 })
@@ -65,18 +65,18 @@ test('sanitizeAiClipId strips path traversal and unsafe chars', () => {
 test('aiClipRecordKey lives under the dedicated namespace prefix (never _inbox/)', () => {
     const ns = '1774858894802785816'
     assert.equal(aiClipNamespacePrefix(ns), `${AI_CLIP_PREFIX}${ns}/`)
-    const key = aiClipRecordKey(ns, 'ai_123_abc')
-    assert.equal(key, `${AI_CLIP_PREFIX}${ns}/ai_123_abc.json`)
+    const key = aiClipRecordKey(ns, '1234567')
+    assert.equal(key, `${AI_CLIP_PREFIX}${ns}/1234567.json`)
     assert.ok(!key.startsWith('_inbox/'))
     assert.equal(aiClipRecordKey(ns, '../escape'), `${AI_CLIP_PREFIX}${ns}/escape.json`)
-    assert.equal(aiClipRecordKey('', 'ai_123_abc'), '')
+    assert.equal(aiClipRecordKey('', '1234567'), '')
     assert.equal(aiClipRecordKey(ns, ''), '')
 })
 
 test('aiClipOriginalAssetKey is sanitized and never points at legacy inbox', () => {
-    assert.equal(aiClipOriginalAssetKey('ai_123_abc'), 'videos/ai_123_abc_original.mp4')
-    assert.equal(aiClipOriginalAssetKey('../ai_123'), 'videos/ai_123_original.mp4')
-    assert.ok(!aiClipOriginalAssetKey('ai_123_abc').startsWith('_inbox/'))
+    assert.equal(aiClipOriginalAssetKey('1234567'), 'videos/1234567_original.mp4')
+    assert.equal(aiClipOriginalAssetKey('../1234567'), 'videos/1234567_original.mp4')
+    assert.ok(!aiClipOriginalAssetKey('1234567').startsWith('_inbox/'))
     assert.equal(aiClipOriginalAssetKey(''), '')
 })
 
@@ -157,6 +157,22 @@ test('sortAiClipRecords is newest-first', () => {
     const older = record({ id: 'ai_old', createdAt: '2026-06-01T00:00:00.000Z', updatedAt: '2026-06-01T00:00:00.000Z' })
     const newer = record({ id: 'ai_new', createdAt: '2026-06-28T00:00:00.000Z', updatedAt: '2026-06-28T00:00:00.000Z' })
     assert.deepEqual(sortAiClipRecords([older, newer]).map((r) => r.id), ['ai_new', 'ai_old'])
+})
+
+
+test('buildAiClipResponse falls back to the 7-digit id as the display title', () => {
+    const record = normalizeAiClipRecord({
+        id: '1234567',
+        namespaceId: '1774858894802785816',
+        originalFileName: 'long-human-file-name.webm',
+        createdAt: '2026-06-29T00:00:00.000Z',
+    })
+    assert.ok(record)
+    const response = buildAiClipResponse(record!, {
+        namespaceId: '1774858894802785816',
+        workerUrl: 'https://api.pubilo.com',
+    })
+    assert.equal(response.title, '1234567')
 })
 
 test('buildAiClipResponse points playback/thumb at namespace-scoped asset endpoints', () => {
