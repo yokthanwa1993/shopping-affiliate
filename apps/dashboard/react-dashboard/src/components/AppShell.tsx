@@ -4,15 +4,12 @@ import { Link } from '@tanstack/react-router'
 import {
   Check,
   ChevronDown,
-  Clock,
   Cpu,
   Facebook,
   Film,
   Layers,
   LayoutDashboard,
   Link2,
-  Megaphone,
-  MessageSquare,
   PackageOpen,
   PenSquare,
   Settings,
@@ -69,13 +66,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
     title: 'เครื่องมือ · Tools',
     items: [
       { to: '/custom-link', label: 'คัสตอมลิงก์', sublabel: 'Custom Link', icon: Link2, exact: false },
-      { to: '/campaigns', label: 'แคมเปญ', sublabel: 'Campaigns', icon: Megaphone, exact: false },
-      { to: '/queue', label: 'คิวสร้างแอด', sublabel: 'Queue', icon: Clock, exact: false },
     ],
-  },
-  {
-    title: 'กิจกรรม · Activity',
-    items: [{ to: '/history', label: 'ประวัติ', sublabel: 'History', icon: MessageSquare, exact: false }],
   },
 ] as const
 
