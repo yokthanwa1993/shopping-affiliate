@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -75,10 +75,12 @@ function StatusBadge({
   status,
   variant = 'overlay',
   className = '',
+  showLabel = false,
 }: {
   status: string
   variant?: 'overlay' | 'solid'
   className?: string
+  showLabel?: boolean
 }) {
   const meta = clipStatusMeta(status)
   const Icon = STATUS_ICON[meta.tone]
@@ -86,10 +88,12 @@ function StatusBadge({
   const shadow = variant === 'overlay' ? ' shadow-lg backdrop-blur-sm' : ''
   return (
     <span
-      className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-bold${shadow} ${palette} ${className}`}
+      className={`inline-flex items-center justify-center rounded-full ${showLabel ? 'gap-1 px-2 py-1 text-[10px]' : 'h-8 w-8 p-0'} font-bold${shadow} ${palette} ${className}`}
+      aria-label={meta.label}
+      title={meta.label}
     >
-      <Icon className={`h-3 w-3${meta.tone === 'processing' ? ' animate-spin' : ''}`} />
-      {meta.label}
+      <Icon className={`${showLabel ? 'h-3 w-3' : 'h-4 w-4'}${meta.tone === 'processing' ? ' animate-spin' : ''}`} />
+      {showLabel ? meta.label : <span className="sr-only">{meta.label}</span>}
     </span>
   )
 }
@@ -325,34 +329,39 @@ function compactThaiDate(value: string): string {
   })
 }
 
-function CardThumb({ item }: { item: AiClip }) {
+function CardThumb({ item, eager = false }: { item: AiClip; eager?: boolean }) {
   const [failed, setFailed] = useState(false)
+  const [loaded, setLoaded] = useState(false)
   const src = item.thumbnailUrl.trim()
-  if (!src || failed) {
-    return (
-      <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-violet-600 via-fuchsia-500 to-indigo-500">
-        <div className="rounded-full bg-white/20 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white">
-          AI
-        </div>
-        <p className="mt-3 line-clamp-3 px-4 text-center text-xs font-semibold text-white/90">
-          {item.title || item.sourceLabel || 'คลิป AI'}
-        </p>
+  const fallback = (
+    <div className="absolute inset-0 flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-slate-200 via-slate-100 to-slate-300">
+      <div className="rounded-full bg-violet-600/85 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white shadow-sm">
+        AI
       </div>
-    )
-  }
+      <p className="mt-3 line-clamp-3 px-4 text-center text-xs font-semibold text-slate-600">
+        {item.title || item.sourceLabel || 'คลิป AI'}
+      </p>
+    </div>
+  )
+  if (!src || failed) return <div className="relative h-full w-full">{fallback}</div>
   return (
-    <img
-      src={src}
-      className="h-full w-full object-cover"
-      loading="lazy"
-      decoding="async"
-      alt=""
-      onError={() => setFailed(true)}
-    />
+    <div className="relative h-full w-full overflow-hidden">
+      {!loaded ? fallback : null}
+      <img
+        src={src}
+        className={`h-full w-full object-cover transition-opacity duration-300 ${loaded ? 'opacity-100' : 'opacity-0'}`}
+        loading={eager ? 'eager' : 'lazy'}
+        decoding="async"
+        fetchPriority={eager ? 'high' : 'auto'}
+        alt=""
+        onLoad={() => setLoaded(true)}
+        onError={() => setFailed(true)}
+      />
+    </div>
   )
 }
 
-function AiCard({ item, onOpen }: { item: AiClip; onOpen: () => void }) {
+function AiCard({ item, onOpen, index = 0 }: { item: AiClip; onOpen: () => void; index?: number }) {
   const dateLabel = compactThaiDate(item.processedAt || item.createdAt)
   return (
     <button
@@ -360,7 +369,7 @@ function AiCard({ item, onOpen }: { item: AiClip; onOpen: () => void }) {
       onClick={onOpen}
       className="relative aspect-[9/16] overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition-transform duration-200 active:scale-95"
     >
-      <CardThumb item={item} />
+      <CardThumb item={item} eager={index < 8} />
       <div className="absolute left-2 top-2 flex items-center gap-1.5">
         <span className="inline-flex items-center gap-1 rounded-full bg-violet-600/95 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
           <Sparkles className="h-3 w-3" /> AI
@@ -508,7 +517,7 @@ function AiDetailModal({
                       : 'คลิปนี้อยู่ในคลัง รอประมวลผล'}
               </p>
             </div>
-            <StatusBadge status={item.status} variant="solid" className="shrink-0" />
+            <StatusBadge status={item.status} variant="solid" className="shrink-0" showLabel />
           </div>
 
           {item.error ? (
@@ -541,23 +550,16 @@ export function AiClipsPage() {
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
   const queryClient = useQueryClient()
 
-  // One unified list: fetch both worker views and merge into a single newest-first grid.
-  // The processed view wins on id collisions so a clip never shows up twice or regresses
-  // to a stale "waiting" card after it finishes.
-  const query = useQuery({
-    queryKey: ['ai-clips', 'all'],
-    queryFn: async ({ signal }) => {
-      const [processed, unprocessed] = await Promise.all([
-        fetchAiClips('processed', signal),
-        fetchAiClips('unprocessed', signal),
-      ])
-      const byId = new Map<string, AiClip>()
-      for (const clip of [...processed, ...unprocessed]) {
-        const key = clip.id || `${clip.title}|${clip.createdAt}`
-        if (!byId.has(key)) byId.set(key, clip)
-      }
-      return Array.from(byId.values()).sort((a, b) => clipTimestamp(b) - clipTimestamp(a))
-    },
+  // Load processed and unprocessed as independent queries so a slow/empty unprocessed
+  // request does not block the visible Media grid. Processed clips usually make up most
+  // of the page, so render them as soon as they return and merge the live statuses later.
+  const processedQuery = useQuery({
+    queryKey: ['ai-clips', 'processed'],
+    queryFn: ({ signal }) => fetchAiClips('processed', signal),
+  })
+  const unprocessedQuery = useQuery({
+    queryKey: ['ai-clips', 'unprocessed'],
+    queryFn: ({ signal }) => fetchAiClips('unprocessed', signal),
   })
 
   const upload = useMutation({
@@ -584,7 +586,17 @@ export function AiClipsPage() {
     },
   })
 
-  const items = query.data ?? []
+  const items = useMemo(() => {
+    const byId = new Map<string, AiClip>()
+    for (const clip of [...(processedQuery.data ?? []), ...(unprocessedQuery.data ?? [])]) {
+      const key = clip.id || `${clip.title}|${clip.createdAt}`
+      if (!byId.has(key)) byId.set(key, clip)
+    }
+    return Array.from(byId.values()).sort((a, b) => clipTimestamp(b) - clipTimestamp(a))
+  }, [processedQuery.data, unprocessedQuery.data])
+  const isInitialLoading = processedQuery.isLoading && unprocessedQuery.isLoading
+  const isFetching = processedQuery.isFetching || unprocessedQuery.isFetching
+  const loadError = processedQuery.error || unprocessedQuery.error
 
   return (
     <div className="mx-auto max-w-6xl space-y-5">
@@ -634,20 +646,20 @@ export function AiClipsPage() {
 
       <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm font-medium text-muted-foreground">
-          {query.isLoading ? 'กำลังโหลด…' : `ทั้งหมด ${items.length} คลิป`}
+          {isInitialLoading ? 'กำลังโหลด…' : `ทั้งหมด ${items.length} คลิป`}
         </p>
-        <Button type="button" variant="outline" onClick={() => void query.refetch()} disabled={query.isFetching}>
-          {query.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
+        <Button type="button" variant="outline" onClick={() => { void processedQuery.refetch(); void unprocessedQuery.refetch() }} disabled={isFetching}>
+          {isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
         </Button>
       </div>
 
-      {query.isError ? (
+      {loadError ? (
         <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-          โหลดคลัง AI ไม่สำเร็จ: {query.error instanceof Error ? query.error.message : 'unknown error'}
+          โหลดคลัง AI ไม่สำเร็จ: {loadError instanceof Error ? loadError.message : 'unknown error'}
         </div>
       ) : null}
 
-      {query.isLoading ? (
+      {isInitialLoading ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {Array.from({ length: 10 }).map((_, i) => (
             <div key={i} className="aspect-[9/16] animate-pulse rounded-2xl bg-muted" />
@@ -664,7 +676,7 @@ export function AiClipsPage() {
       ) : (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {items.map((item, i) => (
-            <AiCard key={item.id || i} item={item} onOpen={() => setSelected(item)} />
+            <AiCard key={item.id || i} item={item} index={i} onOpen={() => setSelected(item)} />
           ))}
         </div>
       )}
