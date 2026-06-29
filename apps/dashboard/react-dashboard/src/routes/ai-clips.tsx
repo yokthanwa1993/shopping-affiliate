@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   CheckCircle2,
-  Clock,
   ExternalLink,
   Loader2,
   ShoppingBag,
@@ -34,7 +33,7 @@ const ACCEPT = 'video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.m4v'
 // Per-clip status badge. The worker currently only distinguishes processed vs
 // unprocessed (presence of processedAt), but we map the broader processing/failed
 // vocabulary too so the badge stays correct if the backend reports richer states later.
-type ClipStatusTone = 'processed' | 'processing' | 'failed' | 'waiting'
+type ClipStatusTone = 'processed' | 'processing' | 'failed'
 
 function clipStatusMeta(status: string): { tone: ClipStatusTone; label: string } {
   const s = String(status || '').trim().toLowerCase()
@@ -47,28 +46,25 @@ function clipStatusMeta(status: string): { tone: ClipStatusTone; label: string }
   if (['failed', 'error', 'failure', 'errored'].includes(s)) {
     return { tone: 'failed', label: 'ล้มเหลว' }
   }
-  return { tone: 'waiting', label: 'รอประมวลผล' }
+  return { tone: 'processing', label: 'กำลังประมวลผล' }
 }
 
 const STATUS_OVERLAY: Record<ClipStatusTone, string> = {
   processed: 'bg-emerald-600/95 text-white',
   processing: 'bg-amber-500/95 text-white',
   failed: 'bg-red-600/95 text-white',
-  waiting: 'bg-slate-800/85 text-white',
 }
 
 const STATUS_SOLID: Record<ClipStatusTone, string> = {
   processed: 'bg-emerald-100 text-emerald-700',
   processing: 'bg-amber-100 text-amber-700',
   failed: 'bg-red-100 text-red-700',
-  waiting: 'bg-slate-200 text-slate-700',
 }
 
 const STATUS_ICON: Record<ClipStatusTone, typeof CheckCircle2> = {
   processed: CheckCircle2,
   processing: Loader2,
   failed: AlertTriangle,
-  waiting: Clock,
 }
 
 function StatusBadge({
@@ -86,13 +82,17 @@ function StatusBadge({
   const Icon = STATUS_ICON[meta.tone]
   const palette = variant === 'overlay' ? STATUS_OVERLAY[meta.tone] : STATUS_SOLID[meta.tone]
   const shadow = variant === 'overlay' ? ' shadow-lg backdrop-blur-sm' : ''
+  const isProcessing = meta.tone === 'processing'
   return (
     <span
-      className={`inline-flex items-center justify-center rounded-full ${showLabel ? 'gap-1 px-2 py-1 text-[10px]' : 'h-8 w-8 p-0'} font-bold${shadow} ${palette} ${className}`}
+      className={`relative inline-flex items-center justify-center rounded-full ${showLabel ? 'gap-1 px-2 py-1 text-[10px]' : 'h-8 w-8 p-0'} font-bold${shadow} ${palette} ${isProcessing ? ' ring-2 ring-amber-200/80 ring-offset-2 ring-offset-white/30 animate-pulse' : ''} ${className}`}
       aria-label={meta.label}
       title={meta.label}
     >
-      <Icon className={`${showLabel ? 'h-3 w-3' : 'h-4 w-4'}${meta.tone === 'processing' ? ' animate-spin' : ''}`} />
+      {isProcessing && !showLabel ? (
+        <span className="absolute inset-[-4px] rounded-full border-2 border-amber-200/80 border-t-white/95 animate-spin" aria-hidden="true" />
+      ) : null}
+      <Icon className={`${showLabel ? 'h-3 w-3' : 'h-4 w-4'}${isProcessing ? ' animate-spin' : ''}`} />
       {showLabel ? meta.label : <span className="sr-only">{meta.label}</span>}
     </span>
   )
