@@ -2,7 +2,6 @@ import { useEffect, type ReactNode } from 'react'
 import { createRootRoute, createRoute, createRouter, Outlet } from '@tanstack/react-router'
 import { AppShell } from '@/components/AppShell'
 import { OverviewPage } from '@/routes/overview'
-import { GalleryPage } from '@/routes/gallery'
 import { MediaLibraryPage } from '@/routes/media-library'
 import { SourceInventoryPage } from '@/routes/source-inventory'
 import { AiClipsPage } from '@/routes/ai-clips'
@@ -53,7 +52,6 @@ function page<const TPath extends string>(path: TPath, component: () => ReactNod
 }
 
 const overviewRoute = page('/', OverviewPage)
-const galleryRoute = page('/gallery', GalleryPage)
 const mediaLibraryRoute = page('/media-library', MediaLibraryPage)
 const sourceInventoryRoute = page('/source-inventory', SourceInventoryPage)
 // Production exposes the source inventory under both /source-inventory and the
@@ -72,8 +70,9 @@ function RedirectToMedia() {
   return <AiClipsPage />
 }
 
-// Legacy alias: keep old bookmarks working but move the browser to /dashboard/media.
+// Legacy aliases: keep old bookmarks working but move the browser to /dashboard/media.
 const aiClipsRoute = page('/ai-clips', RedirectToMedia)
+const galleryRoute = page('/gallery', RedirectToMedia)
 // Explore — search-first view over the cached page-video endpoint, sits above
 // "คลังต้นฉบับ" (/ai-clips) in the Studio nav group.
 const exploreRoute = page('/explore', ExplorePage)

@@ -6,7 +6,6 @@ import {
   ChevronDown,
   Compass,
   Facebook,
-  Images,
   LayoutDashboard,
   Library,
   Link2,
@@ -58,7 +57,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
       //    links) here. The legacy Chinese/LINE source-inventory route still
       //    exists at /source-inventory but is no longer surfaced in the nav.
       // 2) Processing status now lives on Media cards; the old Processing nav is hidden.
-      // 3) "Media Library" stays at /media-library — Facebook media, NOT the AI
+      // 3) Gallery is folded into Media; Media Library stays Facebook-specific.
       //    upload workspace.
       // Explore sits above "คลังต้นฉบับ": a search-first view over the cached
       // page-video endpoint for finding posts/videos from configured pages.
@@ -77,7 +76,6 @@ const NAV_GROUPS: readonly NavGroup[] = [
         exact: false,
         activePaths: ['/media', '/ai-clips', '/source-inventory', '/source-processing', '/inbox'],
       },
-      { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Images, exact: false },
       {
         to: '/media-library',
         label: 'คลังสื่อ',

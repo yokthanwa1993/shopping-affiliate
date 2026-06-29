@@ -27,6 +27,7 @@ export interface AiClip {
   sizeBytes: number
   shopeeLink: string
   lazadaLink: string
+  error: string
 }
 
 function normalize(raw: unknown, index: number): AiClip | null {
@@ -48,6 +49,7 @@ function normalize(raw: unknown, index: number): AiClip | null {
     sizeBytes: Number(safeString(pick(raw, ['sizeBytes', 'size_bytes'])) || '0') || 0,
     shopeeLink: pick(raw, ['shopeeLink', 'shopee_link']),
     lazadaLink: pick(raw, ['lazadaLink', 'lazada_link']),
+    error: pick(raw, ['error', 'errorMessage', 'error_message', 'lastError', 'last_error']),
   }
 }
 

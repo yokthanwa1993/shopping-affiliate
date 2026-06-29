@@ -105,6 +105,34 @@ function clipTimestamp(item: AiClip): number {
   return Number.isNaN(t) ? 0 : t
 }
 
+type PlaybackChoice = 'original' | 'processed'
+
+function cleanUrl(value: string): string {
+  return String(value || '').trim()
+}
+
+function originalPlaybackUrl(item: AiClip): string {
+  return cleanUrl(item.originalUrl)
+}
+
+function processedPlaybackUrl(item: AiClip): string {
+  const original = originalPlaybackUrl(item)
+  const processed = cleanUrl(item.videoUrl || item.previewUrl)
+  if (!processed || processed === original) return ''
+  const meta = clipStatusMeta(item.status)
+  if (meta.tone !== 'processed' && !item.processedAt) return ''
+  return processed
+}
+
+function sourceAvailabilityLabel(item: AiClip): string {
+  const hasOriginal = Boolean(originalPlaybackUrl(item))
+  const hasProcessed = Boolean(processedPlaybackUrl(item))
+  if (hasOriginal && hasProcessed) return 'มีต้นฉบับและผลลัพธ์ให้ดู'
+  if (hasOriginal) return 'มีต้นฉบับให้ดู'
+  if (hasProcessed) return 'มีผลลัพธ์ให้ดู'
+  return 'ยังไม่มีวิดีโอให้ดู'
+}
+
 // Optional links: empty is fine, but a non-empty value must look like an http(s) URL. The
 // worker re-validates this server-side; this is just early, friendly feedback.
 function looksLikeUrl(value: string): boolean {
@@ -369,7 +397,20 @@ function AiDetailModal({
   onDelete: () => void
   isDeleting: boolean
 }) {
-  const playback = (item.videoUrl || item.previewUrl || item.originalUrl || '').trim()
+  const originalPlayback = originalPlaybackUrl(item)
+  const processedPlayback = processedPlaybackUrl(item)
+  const hasOriginal = Boolean(originalPlayback)
+  const hasProcessed = Boolean(processedPlayback)
+  const defaultPlayback: PlaybackChoice = hasProcessed ? 'processed' : 'original'
+  const [playbackChoice, setPlaybackChoice] = useState<PlaybackChoice>(defaultPlayback)
+  const chosenPlayback = playbackChoice === 'processed' ? processedPlayback : originalPlayback
+  const playback = chosenPlayback || processedPlayback || originalPlayback
+  const statusTone = clipStatusMeta(item.status).tone
+
+  useEffect(() => {
+    setPlaybackChoice(hasProcessed ? 'processed' : 'original')
+  }, [item.id, hasProcessed])
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose()
@@ -408,39 +449,74 @@ function AiDetailModal({
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
-          <div className="mx-auto w-full max-w-[220px] overflow-hidden rounded-2xl border bg-muted sm:max-w-[240px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(46dvh, 420px)' }}>
-            {playback ? (
-              <video
-                src={playback}
-                className="block h-full w-full object-cover"
-                controls
-                autoPlay
-                playsInline
-                preload="metadata"
-                poster={item.thumbnailUrl || undefined}
-              />
-            ) : (
-              <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-violet-600 via-fuchsia-500 to-indigo-500">
-                <p className="px-6 text-center text-sm font-semibold text-white/90">ไม่มีพรีวิววิดีโอ</p>
+          <div className="space-y-3">
+            <div className="mx-auto w-full max-w-[220px] overflow-hidden rounded-2xl border bg-muted sm:max-w-[240px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(46dvh, 420px)' }}>
+              {playback ? (
+                <video
+                  key={`${item.id || item.title}-${playbackChoice}-${playback}`}
+                  src={playback}
+                  className="block h-full w-full object-cover"
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                  poster={item.thumbnailUrl || undefined}
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-violet-600 via-fuchsia-500 to-indigo-500">
+                  <p className="px-6 text-center text-sm font-semibold text-white/90">ไม่มีพรีวิววิดีโอ</p>
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-xl border bg-background p-2">
+              <p className="mb-2 px-1 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">เลือกวิดีโอที่ต้องการดู</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={playbackChoice === 'original' ? 'default' : 'outline'}
+                  onClick={() => setPlaybackChoice('original')}
+                  disabled={!hasOriginal}
+                >
+                  ต้นฉบับ
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={playbackChoice === 'processed' ? 'default' : 'outline'}
+                  onClick={() => setPlaybackChoice('processed')}
+                  disabled={!hasProcessed}
+                >
+                  ประมวลผลแล้ว
+                </Button>
               </div>
-            )}
+              <p className="mt-2 px-1 text-xs text-muted-foreground">{sourceAvailabilityLabel(item)}</p>
+            </div>
           </div>
 
           <div className="flex items-center justify-between gap-3 rounded-xl bg-muted px-3 py-3 text-sm text-foreground">
             <div className="min-w-0">
               <p className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-60">สถานะ</p>
               <p className="mt-1 font-semibold">
-                {clipStatusMeta(item.status).tone === 'processed'
+                {statusTone === 'processed'
                   ? 'คลิปนี้ประมวลผลแล้ว'
-                  : clipStatusMeta(item.status).tone === 'processing'
+                  : statusTone === 'processing'
                     ? 'คลิปนี้กำลังประมวลผล'
-                    : clipStatusMeta(item.status).tone === 'failed'
+                    : statusTone === 'failed'
                       ? 'คลิปนี้ประมวลผลไม่สำเร็จ'
                       : 'คลิปนี้อยู่ในคลัง รอประมวลผล'}
               </p>
             </div>
             <StatusBadge status={item.status} variant="solid" className="shrink-0" />
           </div>
+
+          {item.error ? (
+            <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-sm text-red-700">
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em]">Error</p>
+              <p className="mt-1 break-words font-medium">{item.error}</p>
+            </div>
+          ) : null}
 
           {item.shopeeLink || item.lazadaLink ? (
             <div className="space-y-2">
