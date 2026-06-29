@@ -25463,6 +25463,37 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
 // The durable `_queue/` stays a transient one-job handoff: when the namespace already has
 // an active OR queued job, `selectNextAiClipToProcess` defers the whole backlog and we
 // start nothing. Returns true only when a job was actually started this call.
+
+async function drainAiClipQueueOnlyForNamespace(
+    env: Env,
+    bucket: R2Bucket,
+    namespaceId: string,
+): Promise<boolean> {
+    const botId = String(namespaceId || '').trim()
+    if (!botId) return false
+    const list = await bucket.list({ prefix: '_queue/' }).catch(() => ({ objects: [] as Array<{ key: string }> }))
+    const objects = Array.isArray(list.objects) ? list.objects : []
+    if (!objects.length) return false
+
+    let hasAiClipQueue = false
+    for (const obj of objects) {
+        const queued = await bucket.get(obj.key).catch(() => null)
+        const job = queued ? await queued.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown> : {}
+        const sourceType = String(job.sourceType || '').trim()
+        const sourceLabel = String(job.sourceLabel || '').trim().toLowerCase()
+        const isAiClip = sourceType === 'ai_manual_upload' || sourceLabel.includes('ai clip')
+        if (isAiClip) {
+            hasAiClipQueue = true
+            continue
+        }
+        // Stop old legacy/Chinese queued handoffs from being promoted in the new Dashboard flow.
+        await bucket.delete(obj.key).catch(() => { })
+    }
+
+    if (!hasAiClipQueue) return false
+    return processNextInQueue(env, botId)
+}
+
 async function startNextAiClipSourceForNamespace(
     env: Env,
     bucket: R2Bucket,
@@ -25531,24 +25562,23 @@ async function dispatchNextProcessingJobForNamespace(
         return { namespaceId: botId, started: false, source: 'idle', detail: 'gemini_rate_limit_cooldown' }
     }
 
-    // Run the full queue stale-sweep before the fast active guard below. The
-    // fast guard is intentionally bounded and does not rewrite stale active
-    // records, so calling it first can leave a timed-out step 4.3/FFmpeg job
-    // blocking the namespace until the broad 30-minute fallback. processNextInQueue
-    // marks stale active jobs failed and then promotes exactly one queued job.
-    const queueSweepStarted = await processNextInQueue(env, botId).catch((error) => {
-        console.error(`[PROCESSING-DISPATCH] queue sweep failed for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
-        return false
-    })
-    if (queueSweepStarted) {
-        return { namespaceId: botId, started: true, source: 'queue', detail: 'queue_sweep' }
-    }
+    // New Dashboard/AI-source flow: do NOT run the old broad processNextInQueue
+    // pre-sweep here. That helper can promote legacy ready-inbox/admin-original
+    // items before the pure dispatcher gets a chance to apply disableLegacySources,
+    // which is how old Chinese clips kept auto-starting after the queue was cleared.
+    // The pure dispatcher below still drains an already-materialized durable queue
+    // via drainQueue, then starts at most one AI clip source item; legacy sources are
+    // disabled for automatic dispatch.
 
     return dispatchNextProcessingJob(botId, {
         // On error, assume a job is active so we never race a second start.
         hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
-        retryFailedJob: () => requeueDueFailedProcessingJob(env, botId),
-        drainQueue: () => processNextInQueue(env, botId),
+        // New flow must not requeue old failed legacy jobs. Failed AI/source records stay
+        // visible as failures; a new start comes from the AI source library below.
+        retryFailedJob: async () => false,
+        // Drain only AI-clip handoffs. The legacy processNextInQueue helper can fall back
+        // to old ready inbox/admin originals when called with an empty/non-AI queue, so guard it.
+        drainQueue: () => drainAiClipQueueOnlyForNamespace(env, bucket, botId),
         // New Dashboard flow: the AI clips / source library is the ONLY automatic backlog.
         startAiClipSource: () => startNextAiClipSourceForNamespace(env, bucket, botId),
         // LEGACY auto-pick — kept available but DISABLED via `disableLegacySources` below so
