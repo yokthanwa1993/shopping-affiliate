@@ -1229,3 +1229,110 @@ test('both ads branches gate post-first behind the env flag (default off keeps c
         assert.match(src, /cleanShortLink|comment_shortlink: normalizedShopeeLink/, `${label} keeps the create-ad fallback`)
     }
 })
+
+// ============================================================================
+// EXPLORE — WATCHED EXTERNAL PAGES (read-only feature, distinct from owned pages)
+// ============================================================================
+
+function getExternalWatchedBlockSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('// EXPLORE — WATCHED EXTERNAL FACEBOOK PAGES')
+    assert.notEqual(start, -1, 'explore external watched-pages block must exist')
+    const end = source.indexOf("app.get('/api/dashboard/facebook-page-sources'", start)
+    assert.notEqual(end, -1, 'explore block end marker must exist')
+    return source.slice(start, end)
+}
+
+function getExternalRouteSource(routeStart: string, routeEnd: string): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf(routeStart)
+    assert.notEqual(start, -1, `${routeStart} must exist`)
+    const end = source.indexOf(routeEnd, start + routeStart.length)
+    assert.notEqual(end, -1, `${routeStart} end marker (${routeEnd}) must exist`)
+    return source.slice(start, end)
+}
+
+test('explore uses distinct external tables, separate from owned posting pages', () => {
+    const block = getExternalWatchedBlockSource()
+    assert.match(block, /CREATE TABLE IF NOT EXISTS dashboard_external_watched_pages/)
+    assert.match(block, /CREATE TABLE IF NOT EXISTS dashboard_external_page_posts/)
+    // Provenance columns are preserved on the cached posts.
+    for (const col of ['page_key', 'page_name', 'post_id', 'video_id', 'permalink_url', 'source_url', 'picture', 'views', 'created_time']) {
+        assert.match(block, new RegExp(`\\b${col}\\b`), `external posts must store ${col}`)
+    }
+    // Tables are namespace-scoped via composite primary keys.
+    assert.match(block, /PRIMARY KEY \(namespace_id, page_key\)/)
+    assert.match(block, /PRIMARY KEY \(namespace_id, page_key, post_id\)/)
+    // It must NOT reuse the owned-page tables for the watch list.
+    assert.doesNotMatch(block, /INSERT INTO pages\b/)
+    assert.doesNotMatch(block, /facebook_page_video_cache/)
+})
+
+test('explore never gates on page ownership / is_active / posting token source / ad flow', () => {
+    const block = getExternalWatchedBlockSource()
+    assert.doesNotMatch(block, /is_active/)
+    assert.doesNotMatch(block, /post_tokens/)
+    assert.doesNotMatch(block, /comment_tokens/)
+    assert.doesNotMatch(block, /getNamespacePagesTokenPool/)
+    assert.doesNotMatch(block, /create-ad|createAd|dashboard_ad_history/)
+})
+
+test('explore is read-only against Facebook (no posting/commenting/ads endpoints)', () => {
+    const block = getExternalWatchedBlockSource()
+    // No Graph WRITE/publish calls: external sync only reads /posts + /{id} fields.
+    assert.doesNotMatch(block, /method:\s*'POST'[\s\S]*graph\.facebook\.com/)
+    assert.doesNotMatch(block, /\/page-comment|\/feed['"`]|publishReel|buildAffiliateCommentMessage/)
+    // The Graph reads it does make are GET /posts and a name lookup only.
+    assert.match(block, /\/posts\?\$\{params\.toString\(\)\}/)
+    assert.match(block, /fields=name&access_token/)
+})
+
+test('explore resolves a read-only sync token and surfaces missing token as status, not a crash', () => {
+    const block = getExternalWatchedBlockSource()
+    assert.match(block, /resolveFacebookSyncToken\(env\.DB, key, ns\)/)
+    assert.match(block, /last_error: 'facebook_sync_token_missing'/)
+    // syncExternalWatchedPage captures Graph failures into last_error and returns ok:false.
+    assert.match(block, /last_error: message\.slice\(0, 200\)/)
+    // Never returns raw token to the client.
+    assert.doesNotMatch(block, /token:\s*token\b/)
+})
+
+test('normalizeExternalPageInput whitelists keys and rejects junk', () => {
+    const block = getExternalWatchedBlockSource()
+    assert.match(block, /function normalizeExternalPageInput/)
+    // Numeric ids, profile.php?id=, /people|/pages/<id>, and vanity slugs are handled.
+    assert.match(block, /profile\.php/)
+    assert.match(block, /people' \|\| first === 'pages'/)
+    // Key charset is whitelisted so it is safe to interpolate into a Graph path.
+    assert.match(block, /\[A-Za-z0-9\.\]\[A-Za-z0-9\._-\]/)
+    // Host is validated against facebook.com / fb.com before accepting a URL.
+    assert.match(block, /const host = parsed\.hostname\.toLowerCase\(\)/)
+})
+
+test('explore add/patch/delete/sync routes are auth-gated; GET reads are namespace-scoped', () => {
+    const addRoute = getExternalRouteSource("app.post('/api/dashboard/explore/watched-pages'", "app.patch('/api/dashboard/explore/watched-pages/:pageKey'")
+    const patchRoute = getExternalRouteSource("app.patch('/api/dashboard/explore/watched-pages/:pageKey'", "app.delete('/api/dashboard/explore/watched-pages/:pageKey'")
+    const deleteRoute = getExternalRouteSource("app.delete('/api/dashboard/explore/watched-pages/:pageKey'", "app.post('/api/dashboard/explore/sync'")
+    const syncRoute = getExternalRouteSource("app.post('/api/dashboard/explore/sync'", "app.get('/api/dashboard/explore/posts'")
+    for (const [label, src] of [['add', addRoute], ['patch', patchRoute], ['delete', deleteRoute], ['sync', syncRoute]] as const) {
+        assert.match(src, /requireAuthSession\(c\)/, `${label} route must require auth`)
+        assert.match(src, /c\.get\('botId'\)/, `${label} route must be namespace-scoped`)
+    }
+    // GET routes resolve the namespace from x-bot-id (c.get('botId')) too.
+    const listRoute = getExternalRouteSource("app.get('/api/dashboard/explore/watched-pages'", "app.post('/api/dashboard/explore/watched-pages'")
+    const postsRoute = getExternalRouteSource("app.get('/api/dashboard/explore/posts'", "app.get('/api/dashboard/facebook-page-sources'")
+    assert.match(listRoute, /c\.get\('botId'\)/)
+    assert.match(postsRoute, /c\.get\('botId'\)/)
+})
+
+test('explore cron sync is bounded, cooldown-gated, and wired into the scheduled handler', () => {
+    const block = getExternalWatchedBlockSource()
+    assert.match(block, /EXTERNAL_WATCHED_CRON_MAX_PER_TICK = 2/)
+    assert.match(block, /EXTERNAL_WATCHED_CRON_COOLDOWN_MS/)
+    assert.match(block, /function maybeSyncExternalWatchedPagesOnSchedule/)
+    assert.match(block, /enabled = 1/)
+    assert.match(block, /LIMIT \?/)
+    const source = readFileSync('src/index.ts', 'utf8')
+    // The scheduled handler runs it in its own waitUntil with error swallow.
+    assert.match(source, /_ctx\.waitUntil\(maybeSyncExternalWatchedPagesOnSchedule\(env\)\.catch/)
+})

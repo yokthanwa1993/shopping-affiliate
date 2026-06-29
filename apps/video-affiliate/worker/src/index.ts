@@ -3660,6 +3660,7 @@ type DashboardSettingRow = {
 }
 
 let facebookPageVideoCacheTablesReady: Promise<void> | null = null
+let externalWatchedPagesTablesReady: Promise<void> | null = null
 let dashboardSettingsTableReady: Promise<void> | null = null
 let pageVideoAssetWinnersTableReady: Promise<void> | null = null
 let processedVideoAssetLibraryTableReady: Promise<void> | null = null
@@ -7689,6 +7690,753 @@ app.post('/admin/api/migrate-namespaces', async (c) => {
 app.get('/admin/api/gallery/index/status', async (c) => {
     const summary = await getGalleryIndexSummary(c.env.DB)
     return c.json({ ok: true, ...summary })
+})
+
+// =====================================================================
+// EXPLORE — WATCHED EXTERNAL FACEBOOK PAGES
+// A separate, read-only feature from the owned posting Pages. The operator adds
+// Facebook Page URLs/IDs for pages we do NOT own; a bounded cron (and a manual
+// sync button) continuously fetches their posts/clips + view metrics into our
+// own cache. This NEVER posts/comments/creates ads and NEVER touches the `pages`
+// table, posting token slots, page-active flags, or any ad-flow gate. The Graph reads
+// reuse resolveFacebookSyncToken purely as a read-only token; a missing token is
+// surfaced as a sync status error (last_error), never a crash.
+//
+// Distinct data model (namespace-scoped):
+//   dashboard_external_watched_pages — the watch list + per-page sync status
+//   dashboard_external_page_posts    — the cached external posts/clips
+// =====================================================================
+const EXTERNAL_WATCHED_BATCH_SIZE = 50
+// Per-page minimum gap between automatic sync attempts (manual sync uses force).
+const EXTERNAL_WATCHED_SYNC_COOLDOWN_MS = 5 * 60 * 1000
+const EXTERNAL_WATCHED_ERROR_COOLDOWN_MS = 60 * 60 * 1000
+// Global cron cadence + how many enabled pages we sync per tick, so this can
+// never derail (or be derailed by) the posting cron.
+const EXTERNAL_WATCHED_CRON_LAST_RUN_KEY = 'explore_external_sync_last_run_at'
+const EXTERNAL_WATCHED_CRON_COOLDOWN_MS = 10 * 60 * 1000
+const EXTERNAL_WATCHED_CRON_MAX_PER_TICK = 2
+
+type ExternalWatchedPageRow = {
+    namespace_id?: string
+    page_key?: string
+    page_url?: string
+    page_name?: string
+    enabled?: number
+    created_at?: string
+    last_attempt_at?: string
+    last_synced_at?: string
+    last_error?: string
+    last_batch_count?: number
+    next_after?: string
+    posts_count?: number
+    updated_at?: string
+}
+
+type ExternalPagePostRow = {
+    namespace_id?: string
+    page_key?: string
+    page_name?: string
+    post_id?: string
+    video_id?: string
+    is_video?: number
+    permalink_url?: string
+    source_url?: string
+    picture?: string
+    title?: string
+    description?: string
+    views?: number
+    created_time?: string
+    fetched_at?: string
+    updated_at?: string
+}
+
+async function ensureExternalWatchedPagesTables(db: D1Database): Promise<void> {
+    if (!externalWatchedPagesTablesReady) {
+        externalWatchedPagesTablesReady = (async () => {
+            await db.prepare(
+                `CREATE TABLE IF NOT EXISTS dashboard_external_watched_pages (
+                    namespace_id TEXT NOT NULL,
+                    page_key TEXT NOT NULL,
+                    page_url TEXT NOT NULL DEFAULT '',
+                    page_name TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    last_synced_at TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    last_batch_count INTEGER NOT NULL DEFAULT 0,
+                    next_after TEXT NOT NULL DEFAULT '',
+                    posts_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (namespace_id, page_key)
+                )`
+            ).run()
+            await db.prepare(
+                `CREATE INDEX IF NOT EXISTS idx_external_watched_pages_enabled
+                 ON dashboard_external_watched_pages(enabled, last_attempt_at)`
+            ).run().catch(() => { })
+            await db.prepare(
+                `CREATE TABLE IF NOT EXISTS dashboard_external_page_posts (
+                    namespace_id TEXT NOT NULL,
+                    page_key TEXT NOT NULL,
+                    page_name TEXT NOT NULL DEFAULT '',
+                    post_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL DEFAULT '',
+                    is_video INTEGER NOT NULL DEFAULT 0,
+                    permalink_url TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    picture TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    views INTEGER NOT NULL DEFAULT 0,
+                    created_time TEXT NOT NULL DEFAULT '',
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (namespace_id, page_key, post_id)
+                )`
+            ).run()
+            await db.prepare(
+                `CREATE INDEX IF NOT EXISTS idx_external_page_posts_rank
+                 ON dashboard_external_page_posts(namespace_id, page_key, views DESC, created_time DESC)`
+            ).run().catch(() => { })
+        })()
+    }
+    await externalWatchedPagesTablesReady
+}
+
+// Parse an operator-supplied Facebook Page URL or ID into a stable { key, url }.
+// `key` is the Graph node identifier (numeric id or vanity slug) and is also the
+// row primary key; it is whitelisted to [0-9A-Za-z._-] so it is always safe to
+// interpolate into a Graph path. Returns null for anything that isn't a
+// recognizable Facebook page reference (no invented data). Pure function.
+function normalizeExternalPageInput(raw: string): { key: string; url: string } | null {
+    const input = String(raw || '').trim()
+    if (!input) return null
+    const asSlug = (value: string): { key: string; url: string } | null => {
+        const slug = String(value || '').replace(/^@/, '').replace(/^\/+/, '').replace(/\/+$/, '').trim()
+        if (!slug) return null
+        if (/^\d{3,}$/.test(slug)) return { key: slug, url: `https://www.facebook.com/${slug}` }
+        if (!/^[A-Za-z0-9.][A-Za-z0-9._-]{1,}$/.test(slug)) return null
+        return { key: slug, url: `https://www.facebook.com/${slug}` }
+    }
+    // Pure numeric id
+    if (/^\d{3,}$/.test(input)) return { key: input, url: `https://www.facebook.com/${input}` }
+    // URL (or bare host/path) forms
+    const looksLikeUrl = /^https?:\/\//i.test(input) || /(?:^|\.)(facebook|fb)\.com\//i.test(input)
+    if (looksLikeUrl) {
+        let parsed: URL | null = null
+        try {
+            parsed = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`)
+        } catch {
+            return null
+        }
+        const host = parsed.hostname.toLowerCase()
+        if (!/(^|\.)facebook\.com$/.test(host) && !/(^|\.)fb\.com$/.test(host)) return null
+        const idParam = parsed.searchParams.get('id')
+        if (/\/profile\.php$/i.test(parsed.pathname.replace(/\/+$/, '')) && idParam && /^\d+$/.test(idParam)) {
+            return { key: idParam, url: `https://www.facebook.com/profile.php?id=${idParam}` }
+        }
+        const segs = parsed.pathname.split('/').filter(Boolean)
+        const first = (segs[0] || '').toLowerCase()
+        const last = segs[segs.length - 1] || ''
+        if ((first === 'people' || first === 'pages') && /^\d+$/.test(last)) {
+            return { key: last, url: `https://www.facebook.com/${last}` }
+        }
+        return asSlug(segs[0] || '')
+    }
+    return asSlug(input)
+}
+
+async function listExternalWatchedPages(db: D1Database, namespaceId: string): Promise<ExternalWatchedPageRow[]> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    if (!ns) return []
+    const res = await db.prepare(
+        `SELECT namespace_id, page_key, page_url, page_name, enabled, created_at,
+                last_attempt_at, last_synced_at, last_error, last_batch_count, next_after, posts_count, updated_at
+         FROM dashboard_external_watched_pages
+         WHERE namespace_id = ?
+         ORDER BY datetime(created_at) DESC`
+    ).bind(ns).all() as { results?: ExternalWatchedPageRow[] }
+    return Array.isArray(res.results) ? res.results : []
+}
+
+async function getExternalWatchedPage(db: D1Database, namespaceId: string, pageKey: string): Promise<ExternalWatchedPageRow | null> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(pageKey || '').trim()
+    if (!ns || !key) return null
+    return await db.prepare(
+        `SELECT namespace_id, page_key, page_url, page_name, enabled, created_at,
+                last_attempt_at, last_synced_at, last_error, last_batch_count, next_after, posts_count, updated_at
+         FROM dashboard_external_watched_pages
+         WHERE namespace_id = ? AND page_key = ?`
+    ).bind(ns, key).first() as ExternalWatchedPageRow | null
+}
+
+async function upsertExternalWatchedPage(
+    db: D1Database,
+    namespaceId: string,
+    fields: { pageKey: string; pageUrl?: string; pageName?: string; enabled?: boolean },
+): Promise<ExternalWatchedPageRow | null> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(fields.pageKey || '').trim()
+    if (!ns || !key) return null
+    await db.prepare(
+        `INSERT INTO dashboard_external_watched_pages (namespace_id, page_key, page_url, page_name, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, page_key) DO UPDATE SET
+            page_url = CASE WHEN excluded.page_url != '' THEN excluded.page_url ELSE dashboard_external_watched_pages.page_url END,
+            page_name = CASE WHEN excluded.page_name != '' THEN excluded.page_name ELSE dashboard_external_watched_pages.page_name END,
+            enabled = excluded.enabled,
+            updated_at = datetime('now')`
+    ).bind(
+        ns,
+        key,
+        String(fields.pageUrl || '').trim(),
+        String(fields.pageName || '').trim(),
+        fields.enabled === false ? 0 : 1,
+    ).run()
+    return getExternalWatchedPage(db, ns, key)
+}
+
+async function setExternalWatchedPageEnabled(db: D1Database, namespaceId: string, pageKey: string, enabled: boolean): Promise<ExternalWatchedPageRow | null> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(pageKey || '').trim()
+    if (!ns || !key) return null
+    await db.prepare(
+        `UPDATE dashboard_external_watched_pages SET enabled = ?, updated_at = datetime('now')
+         WHERE namespace_id = ? AND page_key = ?`
+    ).bind(enabled ? 1 : 0, ns, key).run()
+    return getExternalWatchedPage(db, ns, key)
+}
+
+async function deleteExternalWatchedPage(db: D1Database, namespaceId: string, pageKey: string): Promise<boolean> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(pageKey || '').trim()
+    if (!ns || !key) return false
+    const existing = await getExternalWatchedPage(db, ns, key)
+    if (!existing) return false
+    await db.prepare(`DELETE FROM dashboard_external_page_posts WHERE namespace_id = ? AND page_key = ?`).bind(ns, key).run().catch(() => { })
+    await db.prepare(`DELETE FROM dashboard_external_watched_pages WHERE namespace_id = ? AND page_key = ?`).bind(ns, key).run()
+    return true
+}
+
+async function updateExternalWatchedPageSyncState(
+    db: D1Database,
+    namespaceId: string,
+    pageKey: string,
+    fields: Partial<ExternalWatchedPageRow>,
+): Promise<ExternalWatchedPageRow | null> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(pageKey || '').trim()
+    if (!ns || !key) return null
+    const current = await getExternalWatchedPage(db, ns, key)
+    if (!current) return null
+    const pageName = String(fields.page_name ?? current.page_name ?? '').trim()
+    const lastAttemptAt = String(fields.last_attempt_at ?? current.last_attempt_at ?? '').trim()
+    const lastSyncedAt = String(fields.last_synced_at ?? current.last_synced_at ?? '').trim()
+    const lastError = String(fields.last_error ?? current.last_error ?? '').trim()
+    const nextAfter = String(fields.next_after ?? current.next_after ?? '').trim()
+    const lastBatchCount = Number(fields.last_batch_count ?? current.last_batch_count ?? 0)
+    const postsCount = Number(fields.posts_count ?? current.posts_count ?? 0)
+    await db.prepare(
+        `UPDATE dashboard_external_watched_pages SET
+            page_name = ?, last_attempt_at = ?, last_synced_at = ?, last_error = ?,
+            next_after = ?, last_batch_count = ?, posts_count = ?, updated_at = datetime('now')
+         WHERE namespace_id = ? AND page_key = ?`
+    ).bind(
+        pageName,
+        lastAttemptAt,
+        lastSyncedAt,
+        lastError,
+        nextAfter,
+        Number.isFinite(lastBatchCount) ? Math.max(0, Math.floor(lastBatchCount)) : 0,
+        Number.isFinite(postsCount) ? Math.max(0, Math.floor(postsCount)) : 0,
+        ns,
+        key,
+    ).run()
+    return getExternalWatchedPage(db, ns, key)
+}
+
+async function countExternalPagePosts(db: D1Database, namespaceId: string, pageKey?: string, minViews = 0): Promise<number> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    if (!ns) return 0
+    const conditions = ['namespace_id = ?', 'views >= ?']
+    const binds: unknown[] = [ns, Math.max(0, Math.floor(Number(minViews) || 0))]
+    const key = String(pageKey || '').trim()
+    if (key) { conditions.push('page_key = ?'); binds.push(key) }
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS total FROM dashboard_external_page_posts WHERE ${conditions.join(' AND ')}`
+    ).bind(...binds).first() as { total?: number } | null
+    return Number(row?.total || 0)
+}
+
+async function upsertExternalPagePostRows(
+    db: D1Database,
+    namespaceId: string,
+    pageKey: string,
+    pageName: string,
+    rows: ExternalPagePostRow[],
+): Promise<number> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(namespaceId || '').trim()
+    const key = String(pageKey || '').trim()
+    if (!ns || !key || rows.length === 0) return 0
+    let written = 0
+    for (const row of rows) {
+        const postId = String(row.post_id || '').trim()
+        if (!postId) continue
+        await db.prepare(
+            `INSERT INTO dashboard_external_page_posts (
+                namespace_id, page_key, page_name, post_id, video_id, is_video,
+                permalink_url, source_url, picture, title, description, views, created_time, fetched_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(namespace_id, page_key, post_id) DO UPDATE SET
+                page_name = excluded.page_name,
+                video_id = CASE WHEN excluded.video_id != '' THEN excluded.video_id ELSE dashboard_external_page_posts.video_id END,
+                is_video = excluded.is_video,
+                permalink_url = CASE WHEN excluded.permalink_url != '' THEN excluded.permalink_url ELSE dashboard_external_page_posts.permalink_url END,
+                source_url = CASE WHEN excluded.source_url != '' THEN excluded.source_url ELSE dashboard_external_page_posts.source_url END,
+                picture = CASE WHEN excluded.picture != '' THEN excluded.picture ELSE dashboard_external_page_posts.picture END,
+                title = excluded.title,
+                description = excluded.description,
+                views = MAX(dashboard_external_page_posts.views, excluded.views),
+                created_time = excluded.created_time,
+                updated_at = datetime('now')`
+        ).bind(
+            ns,
+            key,
+            String(row.page_name || pageName || '').trim(),
+            postId,
+            String(row.video_id || '').trim(),
+            Number(row.is_video || 0) > 0 ? 1 : 0,
+            String(row.permalink_url || '').trim(),
+            String(row.source_url || '').trim(),
+            String(row.picture || '').trim(),
+            String(row.title || '').trim(),
+            String(row.description || '').trim(),
+            Math.max(0, Math.floor(Number(row.views || 0))),
+            String(row.created_time || '').trim(),
+        ).run()
+        written += 1
+    }
+    return written
+}
+
+async function listExternalPagePosts(db: D1Database, params: {
+    namespaceId: string
+    pageKey?: string
+    search?: string
+    minViews?: number
+    sort?: 'newest' | 'oldest' | 'views'
+    limit?: number
+    offset?: number
+}): Promise<ExternalPagePostRow[]> {
+    await ensureExternalWatchedPagesTables(db)
+    const ns = String(params.namespaceId || '').trim()
+    if (!ns) return []
+    const minViews = Math.max(0, Math.floor(Number(params.minViews) || 0))
+    const limit = Math.min(500, Math.max(1, Math.floor(Number(params.limit) || 60)))
+    const offset = Math.min(10000, Math.max(0, Math.floor(Number(params.offset) || 0)))
+    const conditions = ['namespace_id = ?', 'views >= ?']
+    const binds: unknown[] = [ns, minViews]
+    const key = String(params.pageKey || '').trim()
+    if (key) { conditions.push('page_key = ?'); binds.push(key) }
+    const search = String(params.search || '').trim().toLowerCase()
+    if (search) {
+        // Case-insensitive substring over the human-meaningful fields; bound, not interpolated.
+        conditions.push('(LOWER(title) LIKE ? OR LOWER(description) LIKE ? OR LOWER(page_name) LIKE ? OR page_key LIKE ? OR post_id LIKE ?)')
+        const like = `%${search}%`
+        binds.push(like, like, like, like, like)
+    }
+    // Ordering comes from a fixed whitelist below, so it is safe to interpolate.
+    const sort = String(params.sort || '').trim().toLowerCase()
+    const orderBy = sort === 'views'
+        ? 'views DESC, created_time DESC'
+        : sort === 'oldest'
+            ? 'created_time ASC, views DESC'
+            : 'created_time DESC, views DESC'
+    binds.push(limit, offset)
+    const res = await db.prepare(
+        `SELECT namespace_id, page_key, page_name, post_id, video_id, is_video,
+                permalink_url, source_url, picture, title, description, views, created_time, fetched_at, updated_at
+         FROM dashboard_external_page_posts
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY ${orderBy}
+         LIMIT ? OFFSET ?`
+    ).bind(...binds).all() as { results?: ExternalPagePostRow[] }
+    return Array.isArray(res.results) ? res.results : []
+}
+
+// Best-effort page display name lookup (read-only). Returns '' on any failure.
+async function fetchExternalPageNameFromGraphToken(token: string, pageKey: string): Promise<string> {
+    try {
+        const resp = await fetch(
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(pageKey)}?fields=name&access_token=${encodeURIComponent(String(token || '').trim())}`,
+        )
+        if (!resp.ok) return ''
+        const data = await resp.json().catch(() => ({})) as { name?: string; error?: unknown }
+        if (data?.error) return ''
+        return String(data?.name || '').trim()
+    } catch {
+        return ''
+    }
+}
+
+// Read-only fetch of one /posts batch for an EXTERNAL (un-owned) page. Mirrors
+// fetchFacebookPageVideoBatchFromGraphToken but keeps ALL posts (not just video
+// clips) and tags is_video + view counts for video attachments. Throws on Graph
+// errors so the caller records last_error.
+async function fetchExternalPagePostsBatchFromGraphToken(token: string, pageKey: string, after = ''): Promise<{
+    items: ExternalPagePostRow[]
+    nextAfter: string
+}> {
+    const params = new URLSearchParams({
+        fields: 'id,message,permalink_url,created_time,full_picture,attachments{media_type,target{id}}',
+        limit: String(EXTERNAL_WATCHED_BATCH_SIZE),
+        access_token: String(token || '').trim(),
+    })
+    if (after) params.set('after', after)
+    const response = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(pageKey)}/posts?${params.toString()}`)
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '')
+        throw new Error(`facebook_graph_http_${response.status}${errorBody ? `:${errorBody.slice(0, 120)}` : ''}`)
+    }
+    const payload = await response.json().catch(() => ({})) as {
+        error?: { code?: number | string; message?: string }
+        data?: Array<Record<string, unknown>>
+        paging?: { next?: string }
+    }
+    if (payload?.error) {
+        const code = Number(payload.error?.code || 0)
+        const message = String(payload.error?.message || 'facebook_graph_failed')
+        if (code === 368) throw new Error(`facebook_rate_limited:${code}`)
+        throw new Error(`${message}${code ? `:${code}` : ''}`)
+    }
+    const posts = Array.isArray(payload?.data) ? payload.data : []
+    const videoIds: string[] = []
+    const items: ExternalPagePostRow[] = []
+    for (const post of posts) {
+        const rawPostId = String(post.id || '').trim()
+        if (!rawPostId) continue
+        const postId = rawPostId.includes('_') ? rawPostId.split('_').pop() || rawPostId : rawPostId
+        const attachments = post.attachments as { data?: Array<Record<string, unknown>> } | undefined
+        const atts = Array.isArray(attachments?.data) ? attachments.data : []
+        let videoId = ''
+        for (const att of atts) {
+            if (att.media_type === 'video') {
+                videoId = String((att.target as Record<string, unknown>)?.id || '').trim()
+                if (videoId) break
+            }
+        }
+        if (videoId) videoIds.push(videoId)
+        items.push({
+            post_id: postId,
+            video_id: videoId,
+            is_video: videoId ? 1 : 0,
+            permalink_url: String(post.permalink_url || '').trim(),
+            source_url: '',
+            picture: String(post.full_picture || '').trim(),
+            title: '',
+            description: String(post.message || '').trim(),
+            views: 0,
+            created_time: String(post.created_time || '').trim(),
+        })
+    }
+    if (videoIds.length > 0) {
+        const { viewsByVideoId, rawByVideoId } = await fetchVideoViewsResilient(token, videoIds)
+        for (const item of items) {
+            const vid = String(item.video_id || '').trim()
+            if (!vid) continue
+            const info = rawByVideoId.get(vid) || {}
+            item.views = viewsByVideoId.get(vid) ?? 0
+            item.title = String(info.title || item.title || '').trim()
+            if (!item.description) item.description = String(info.description || '').trim()
+            if (!item.source_url) item.source_url = String(info.source || '').trim()
+            if (!item.picture) item.picture = String(info.picture || '').trim()
+        }
+    }
+    const nextUrl = String(payload?.paging?.next || '').trim()
+    const nextAfter = nextUrl ? (new URL(nextUrl).searchParams.get('after') || '') : ''
+    return { items, nextAfter }
+}
+
+// Sync ONE watched external page: resolve a read-only token, fetch one batch,
+// upsert posts, and update sync status. Fully read-only against Facebook. Never
+// throws — failures are captured in last_error so the UI shows a status, not a
+// 500. Returns the refreshed watched-page row.
+async function syncExternalWatchedPage(env: Env, args: {
+    namespaceId: string
+    pageKey: string
+    force?: boolean
+}): Promise<{ ok: boolean; reason?: string; inserted: number; page: ExternalWatchedPageRow | null }> {
+    const ns = String(args.namespaceId || '').trim()
+    const key = String(args.pageKey || '').trim()
+    const force = !!args.force
+    const nowIso = new Date().toISOString()
+    const watched = await getExternalWatchedPage(env.DB, ns, key)
+    if (!watched) return { ok: false, reason: 'page_not_watched', inserted: 0, page: null }
+
+    if (!force) {
+        const lastAttemptMs = Date.parse(String(watched.last_attempt_at || '').trim())
+        if (Number.isFinite(lastAttemptMs)) {
+            const elapsed = Date.now() - lastAttemptMs
+            const hadError = !!String(watched.last_error || '').trim()
+            const cooldown = hadError ? EXTERNAL_WATCHED_ERROR_COOLDOWN_MS : EXTERNAL_WATCHED_SYNC_COOLDOWN_MS
+            if (elapsed < cooldown) {
+                return { ok: true, reason: 'cooldown', inserted: 0, page: watched }
+            }
+        }
+    }
+
+    // Read-only token only. External pages are never in the token pool / pages
+    // table, so this resolves to the manual dashboard_settings.facebook_sync_token.
+    const token = await resolveFacebookSyncToken(env.DB, key, ns)
+    if (!token) {
+        const page = await updateExternalWatchedPageSyncState(env.DB, ns, key, {
+            last_attempt_at: nowIso,
+            last_error: 'facebook_sync_token_missing',
+        })
+        return { ok: false, reason: 'facebook_sync_token_missing', inserted: 0, page }
+    }
+
+    await updateExternalWatchedPageSyncState(env.DB, ns, key, { last_attempt_at: nowIso })
+    try {
+        const after = String(watched.next_after || '').trim()
+        const resolvedName = String(watched.page_name || '').trim() || (await fetchExternalPageNameFromGraphToken(token, key))
+        const batch = await fetchExternalPagePostsBatchFromGraphToken(token, key, after)
+        const inserted = await upsertExternalPagePostRows(env.DB, ns, key, resolvedName, batch.items)
+        const postsCount = await countExternalPagePosts(env.DB, ns, key)
+        // When pagination is exhausted, reset the cursor so the next sync starts
+        // from the newest posts again (continuous refresh of the watch list).
+        const page = await updateExternalWatchedPageSyncState(env.DB, ns, key, {
+            page_name: resolvedName,
+            last_attempt_at: nowIso,
+            last_synced_at: nowIso,
+            last_error: '',
+            next_after: batch.nextAfter,
+            last_batch_count: inserted,
+            posts_count: postsCount,
+        })
+        return { ok: true, inserted, page }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const page = await updateExternalWatchedPageSyncState(env.DB, ns, key, {
+            last_attempt_at: nowIso,
+            last_error: message.slice(0, 200),
+        })
+        return { ok: false, reason: message, inserted: 0, page }
+    }
+}
+
+// Bounded cron tick: sync the few least-recently-attempted ENABLED watched pages
+// across all namespaces. Global cooldown + small per-tick cap so it can never
+// derail the posting cron. All errors are swallowed/sanitized by the caller.
+async function maybeSyncExternalWatchedPagesOnSchedule(env: Env): Promise<{ ran: boolean; reason?: string; synced: number }> {
+    await ensureExternalWatchedPagesTables(env.DB)
+    const lastRun = await getDashboardSetting(env.DB, EXTERNAL_WATCHED_CRON_LAST_RUN_KEY).catch(() => null)
+    const lastRunMs = Date.parse(String(lastRun?.value || '').trim())
+    if (Number.isFinite(lastRunMs) && (Date.now() - lastRunMs) < EXTERNAL_WATCHED_CRON_COOLDOWN_MS) {
+        return { ran: false, reason: 'interval_not_elapsed', synced: 0 }
+    }
+    await setDashboardSetting(env.DB, EXTERNAL_WATCHED_CRON_LAST_RUN_KEY, new Date().toISOString()).catch(() => null)
+    const due = await env.DB.prepare(
+        `SELECT namespace_id, page_key
+         FROM dashboard_external_watched_pages
+         WHERE enabled = 1
+         ORDER BY datetime(CASE WHEN last_attempt_at = '' THEN '1970-01-01' ELSE last_attempt_at END) ASC
+         LIMIT ?`
+    ).bind(EXTERNAL_WATCHED_CRON_MAX_PER_TICK).all().catch(() => ({ results: [] })) as { results?: Array<{ namespace_id?: string; page_key?: string }> }
+    const rows = Array.isArray(due.results) ? due.results : []
+    let synced = 0
+    for (const row of rows) {
+        const ns = String(row.namespace_id || '').trim()
+        const key = String(row.page_key || '').trim()
+        if (!ns || !key) continue
+        try {
+            const result = await syncExternalWatchedPage(env, { namespaceId: ns, pageKey: key })
+            if (result.ok && result.reason !== 'cooldown') synced += 1
+        } catch (e) {
+            console.error(`[EXPLORE-EXTERNAL] sync failed ns=${ns} page=${key}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    return { ran: true, synced }
+}
+
+function serializeExternalWatchedPage(row: ExternalWatchedPageRow | null) {
+    if (!row) return null
+    return {
+        page_id: String(row.page_key || '').trim(),
+        page_key: String(row.page_key || '').trim(),
+        page_url: String(row.page_url || '').trim(),
+        page_name: String(row.page_name || '').trim(),
+        enabled: Number(row.enabled || 0) > 0,
+        created_at: String(row.created_at || '').trim(),
+        last_attempt_at: String(row.last_attempt_at || '').trim(),
+        last_synced_at: String(row.last_synced_at || '').trim(),
+        last_error: String(row.last_error || '').trim(),
+        last_batch_count: Number(row.last_batch_count || 0),
+        posts_count: Number(row.posts_count || 0),
+    }
+}
+
+function serializeExternalPagePost(row: ExternalPagePostRow) {
+    const permalink = String(row.permalink_url || '').trim()
+    return {
+        page_id: String(row.page_key || '').trim(),
+        page_name: String(row.page_name || '').trim(),
+        post_id: String(row.post_id || '').trim(),
+        video_id: String(row.video_id || '').trim(),
+        is_video: Number(row.is_video || 0) > 0,
+        post_url: permalink || buildFacebookUrl(String(row.page_key || '').trim()),
+        source_url: String(row.source_url || '').trim(),
+        thumbnail: String(row.picture || '').trim(),
+        title: String(row.title || '').trim(),
+        caption: String(row.description || '').trim(),
+        views: Number(row.views || 0),
+        created_time: String(row.created_time || '').trim(),
+        fetched_at: String(row.fetched_at || '').trim(),
+        updated_at: String(row.updated_at || '').trim(),
+    }
+}
+
+// List the watched external pages for the namespace (read-only).
+app.get('/api/dashboard/explore/watched-pages', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    try {
+        const pages = await listExternalWatchedPages(c.env.DB, namespaceId)
+        const totalPosts = await countExternalPagePosts(c.env.DB, namespaceId)
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            pages: pages.map(serializeExternalWatchedPage).filter(Boolean),
+            total_posts: totalPosts,
+        }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500, { 'Cache-Control': 'no-store' })
+    }
+})
+
+// Add a watched external page from a URL or ID. Read-only feature; this only
+// records the watch entry and kicks a background sync — it never posts anything.
+app.post('/api/dashboard/explore/watched-pages', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+    const body = await c.req.json().catch(() => ({})) as { url_or_id?: string; namespace_id?: string }
+    const namespaceId = String(body.namespace_id || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    const normalized = normalizeExternalPageInput(String(body.url_or_id || ''))
+    if (!normalized) return c.json({ ok: false, error: 'invalid_page_url_or_id' }, 400)
+    try {
+        const row = await upsertExternalWatchedPage(c.env.DB, namespaceId, {
+            pageKey: normalized.key,
+            pageUrl: normalized.url,
+            enabled: true,
+        })
+        // Kick an immediate first sync in the background so the card populates
+        // without blocking the response. Failures are captured in last_error.
+        try {
+            c.executionCtx?.waitUntil(
+                syncExternalWatchedPage(c.env, { namespaceId, pageKey: normalized.key, force: true })
+                    .catch((e) => console.error(`[EXPLORE-EXTERNAL] initial sync ${normalized.key}: ${e instanceof Error ? e.message : String(e)}`)),
+            )
+        } catch { /* executionCtx unavailable (e.g. tests) — sync happens on cron/manual */ }
+        return c.json({ ok: true, page: serializeExternalWatchedPage(row) }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500, { 'Cache-Control': 'no-store' })
+    }
+})
+
+// Enable/disable a watched external page (does not delete its cached posts).
+app.patch('/api/dashboard/explore/watched-pages/:pageKey', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+    const pageKey = String(c.req.param('pageKey') || '').trim()
+    const body = await c.req.json().catch(() => ({})) as { enabled?: boolean; namespace_id?: string }
+    const namespaceId = String(body.namespace_id || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!pageKey) return c.json({ ok: false, error: 'page_key_required' }, 400)
+    if (typeof body.enabled !== 'boolean') return c.json({ ok: false, error: 'enabled_boolean_required' }, 400)
+    const row = await setExternalWatchedPageEnabled(c.env.DB, namespaceId, pageKey, body.enabled)
+    if (!row) return c.json({ ok: false, error: 'page_not_watched' }, 404)
+    return c.json({ ok: true, page: serializeExternalWatchedPage(row) }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Remove a watched external page and its cached posts.
+app.delete('/api/dashboard/explore/watched-pages/:pageKey', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+    const pageKey = String(c.req.param('pageKey') || '').trim()
+    const namespaceId = String(c.req.query('namespace_id') || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!pageKey) return c.json({ ok: false, error: 'page_key_required' }, 400)
+    const removed = await deleteExternalWatchedPage(c.env.DB, namespaceId, pageKey)
+    if (!removed) return c.json({ ok: false, error: 'page_not_watched' }, 404)
+    return c.json({ ok: true, removed: true, page_id: pageKey }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Manually sync one watched page (page_id) or all enabled pages (all=true).
+app.post('/api/dashboard/explore/sync', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+    const body = await c.req.json().catch(() => ({})) as { page_id?: string; page_key?: string; all?: boolean; namespace_id?: string }
+    const namespaceId = String(body.namespace_id || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    try {
+        if (body.all) {
+            const pages = (await listExternalWatchedPages(c.env.DB, namespaceId)).filter((p) => Number(p.enabled || 0) > 0).slice(0, 20)
+            const results = []
+            for (const p of pages) {
+                const r = await syncExternalWatchedPage(c.env, { namespaceId, pageKey: String(p.page_key || ''), force: true })
+                results.push({ page_id: String(p.page_key || ''), ok: r.ok, reason: r.reason, inserted: r.inserted })
+            }
+            return c.json({ ok: true, synced: results.length, results }, 200, { 'Cache-Control': 'no-store' })
+        }
+        const pageKey = String(body.page_id || body.page_key || '').trim()
+        if (!pageKey) return c.json({ ok: false, error: 'page_id_required' }, 400)
+        const r = await syncExternalWatchedPage(c.env, { namespaceId, pageKey, force: true })
+        return c.json({ ok: r.ok, reason: r.reason, inserted: r.inserted, page: serializeExternalWatchedPage(r.page) }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500, { 'Cache-Control': 'no-store' })
+    }
+})
+
+// Read cached external posts/clips with filters/search/sort (read-only).
+app.get('/api/dashboard/explore/posts', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || c.get('botId') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    const pageKey = String(c.req.query('page_id') || c.req.query('page_key') || '').trim()
+    const search = String(c.req.query('q') || c.req.query('search') || '').trim()
+    const minViewsRaw = Number(c.req.query('min_views') || 0)
+    const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
+    const sortRaw = String(c.req.query('sort') || '').trim().toLowerCase()
+    const sort: 'newest' | 'oldest' | 'views' = sortRaw === 'oldest' ? 'oldest' : sortRaw === 'views' ? 'views' : 'newest'
+    const limitRaw = Number(c.req.query('limit') || 60)
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 60
+    const offsetRaw = Number(c.req.query('offset') || 0)
+    const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0
+    try {
+        const [items, total] = await Promise.all([
+            listExternalPagePosts(c.env.DB, { namespaceId, pageKey, search, minViews, sort, limit, offset }),
+            countExternalPagePosts(c.env.DB, namespaceId, pageKey, minViews),
+        ])
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            page_id: pageKey || null,
+            sort,
+            total,
+            data_source: 'dashboard_external_page_posts',
+            items: items.map(serializeExternalPagePost),
+        }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500, { 'Cache-Control': 'no-store' })
+    }
 })
 
 app.get('/api/dashboard/facebook-page-sources', async (c) => {
@@ -46444,6 +47192,12 @@ export default {
         // video to create the click-link ad in the page's fixed click-link adset (idempotent, one per row).
         _ctx.waitUntil(processFollowToClickLinkHandoffs(env).catch((error) => {
             console.error(`[AUTO-ADS-HANDOFF] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // Explore: continuously refresh WATCHED EXTERNAL pages (un-owned pages the operator added).
+        // Read-only Graph reads into our own cache, bounded to a few pages per tick with a global
+        // cooldown. Own waitUntil + error swallow so it can never derail (or be derailed by) posting.
+        _ctx.waitUntil(maybeSyncExternalWatchedPagesOnSchedule(env).catch((error) => {
+            console.error(`[EXPLORE-EXTERNAL] ${error instanceof Error ? error.message : String(error)}`)
         }))
     },
 }
