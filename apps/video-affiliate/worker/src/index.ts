@@ -25453,6 +25453,69 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
 // returns structured evidence so callers can log a sanitized one-liner. The
 // ordering lives in the import-free `processing-dispatch` module; this wrapper
 // just supplies the real side-effecting steps.
+// Materialize AT MOST ONE unprocessed AI clip from the new source library
+// (`_ai_clips/<namespace>/`) into the durable `_queue/` and promote it to processing —
+// the exact same handoff `/api/dashboard/ai-clips/process` performs, minus the per-id
+// response bookkeeping. This is the ONLY automatic backlog source the Dashboard
+// processing flow uses: the legacy ready-inbox / admin-original auto-pick is disabled in
+// dispatchNextProcessingJobForNamespace, so old Chinese/legacy clips are never auto-started.
+//
+// The durable `_queue/` stays a transient one-job handoff: when the namespace already has
+// an active OR queued job, `selectNextAiClipToProcess` defers the whole backlog and we
+// start nothing. Returns true only when a job was actually started this call.
+async function startNextAiClipSourceForNamespace(
+    env: Env,
+    bucket: R2Bucket,
+    namespaceId: string,
+): Promise<boolean> {
+    const botId = String(namespaceId || '').trim()
+    if (!botId) return false
+    const workerUrl = String(env.WORKER_URL || '').trim()
+    if (!workerUrl) return false
+
+    const allRecords = await listAiClipRecords(bucket, botId).catch(() => [] as AiClipRecord[])
+    if (!allRecords.length) return false
+    const knownIds = new Set(allRecords.map((record) => record.id))
+    const processedIds = new Set(allRecords.filter((record) => isAiClipProcessed(record)).map((record) => record.id))
+    const unprocessed = allRecords.filter((record) => !isAiClipProcessed(record))
+    if (!unprocessed.length) return false
+
+    // Never grow the durable queue while a job is active or already queued: the queue is a
+    // transient one-job handoff, never the operator's backlog.
+    const inFlight = await namespaceHasInFlightProcessingJob(bucket, botId).catch(() => true)
+    const selection = selectNextAiClipToProcess(unprocessed, { requestedIds: [], inFlight, knownIds, processedIds })
+    if (!selection.selectedId) return false
+
+    const record = allRecords.find((item) => item.id === selection.selectedId) || null
+    if (!record) return false
+
+    const nowIso = new Date().toISOString()
+    const job = buildAiClipProcessingQueueJob(record, { workerUrl, namespaceId: botId, nowIso })
+    if (!job) return false
+
+    // Mirror the route's handoff: persist a `_link_context` record so the completion webhook
+    // writes the product links onto the finished gallery meta. chatId 0 → no Telegram DM.
+    await bucket.put(`_link_context/${record.id}.json`, JSON.stringify({
+        id: record.id,
+        videoUrl: job.videoUrl,
+        shopeeLink: job.shopeeLink,
+        lazadaLink: job.lazadaLink,
+        shopeeOriginalLink: job.shopeeLink,
+        lazadaOriginalLink: job.lazadaLink,
+        chatId: 0,
+        sourceType: job.sourceType,
+        sourceLabel: job.sourceLabel,
+        createdAt: nowIso,
+    }), { httpMetadata: { contentType: 'application/json' } })
+    await bucket.put(`_queue/${record.id}.json`, JSON.stringify(job), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+
+    // Promote the single queued job to processing now — the same drain completion + cron use.
+    const started = await processNextInQueue(env, botId).catch(() => false)
+    return started || (await hasActiveProcessingJob(bucket, botId).catch(() => false))
+}
+
 async function dispatchNextProcessingJobForNamespace(
     env: Env,
     ctx: ExecutionContext,
@@ -25486,6 +25549,11 @@ async function dispatchNextProcessingJobForNamespace(
         hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
         retryFailedJob: () => requeueDueFailedProcessingJob(env, botId),
         drainQueue: () => processNextInQueue(env, botId),
+        // New Dashboard flow: the AI clips / source library is the ONLY automatic backlog.
+        startAiClipSource: () => startNextAiClipSourceForNamespace(env, bucket, botId),
+        // LEGACY auto-pick — kept available but DISABLED via `disableLegacySources` below so
+        // automatic dispatch (cron / completion / manual) never starts old Chinese/legacy
+        // gallery_index ready-inbox items or admin-original-library clips for this flow.
         startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline, excludeVideoIds: options.excludeVideoIds }),
         startAdminOriginal: async () => {
             const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
@@ -25496,7 +25564,7 @@ async function dispatchNextProcessingJobForNamespace(
             await autoImportAndProcessForAdmin(env, ctx)
             return hasActiveProcessingJob(bucket, botId).catch(() => false)
         },
-    })
+    }, { disableLegacySources: true })
 }
 
 app.get('/api/processing', async (c) => {

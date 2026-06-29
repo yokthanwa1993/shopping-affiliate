@@ -20,8 +20,9 @@ export type ProcessingDispatchSource =
     | 'active' // a job is already running for this namespace; nothing new started
     | 'retry' // requeued a retryable failed processing record
     | 'queue' // started the next durable `_queue/` entry
-    | 'ready_inbox' // started the next ready inbox / gallery_index candidate
-    | 'admin_original' // imported + started the next admin original-library item
+    | 'ai_clip_source' // materialized + started the next unprocessed AI clip (new source library)
+    | 'ready_inbox' // started the next ready inbox / gallery_index candidate (legacy)
+    | 'admin_original' // imported + started the next admin original-library item (legacy)
     | 'idle' // nothing ready to start
 
 export interface ProcessingDispatchResult {
@@ -42,13 +43,33 @@ export interface ProcessingDispatchSteps {
     // Drains the durable `_queue/` first. Resolves true when a queued job was
     // promoted to processing.
     drainQueue: () => Promise<boolean>
+    // Optional: materialize + start exactly ONE unprocessed AI clip from the new
+    // source library (`_ai_clips/<namespace>/`) when the durable queue is empty.
+    // This is the ONLY automatic backlog source for the Dashboard processing flow,
+    // and is tried BEFORE the legacy sources below. Resolves true when a job was
+    // started, false when there is no unprocessed AI clip to start.
+    startAiClipSource?: () => Promise<boolean>
     // Scans ready inbox / gallery_index / recent originals and starts exactly
     // one ready candidate. Resolves true when a job was started (or is already
-    // running for the picked candidate).
+    // running for the picked candidate). LEGACY: gated by `disableLegacySources`.
     startReadyInbox: () => Promise<boolean>
     // Optional: import + start from the admin original library when nothing else
-    // is ready. Should resolve false (no-op) for non-admin namespaces.
+    // is ready. Should resolve false (no-op) for non-admin namespaces. LEGACY:
+    // gated by `disableLegacySources`.
     startAdminOriginal?: () => Promise<boolean>
+}
+
+// Tuning for one dispatch call. Kept separate from the side-effecting steps so a
+// caller can opt the new Dashboard/AI-clip flow out of the legacy auto-pick without
+// changing the step wiring.
+export interface ProcessingDispatchOptions {
+    // When true, the legacy `startReadyInbox` / `startAdminOriginal` fallbacks are
+    // NEVER invoked — only the durable queue and the new AI clip source can start a
+    // job. This is how the Dashboard namespace flow stops auto-picking old
+    // Chinese/legacy gallery_index inbox items and admin-original clips. The legacy
+    // steps may still be supplied (kept available for explicit/legacy callers); they
+    // are simply skipped while this flag is set.
+    disableLegacySources?: boolean
 }
 
 // Drives the steps in priority order and returns structured evidence of what
@@ -57,6 +78,7 @@ export interface ProcessingDispatchSteps {
 export async function dispatchNextProcessingJob(
     namespaceId: string,
     steps: ProcessingDispatchSteps,
+    options: ProcessingDispatchOptions = {},
 ): Promise<ProcessingDispatchResult> {
     const botId = String(namespaceId || '').trim()
     if (!botId) {
@@ -75,12 +97,22 @@ export async function dispatchNextProcessingJob(
         return { namespaceId: botId, started: true, source: 'queue' }
     }
 
-    if (await steps.startReadyInbox()) {
-        return { namespaceId: botId, started: true, source: 'ready_inbox' }
+    // New source library: pick exactly one unprocessed AI clip before any legacy
+    // source. Runs regardless of `disableLegacySources` — it IS the intended source.
+    if (steps.startAiClipSource && (await steps.startAiClipSource())) {
+        return { namespaceId: botId, started: true, source: 'ai_clip_source' }
     }
 
-    if (steps.startAdminOriginal && (await steps.startAdminOriginal())) {
-        return { namespaceId: botId, started: true, source: 'admin_original' }
+    // Legacy fallbacks. Skipped entirely for the Dashboard/AI-clip flow so old
+    // Chinese/legacy gallery_index inbox + admin-original clips are never auto-picked.
+    if (!options.disableLegacySources) {
+        if (await steps.startReadyInbox()) {
+            return { namespaceId: botId, started: true, source: 'ready_inbox' }
+        }
+
+        if (steps.startAdminOriginal && (await steps.startAdminOriginal())) {
+            return { namespaceId: botId, started: true, source: 'admin_original' }
+        }
     }
 
     return { namespaceId: botId, started: false, source: 'idle' }

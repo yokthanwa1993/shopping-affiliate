@@ -11,11 +11,12 @@ import {
 // records how many times each one ran, so tests can assert both the result and
 // that later steps are short-circuited once an earlier one starts work.
 function makeSteps(overrides: Partial<Record<keyof ProcessingDispatchSteps, boolean>> = {}) {
-    const calls = { hasActiveJob: 0, retryFailedJob: 0, drainQueue: 0, startReadyInbox: 0, startAdminOriginal: 0 }
+    const calls = { hasActiveJob: 0, retryFailedJob: 0, drainQueue: 0, startAiClipSource: 0, startReadyInbox: 0, startAdminOriginal: 0 }
     const steps: ProcessingDispatchSteps = {
         hasActiveJob: async () => { calls.hasActiveJob++; return overrides.hasActiveJob ?? false },
         retryFailedJob: async () => { calls.retryFailedJob++; return overrides.retryFailedJob ?? false },
         drainQueue: async () => { calls.drainQueue++; return overrides.drainQueue ?? false },
+        startAiClipSource: async () => { calls.startAiClipSource++; return overrides.startAiClipSource ?? false },
         startReadyInbox: async () => { calls.startReadyInbox++; return overrides.startReadyInbox ?? false },
         startAdminOriginal: async () => { calls.startAdminOriginal++; return overrides.startAdminOriginal ?? false },
     }
@@ -68,6 +69,66 @@ test('falls back to the admin original library when queue and ready inbox are em
     assert.equal(calls.drainQueue, 1)
     assert.equal(calls.startReadyInbox, 1)
     assert.equal(calls.startAdminOriginal, 1)
+})
+
+// --- New Dashboard / AI-clip source flow: the AI clip source is the only automatic
+// backlog; legacy ready-inbox + admin-original auto-pick is disabled. ---
+
+test('the AI clip source is tried before legacy ready inbox / admin original', async () => {
+    const { steps, calls } = makeSteps({ startAiClipSource: true, startReadyInbox: true, startAdminOriginal: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps)
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: true, source: 'ai_clip_source' })
+    assert.equal(calls.drainQueue, 1)
+    assert.equal(calls.startAiClipSource, 1)
+    // Legacy sources never run once the AI source starts a job (at most one job per call).
+    assert.equal(calls.startReadyInbox, 0)
+    assert.equal(calls.startAdminOriginal, 0)
+})
+
+test('disableLegacySources never auto-picks the legacy ready inbox / admin original', async () => {
+    // Legacy steps WOULD start work, but the new-flow flag must skip them entirely.
+    const { steps, calls } = makeSteps({ startReadyInbox: true, startAdminOriginal: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps, { disableLegacySources: true })
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: false, source: 'idle' })
+    assert.equal(calls.drainQueue, 1)
+    assert.equal(calls.startAiClipSource, 1)
+    // The legacy Chinese/admin-original sources are NEVER consulted in the new flow.
+    assert.equal(calls.startReadyInbox, 0)
+    assert.equal(calls.startAdminOriginal, 0)
+})
+
+test('disableLegacySources still starts the AI clip source when one is available', async () => {
+    const { steps, calls } = makeSteps({ startAiClipSource: true, startReadyInbox: true, startAdminOriginal: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps, { disableLegacySources: true })
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: true, source: 'ai_clip_source' })
+    assert.equal(calls.startAiClipSource, 1)
+    assert.equal(calls.startReadyInbox, 0)
+    assert.equal(calls.startAdminOriginal, 0)
+})
+
+test('disableLegacySources with an empty AI source idles (legacy never picked even as fallback)', async () => {
+    const { steps, calls } = makeSteps({ startAiClipSource: false, startReadyInbox: true, startAdminOriginal: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps, { disableLegacySources: true })
+    assert.equal(result.started, false)
+    assert.equal(result.source, 'idle')
+    assert.equal(calls.startAiClipSource, 1)
+    assert.equal(calls.startReadyInbox, 0)
+    assert.equal(calls.startAdminOriginal, 0)
+})
+
+test('a still-draining durable queue wins over the AI clip source (one job per call)', async () => {
+    const { steps, calls } = makeSteps({ drainQueue: true, startAiClipSource: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps, { disableLegacySources: true })
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: true, source: 'queue' })
+    // The AI source is NOT consulted while a durable queue job is still being drained.
+    assert.equal(calls.startAiClipSource, 0)
+})
+
+test('an active job short-circuits the AI clip source too', async () => {
+    const { steps, calls } = makeSteps({ hasActiveJob: true, startAiClipSource: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps, { disableLegacySources: true })
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: false, source: 'active' })
+    assert.equal(calls.startAiClipSource, 0)
 })
 
 test('reports idle when nothing is ready to start', async () => {
