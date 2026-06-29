@@ -22,6 +22,7 @@ import {
     sanitizeAiClipId,
     sanitizeAiClipLink,
     sanitizeAiClipTitle,
+    selectNextAiClipToProcess,
     sortAiClipRecords,
     type AiClipRecord,
 } from '../src/ai-clips.js'
@@ -308,6 +309,117 @@ test('buildAiClipProcessingQueueJob produces a legacy _queue-compatible job', ()
     assert.equal(job.status, 'queued')
     assert.equal(job.createdAt, '2026-06-29T02:00:00.000Z')
     assert.equal(job.sourceType, AI_CLIP_SOURCE_TYPE)
+})
+
+// ── One-at-a-time selection (never bulk-enqueue the source library) ──────────────────────
+
+// Build the (knownIds, processedIds, unprocessed) context the route passes selectNextAiClipToProcess.
+function selectionCtx(records: AiClipRecord[]) {
+    const sorted = sortAiClipRecords(records)
+    return {
+        unprocessed: sorted.filter((r) => !isAiClipProcessed(r)),
+        knownIds: new Set(sorted.map((r) => r.id)),
+        processedIds: new Set(sorted.filter((r) => isAiClipProcessed(r)).map((r) => r.id)),
+    }
+}
+
+test('selectNextAiClipToProcess (omit ids) starts at most ONE clip and leaves the rest as backlog', () => {
+    const records = [
+        record({ id: '1000001', createdAt: '2026-06-20T00:00:00.000Z', updatedAt: '2026-06-20T00:00:00.000Z' }),
+        record({ id: '1000002', createdAt: '2026-06-25T00:00:00.000Z', updatedAt: '2026-06-25T00:00:00.000Z' }),
+        record({ id: '1000003', createdAt: '2026-06-28T00:00:00.000Z', updatedAt: '2026-06-28T00:00:00.000Z' }),
+    ]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, { requestedIds: [], inFlight: false, knownIds, processedIds })
+    // Exactly one selected — the first in UI order (newest-first per sortAiClipRecords).
+    assert.equal(sel.reason, 'selected')
+    assert.equal(sel.selectedId, '1000003')
+    // The other two unprocessed clips stay in the source library, NOT enqueued.
+    assert.equal(sel.backlog, 2)
+    assert.deepEqual(sel.notFoundIds, [])
+    assert.deepEqual(sel.skippedProcessedIds, [])
+})
+
+test('selectNextAiClipToProcess defers the whole backlog when a job is already in flight', () => {
+    const records = [record({ id: '1000001' }), record({ id: '1000002' }), record({ id: '1000003' })]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, { requestedIds: [], inFlight: true, knownIds, processedIds })
+    // Nothing selected — the durable queue is never grown while a job runs.
+    assert.equal(sel.selectedId, '')
+    assert.equal(sel.reason, 'already_in_flight')
+    // All three eligible clips reported as deferred backlog.
+    assert.equal(sel.backlog, 3)
+})
+
+test('selectNextAiClipToProcess (explicit multiple ids) still starts ONLY the first eligible one', () => {
+    const records = [record({ id: '1000001' }), record({ id: '1000002' }), record({ id: '1000003' })]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, {
+        requestedIds: ['1000002', '1000003', '1000001'],
+        inFlight: false,
+        knownIds,
+        processedIds,
+    })
+    // First in request order wins; the remaining two requested ids stay as backlog — no long queue.
+    assert.equal(sel.reason, 'selected')
+    assert.equal(sel.selectedId, '1000002')
+    assert.equal(sel.backlog, 2)
+})
+
+test('selectNextAiClipToProcess (explicit ids) defers all when a job is already accepted/in-flight', () => {
+    const records = [record({ id: '1000001' }), record({ id: '1000002' }), record({ id: '1000003' })]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, {
+        requestedIds: ['1000001', '1000002', '1000003'],
+        inFlight: true,
+        knownIds,
+        processedIds,
+    })
+    // A second accepted call with three ids must NOT enqueue anything — never a long queue.
+    assert.equal(sel.selectedId, '')
+    assert.equal(sel.reason, 'already_in_flight')
+    assert.equal(sel.backlog, 3)
+})
+
+test('selectNextAiClipToProcess surfaces not-found + already-processed explicit ids without dropping them', () => {
+    const records = [
+        record({ id: '1000001' }),
+        record({ id: '1000002', processedAt: '2026-06-29T01:00:00.000Z' }),
+    ]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, {
+        requestedIds: ['9999999', '1000002', '1000001'],
+        inFlight: false,
+        knownIds,
+        processedIds,
+    })
+    assert.equal(sel.selectedId, '1000001') // first eligible (known + unprocessed)
+    assert.equal(sel.backlog, 0)
+    assert.deepEqual(sel.notFoundIds, ['9999999'])
+    assert.deepEqual(sel.skippedProcessedIds, ['1000002'])
+})
+
+test('selectNextAiClipToProcess reports no eligible clip when nothing is unprocessed', () => {
+    const records = [record({ id: '1000001', processedAt: '2026-06-29T01:00:00.000Z' })]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, { requestedIds: [], inFlight: false, knownIds, processedIds })
+    assert.equal(sel.selectedId, '')
+    assert.equal(sel.reason, 'no_eligible_clip')
+    assert.equal(sel.backlog, 0)
+})
+
+test('selectNextAiClipToProcess dedups repeated explicit ids before selecting', () => {
+    const records = [record({ id: '1000001' }), record({ id: '1000002' })]
+    const { unprocessed, knownIds, processedIds } = selectionCtx(records)
+    const sel = selectNextAiClipToProcess(unprocessed, {
+        requestedIds: ['1000001', '1000001', '1000002'],
+        inFlight: false,
+        knownIds,
+        processedIds,
+    })
+    assert.equal(sel.selectedId, '1000001')
+    // De-duped: only one remaining distinct eligible id stays as backlog.
+    assert.equal(sel.backlog, 1)
 })
 
 test('buildAiClipProcessingQueueJob preserves an absent link as empty + returns null without a source url', () => {

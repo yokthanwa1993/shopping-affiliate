@@ -324,6 +324,7 @@ import {
     parseAiClipView,
     sanitizeAiClipId,
     sanitizeAiClipLink,
+    selectNextAiClipToProcess,
     sanitizeAiClipTitle,
     sortAiClipRecords,
     aiClipNamespacePrefix,
@@ -11092,16 +11093,24 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
     }
 })
 
-// Enqueue AI clips into the SAME durable `_queue/` pipeline the legacy inbox uses, then kick
-// the shared dispatcher so processing starts now (no waiting for a UI open or cron tick). This
-// is the production handoff for operator-uploaded AI clips: it generates the processed video
-// only — it NEVER auto-posts to Facebook or creates ads. Namespace-scoped: only AI clip
-// records owned by the caller's bot namespace are touched, and the durable queue keys live
-// under the namespace-scoped BotBucket so a job can never leak across namespaces.
+// Materialize AT MOST ONE AI clip into the SAME durable `_queue/` pipeline the legacy inbox
+// uses, then kick the shared dispatcher so it starts now (no waiting for a UI open or cron tick).
+// This is the production handoff for operator-uploaded AI clips: it generates the processed video
+// only — it NEVER auto-posts to Facebook or creates ads. Namespace-scoped: only AI clip records
+// owned by the caller's bot namespace are touched, and the durable queue keys live under the
+// namespace-scoped BotBucket so a job can never leak across namespaces.
 //
-// Body: { ids?: string[] } — explicit ids, or omit/empty to enqueue ALL unprocessed AI clips.
-// Per-id result is queued | skipped | blocked | error so a missing-link or already-running
-// clip is reported, never silently dropped.
+// ONE-AT-A-TIME CONTRACT (Thanwa's required flow): the AI Clips source library IS the backlog;
+// the durable `_queue/` is NOT. This endpoint deliberately does NOT bulk-enqueue every unprocessed
+// clip — an accidental "process all" once rebuilt a long queue that had to be cleared by hand.
+//   - If a job is already active/queued for the namespace → enqueue NOTHING, return the eligible
+//     set as a deferred backlog count (`counts.deferred` / `counts.backlog`).
+//   - Otherwise start EXACTLY ONE next clip: the first matching explicit id (request order), or —
+//     when no ids are given — the oldest/newest-first unprocessed clip in the existing UI order.
+//
+// Body: { ids?: string[] } — explicit ids (only the first eligible one starts), or omit/empty to
+// start the single next unprocessed clip. Result is queued | skipped | blocked | deferred | error
+// so a not-found / already-processed / namespace-busy clip is reported, never silently dropped.
 app.post('/api/dashboard/ai-clips/process', async (c) => {
     const authCheck = await requireAuthSession(c)
     if (!authCheck.ok) return authCheck.response
@@ -11117,7 +11126,6 @@ app.post('/api/dashboard/ai-clips/process', async (c) => {
         const requestedIds = Array.isArray(body?.ids)
             ? Array.from(new Set(body.ids.map((value) => sanitizeAiClipId(value)).filter(Boolean)))
             : []
-        const requestedSet = requestedIds.length ? new Set(requestedIds) : null
 
         // The legacy AI pipeline does NOT require paired product links — a linkless clip
         // processes fine and any link present is preserved into the final gallery meta. Keep
@@ -11126,59 +11134,75 @@ app.post('/api/dashboard/ai-clips/process', async (c) => {
 
         const allRecords = await listAiClipRecords(bucket, namespaceId)
         const byId = new Map(allRecords.map((record) => [record.id, record]))
-        // Default (no ids) = every unprocessed clip. Explicit ids = exactly those, in request order.
-        const targets = requestedSet
-            ? requestedIds.map((id) => byId.get(id) || null)
-            : allRecords.filter((record) => !isAiClipProcessed(record))
+        const knownIds = new Set(allRecords.map((record) => record.id))
+        const processedIds = new Set(allRecords.filter((record) => isAiClipProcessed(record)).map((record) => record.id))
+        const unprocessed = allRecords.filter((record) => !isAiClipProcessed(record))
 
-        const results: Array<{ id: string; result: 'queued' | 'skipped' | 'blocked' | 'error'; reason: string }> = []
-        const counts = { requested: requestedSet ? requestedIds.length : targets.length, queued: 0, skipped: 0, blocked: 0, error: 0 }
+        // Namespace-level in-flight gate: never start a second job while one is active or queued.
+        const inFlight = await namespaceHasInFlightProcessingJob(bucket, namespaceId).catch(() => true)
+        const selection = selectNextAiClipToProcess(unprocessed, { requestedIds, inFlight, knownIds, processedIds })
 
-        for (let i = 0; i < targets.length; i += 1) {
-            const record = targets[i]
-            const requestedId = requestedSet ? requestedIds[i] : (record ? record.id : '')
+        const results: Array<{ id: string; result: 'queued' | 'skipped' | 'blocked' | 'deferred' | 'error'; reason: string }> = []
+        const counts = {
+            // How many clips the operator asked to act on (explicit ids, or the whole unprocessed backlog).
+            requested: requestedIds.length || unprocessed.length,
+            queued: 0,
+            skipped: 0,
+            blocked: 0,
+            // Eligible clips deliberately left in the source library this call (busy namespace).
+            deferred: 0,
+            error: 0,
+            // Eligible clips NOT enqueued this call that remain available for the next call.
+            backlog: selection.backlog,
+        }
+
+        // Explicit ids that resolved to nothing actionable — reported per id, never silently dropped.
+        for (const id of selection.notFoundIds) {
+            counts.error += 1
+            results.push({ id, result: 'error', reason: 'ai_clip_not_found' })
+        }
+        for (const id of selection.skippedProcessedIds) {
+            counts.skipped += 1
+            results.push({ id, result: 'skipped', reason: 'already_processed' })
+        }
+
+        if (selection.selectedId) {
+            const record = byId.get(selection.selectedId) || null
             if (!record) {
                 counts.error += 1
-                results.push({ id: requestedId, result: 'error', reason: 'ai_clip_not_found' })
-                continue
-            }
-            try {
-                // In-flight = a durable queue or active processing record already exists for this id.
-                const [queueObj, processingObj] = await Promise.all([
-                    bucket.get(`_queue/${record.id}.json`).catch(() => null),
-                    bucket.get(`_processing/${record.id}.json`).catch(() => null),
-                ])
-                const inFlight = !!queueObj || !!processingObj
-                const decision = decideAiClipProcessing(record, { inFlight, requireProductLinks })
-
+                results.push({ id: selection.selectedId, result: 'error', reason: 'ai_clip_not_found' })
+            } else {
+                // Final per-clip guard (link-gated namespaces). inFlight is false here by construction
+                // — the namespace gate above already deferred everything when a job was in flight.
+                const decision = decideAiClipProcessing(record, { inFlight: false, requireProductLinks })
                 if (decision.kind === 'queue') {
                     const nowIso = new Date().toISOString()
                     const job = buildAiClipProcessingQueueJob(record, { workerUrl, namespaceId, nowIso })
                     if (!job) {
                         counts.error += 1
                         results.push({ id: record.id, result: 'error', reason: 'missing_original_asset_url' })
-                        continue
+                    } else {
+                        // Mirror the inbox handoff: persist a `_link_context` record so the
+                        // completion webhook (/api/gallery/refresh) writes the product links onto
+                        // the finished gallery meta. chatId 0 → no Telegram completion DM.
+                        await bucket.put(`_link_context/${record.id}.json`, JSON.stringify({
+                            id: record.id,
+                            videoUrl: job.videoUrl,
+                            shopeeLink: job.shopeeLink,
+                            lazadaLink: job.lazadaLink,
+                            shopeeOriginalLink: job.shopeeLink,
+                            lazadaOriginalLink: job.lazadaLink,
+                            chatId: 0,
+                            sourceType: job.sourceType,
+                            sourceLabel: job.sourceLabel,
+                            createdAt: nowIso,
+                        }), { httpMetadata: { contentType: 'application/json' } })
+                        await bucket.put(`_queue/${record.id}.json`, JSON.stringify(job), {
+                            httpMetadata: { contentType: 'application/json' },
+                        })
+                        counts.queued += 1
+                        results.push({ id: record.id, result: 'queued', reason: decision.reason })
                     }
-                    // Mirror the inbox handoff: persist a `_link_context` record so the
-                    // completion webhook (/api/gallery/refresh) writes the product links onto
-                    // the finished gallery meta. chatId 0 → no Telegram completion DM.
-                    await bucket.put(`_link_context/${record.id}.json`, JSON.stringify({
-                        id: record.id,
-                        videoUrl: job.videoUrl,
-                        shopeeLink: job.shopeeLink,
-                        lazadaLink: job.lazadaLink,
-                        shopeeOriginalLink: job.shopeeLink,
-                        lazadaOriginalLink: job.lazadaLink,
-                        chatId: 0,
-                        sourceType: job.sourceType,
-                        sourceLabel: job.sourceLabel,
-                        createdAt: nowIso,
-                    }), { httpMetadata: { contentType: 'application/json' } })
-                    await bucket.put(`_queue/${record.id}.json`, JSON.stringify(job), {
-                        httpMetadata: { contentType: 'application/json' },
-                    })
-                    counts.queued += 1
-                    results.push({ id: record.id, result: 'queued', reason: decision.reason })
                 } else if (decision.kind === 'blocked_missing_links') {
                     counts.blocked += 1
                     results.push({ id: record.id, result: 'blocked', reason: decision.reason })
@@ -11186,20 +11210,26 @@ app.post('/api/dashboard/ai-clips/process', async (c) => {
                     counts.skipped += 1
                     results.push({ id: record.id, result: 'skipped', reason: decision.reason })
                 }
-            } catch (e) {
-                counts.error += 1
-                results.push({ id: record.id, result: 'error', reason: e instanceof Error ? e.message : String(e) })
             }
+        } else if (selection.reason === 'already_in_flight') {
+            // Namespace busy: the whole eligible backlog stays in the source library, deferred.
+            counts.deferred = selection.backlog
+            results.push({
+                id: '',
+                result: 'deferred',
+                reason: selection.backlog > 0 ? 'namespace_busy_backlog_deferred' : 'namespace_busy',
+            })
         }
 
-        // Kick the shared dispatcher so the queue drains immediately — the same entry point
-        // completion + cron use, so even if this waitUntil is cancelled the every-minute cron
-        // still starts the queued job within ~60s.
+        // Kick the shared dispatcher so the one queued job drains immediately — the same entry
+        // point completion + cron use, so even if this waitUntil is cancelled the every-minute
+        // cron still starts the queued job within ~60s. Only kicked when we actually enqueued,
+        // so a busy namespace is never nudged into racing a second start.
         if (counts.queued > 0) {
             c.executionCtx.waitUntil(
                 dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: false })
                     .then((result) => {
-                        console.log(`[AI-CLIP-PROCESS] ${namespaceId}: queued=${counts.queued} started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                        console.log(`[AI-CLIP-PROCESS] ${namespaceId}: queued=${counts.queued} backlog=${counts.backlog} started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
                     })
                     .catch((error) => {
                         console.error(`[AI-CLIP-PROCESS] dispatch failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
@@ -24122,6 +24152,16 @@ async function hasActiveProcessingJob(bucket: R2Bucket, namespaceId = ''): Promi
         return true
     }
     return false
+}
+
+// True when the namespace already has work in flight: an active `_processing/` job OR any
+// durable `_queue/` entry still waiting to start. Used by the AI-clip process handoff to gate
+// the one-at-a-time rule — when this is true, the source-library backlog is deferred and NOTHING
+// new is enqueued, so an accidental "process all" can never rebuild the long queue again.
+async function namespaceHasInFlightProcessingJob(bucket: R2Bucket, namespaceId: string): Promise<boolean> {
+    if (await hasActiveProcessingJob(bucket, namespaceId).catch(() => true)) return true
+    const queued = await bucket.list({ prefix: '_queue/' }).catch(() => null)
+    return !!(queued && Array.isArray(queued.objects) && queued.objects.length > 0)
 }
 
 async function getProcessingJobStatus(bucket: R2Bucket, id: string): Promise<string> {

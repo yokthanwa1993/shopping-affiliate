@@ -236,6 +236,73 @@ export function decideAiClipProcessing(
     return { kind: 'queue', reason: 'queued' }
 }
 
+export type AiClipProcessSelectionReason = 'selected' | 'already_in_flight' | 'no_eligible_clip'
+
+export type AiClipProcessSelection = {
+    // The single clip id to materialize into the durable queue + start now, or '' when nothing
+    // should be enqueued this call.
+    selectedId: string
+    reason: AiClipProcessSelectionReason
+    // Eligible unprocessed clips deliberately LEFT in the source library (never enqueued) this
+    // call: the rest of the explicit-id set, or the rest of the unprocessed backlog.
+    backlog: number
+    // Requested ids that matched no known record (explicit-id mode only) — reported, not dropped.
+    notFoundIds: string[]
+    // Requested ids that are already processed (explicit-id mode only).
+    skippedProcessedIds: string[]
+}
+
+// Choose AT MOST ONE AI clip to materialize into the durable processing queue. This is the
+// guardrail that keeps the operator's source library (the real backlog) from being bulk-enqueued
+// the way an accidental "process all" did — the durable `_queue/` must never become the user's
+// backlog. Pure: the route passes the already-listed/sorted records plus the externally-observed
+// in-flight flag, so all R2 I/O stays in index.ts.
+//   - inFlight (namespace already has an active OR queued job) → select nothing; the whole
+//     eligible set is reported as deferred backlog.
+//   - explicit ids → pick the FIRST id (in request order) that is known + unprocessed; surface
+//     any not-found / already-processed ids; the remaining eligible ids stay as backlog.
+//   - no ids → pick the FIRST unprocessed clip in the supplied UI order; the rest stay as backlog.
+export function selectNextAiClipToProcess(
+    unprocessed: Array<Pick<AiClipRecord, 'id'>>,
+    ctx: { requestedIds: string[]; inFlight: boolean; knownIds: Set<string>; processedIds: Set<string> },
+): AiClipProcessSelection {
+    const requested = (Array.isArray(ctx.requestedIds) ? ctx.requestedIds : [])
+        .map((value) => sanitizeAiClipId(value))
+        .filter(Boolean)
+    const explicit = requested.length > 0
+
+    const notFoundIds: string[] = []
+    const skippedProcessedIds: string[] = []
+    let candidates: string[]
+    if (explicit) {
+        candidates = []
+        const seen = new Set<string>()
+        for (const id of requested) {
+            if (seen.has(id)) continue
+            seen.add(id)
+            if (!ctx.knownIds.has(id)) {
+                notFoundIds.push(id)
+                continue
+            }
+            if (ctx.processedIds.has(id)) {
+                skippedProcessedIds.push(id)
+                continue
+            }
+            candidates.push(id)
+        }
+    } else {
+        candidates = unprocessed.map((record) => sanitizeAiClipId(record.id)).filter(Boolean)
+    }
+
+    if (ctx.inFlight) {
+        return { selectedId: '', reason: 'already_in_flight', backlog: candidates.length, notFoundIds, skippedProcessedIds }
+    }
+    if (!candidates.length) {
+        return { selectedId: '', reason: 'no_eligible_clip', backlog: 0, notFoundIds, skippedProcessedIds }
+    }
+    return { selectedId: candidates[0], reason: 'selected', backlog: candidates.length - 1, notFoundIds, skippedProcessedIds }
+}
+
 // Internal original-asset URL the pipeline pulls the source MP4 from. Reuses the same
 // namespace-scoped /api/gallery/:id/asset/original route the upload/list responses serve.
 export function aiClipProcessingSourceUrl(
