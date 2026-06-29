@@ -312,7 +312,9 @@ import {
     AI_CLIP_MAX_BYTES,
     aiClipOriginalAssetKey,
     aiClipRecordKey,
+    buildAiClipProcessingQueueJob,
     buildAiClipResponse,
+    decideAiClipProcessing,
     filterAiClipsByView,
     generateAiClipId,
     isAiClipProcessed,
@@ -10942,6 +10944,38 @@ async function listAiClipRecords(bucket: R2Bucket, namespaceId: string): Promise
     return sortAiClipRecords(records)
 }
 
+// Mark an AI clip record processed when its pipeline completes, so it moves from the
+// unprocessed view to /api/dashboard/ai-clips?view=processed and /dashboard/gallery. Keyed
+// off the namespace-scoped record key; a no-op (returns false) when this id is not an AI clip
+// (e.g. a legacy inbox video), so it is safe to call unconditionally from the shared
+// completion webhook. Never overwrites an already-set processedAt.
+async function markAiClipProcessedIfPresent(
+    bucket: R2Bucket,
+    namespaceId: string,
+    videoId: string,
+    completedAt: string,
+): Promise<boolean> {
+    const id = sanitizeAiClipId(videoId)
+    const recordKey = aiClipRecordKey(namespaceId, id)
+    if (!recordKey) return false
+    const existing = await bucket.get(recordKey).catch(() => null)
+    if (!existing) return false
+    const raw = await existing.json().catch(() => null) as Partial<AiClipRecord> | null
+    const record = normalizeAiClipRecord({ ...raw, namespaceId })
+    if (!record || record.id !== id || record.namespaceId !== namespaceId) return false
+    const stamp = String(completedAt || '').trim() || new Date().toISOString()
+    const next = normalizeAiClipRecord({
+        ...record,
+        processedAt: record.processedAt || stamp,
+        updatedAt: stamp,
+    })
+    if (!next) return false
+    await bucket.put(recordKey, JSON.stringify(next), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    return true
+}
+
 app.get('/api/dashboard/ai-clips', async (c) => {
     const authCheck = await requireAuthSession(c)
     if (!authCheck.ok) return authCheck.response
@@ -11053,6 +11087,127 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
             namespace_id: namespaceId,
             video: buildAiClipResponse(record, { namespaceId, workerUrl }),
         })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
+// Enqueue AI clips into the SAME durable `_queue/` pipeline the legacy inbox uses, then kick
+// the shared dispatcher so processing starts now (no waiting for a UI open or cron tick). This
+// is the production handoff for operator-uploaded AI clips: it generates the processed video
+// only — it NEVER auto-posts to Facebook or creates ads. Namespace-scoped: only AI clip
+// records owned by the caller's bot namespace are touched, and the durable queue keys live
+// under the namespace-scoped BotBucket so a job can never leak across namespaces.
+//
+// Body: { ids?: string[] } — explicit ids, or omit/empty to enqueue ALL unprocessed AI clips.
+// Per-id result is queued | skipped | blocked | error so a missing-link or already-running
+// clip is reported, never silently dropped.
+app.post('/api/dashboard/ai-clips/process', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    try {
+        const namespaceId = String(c.get('botId') || '').trim()
+        if (!namespaceId || namespaceId === 'default') return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+
+        const bucket = c.get('bucket')
+        const workerUrl = String(c.env.WORKER_URL || '').trim()
+        if (!workerUrl) return c.json({ ok: false, error: 'worker_url_unconfigured' }, 500)
+
+        const body = await c.req.json().catch(() => ({})) as { ids?: unknown }
+        const requestedIds = Array.isArray(body?.ids)
+            ? Array.from(new Set(body.ids.map((value) => sanitizeAiClipId(value)).filter(Boolean)))
+            : []
+        const requestedSet = requestedIds.length ? new Set(requestedIds) : null
+
+        // The legacy AI pipeline does NOT require paired product links — a linkless clip
+        // processes fine and any link present is preserved into the final gallery meta. Keep
+        // this a single switch so a future link-gated namespace can block doomed jobs instead.
+        const requireProductLinks = false
+
+        const allRecords = await listAiClipRecords(bucket, namespaceId)
+        const byId = new Map(allRecords.map((record) => [record.id, record]))
+        // Default (no ids) = every unprocessed clip. Explicit ids = exactly those, in request order.
+        const targets = requestedSet
+            ? requestedIds.map((id) => byId.get(id) || null)
+            : allRecords.filter((record) => !isAiClipProcessed(record))
+
+        const results: Array<{ id: string; result: 'queued' | 'skipped' | 'blocked' | 'error'; reason: string }> = []
+        const counts = { requested: requestedSet ? requestedIds.length : targets.length, queued: 0, skipped: 0, blocked: 0, error: 0 }
+
+        for (let i = 0; i < targets.length; i += 1) {
+            const record = targets[i]
+            const requestedId = requestedSet ? requestedIds[i] : (record ? record.id : '')
+            if (!record) {
+                counts.error += 1
+                results.push({ id: requestedId, result: 'error', reason: 'ai_clip_not_found' })
+                continue
+            }
+            try {
+                // In-flight = a durable queue or active processing record already exists for this id.
+                const [queueObj, processingObj] = await Promise.all([
+                    bucket.get(`_queue/${record.id}.json`).catch(() => null),
+                    bucket.get(`_processing/${record.id}.json`).catch(() => null),
+                ])
+                const inFlight = !!queueObj || !!processingObj
+                const decision = decideAiClipProcessing(record, { inFlight, requireProductLinks })
+
+                if (decision.kind === 'queue') {
+                    const nowIso = new Date().toISOString()
+                    const job = buildAiClipProcessingQueueJob(record, { workerUrl, namespaceId, nowIso })
+                    if (!job) {
+                        counts.error += 1
+                        results.push({ id: record.id, result: 'error', reason: 'missing_original_asset_url' })
+                        continue
+                    }
+                    // Mirror the inbox handoff: persist a `_link_context` record so the
+                    // completion webhook (/api/gallery/refresh) writes the product links onto
+                    // the finished gallery meta. chatId 0 → no Telegram completion DM.
+                    await bucket.put(`_link_context/${record.id}.json`, JSON.stringify({
+                        id: record.id,
+                        videoUrl: job.videoUrl,
+                        shopeeLink: job.shopeeLink,
+                        lazadaLink: job.lazadaLink,
+                        shopeeOriginalLink: job.shopeeLink,
+                        lazadaOriginalLink: job.lazadaLink,
+                        chatId: 0,
+                        sourceType: job.sourceType,
+                        sourceLabel: job.sourceLabel,
+                        createdAt: nowIso,
+                    }), { httpMetadata: { contentType: 'application/json' } })
+                    await bucket.put(`_queue/${record.id}.json`, JSON.stringify(job), {
+                        httpMetadata: { contentType: 'application/json' },
+                    })
+                    counts.queued += 1
+                    results.push({ id: record.id, result: 'queued', reason: decision.reason })
+                } else if (decision.kind === 'blocked_missing_links') {
+                    counts.blocked += 1
+                    results.push({ id: record.id, result: 'blocked', reason: decision.reason })
+                } else {
+                    counts.skipped += 1
+                    results.push({ id: record.id, result: 'skipped', reason: decision.reason })
+                }
+            } catch (e) {
+                counts.error += 1
+                results.push({ id: record.id, result: 'error', reason: e instanceof Error ? e.message : String(e) })
+            }
+        }
+
+        // Kick the shared dispatcher so the queue drains immediately — the same entry point
+        // completion + cron use, so even if this waitUntil is cancelled the every-minute cron
+        // still starts the queued job within ~60s.
+        if (counts.queued > 0) {
+            c.executionCtx.waitUntil(
+                dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: false })
+                    .then((result) => {
+                        console.log(`[AI-CLIP-PROCESS] ${namespaceId}: queued=${counts.queued} started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                    })
+                    .catch((error) => {
+                        console.error(`[AI-CLIP-PROCESS] dispatch failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                    })
+            )
+        }
+
+        return c.json({ ok: true, namespace_id: namespaceId, counts, results }, 200, { 'Cache-Control': 'private, no-store' })
     } catch (e) {
         return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500)
     }
@@ -26333,6 +26488,11 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                     updatedAt: refreshCompletedAt,
                 }).catch(() => { })
             }
+
+            // Operator-uploaded AI clips live under their own `_ai_clips/` prefix (not _inbox),
+            // so stamp their record processed here too — otherwise the finished clip would stay
+            // stuck in the unprocessed view + never appear in /dashboard/gallery.
+            await markAiClipProcessedIfPresent(c.get('bucket'), namespaceId, videoId, refreshCompletedAt).catch(() => false)
         }
 
         if (videoId) {

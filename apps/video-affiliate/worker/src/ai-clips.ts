@@ -193,6 +193,95 @@ export function sortAiClipRecords(records: AiClipRecord[]): AiClipRecord[] {
     })
 }
 
+// ── Processing handoff (pure helpers) ───────────────────────────────────────────────────
+// AI clips reuse the legacy `_queue/` durable-queue contract drained by processNextInQueue:
+// a job is `{ id, videoUrl, chatId, shopeeLink?, lazadaLink?, status:'queued', createdAt }`.
+// The pipeline recognizes an INTERNAL original asset URL (`/api/gallery/:id/asset/original`)
+// and pulls the already-uploaded `videos/{id}_original.mp4` straight from R2 — no re-download,
+// no _inbox record, no Facebook/ads side effects. These helpers are pure so the enqueue
+// decision + job shape can be unit-tested; the route in index.ts does the R2 I/O.
+
+export type AiClipProcessDecisionKind =
+    | 'queue'
+    | 'skipped_processed'
+    | 'skipped_in_flight'
+    | 'blocked_missing_links'
+
+export type AiClipProcessDecision = {
+    kind: AiClipProcessDecisionKind
+    // Stable machine reason surfaced verbatim in the per-id response.
+    reason: string
+}
+
+// Classify ONE AI clip for processing given the externally-observed in-flight state and
+// whether the namespace's pipeline requires paired product links. Pure: callers pass
+// `inFlight` (a `_queue/`/`_processing/` record already exists) so the I/O stays in index.ts.
+//   - already processed → skip (never re-queue a finished clip)
+//   - already queued/processing → skip (never duplicate an in-flight job)
+//   - links required but missing → block with `missing_product_links` (no doomed job)
+//   - otherwise → queue
+export function decideAiClipProcessing(
+    record: Pick<AiClipRecord, 'processedAt' | 'shopeeLink' | 'lazadaLink'>,
+    ctx: { inFlight: boolean; requireProductLinks: boolean },
+): AiClipProcessDecision {
+    if (isAiClipProcessed(record)) return { kind: 'skipped_processed', reason: 'already_processed' }
+    if (ctx.inFlight) return { kind: 'skipped_in_flight', reason: 'already_queued_or_processing' }
+    if (ctx.requireProductLinks) {
+        const hasShopee = !!sanitizeAiClipLink(record.shopeeLink)
+        const hasLazada = !!sanitizeAiClipLink(record.lazadaLink)
+        if (!hasShopee || !hasLazada) {
+            return { kind: 'blocked_missing_links', reason: 'missing_product_links' }
+        }
+    }
+    return { kind: 'queue', reason: 'queued' }
+}
+
+// Internal original-asset URL the pipeline pulls the source MP4 from. Reuses the same
+// namespace-scoped /api/gallery/:id/asset/original route the upload/list responses serve.
+export function aiClipProcessingSourceUrl(
+    record: Pick<AiClipRecord, 'id'>,
+    params: { workerUrl: string; namespaceId: string },
+): string {
+    return galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original')
+}
+
+export type AiClipQueueJob = {
+    id: string
+    videoUrl: string
+    // No Telegram chat for operator uploads — 0 suppresses the completion DM in /api/gallery/refresh.
+    chatId: number
+    shopeeLink: string
+    lazadaLink: string
+    status: 'queued'
+    createdAt: string
+    // Provenance so completion code can recognize an AI clip without a separate lookup.
+    sourceType: typeof AI_CLIP_SOURCE_TYPE
+    sourceLabel: string
+}
+
+// Build the durable `_queue/` job for an AI clip. Returns null when the internal source URL
+// cannot be built (missing worker URL / namespace / id) so the caller reports an explicit
+// error instead of queuing an unrunnable job. Product links are preserved verbatim.
+export function buildAiClipProcessingQueueJob(
+    record: AiClipRecord,
+    params: { workerUrl: string; namespaceId: string; nowIso: string },
+): AiClipQueueJob | null {
+    const id = sanitizeAiClipId(record.id)
+    const videoUrl = aiClipProcessingSourceUrl(record, params)
+    if (!id || !videoUrl) return null
+    return {
+        id,
+        videoUrl,
+        chatId: 0,
+        shopeeLink: sanitizeAiClipLink(record.shopeeLink),
+        lazadaLink: sanitizeAiClipLink(record.lazadaLink),
+        status: 'queued',
+        createdAt: String(params.nowIso || '').trim() || new Date(0).toISOString(),
+        sourceType: AI_CLIP_SOURCE_TYPE,
+        sourceLabel: String(record.sourceLabel || '').trim() || AI_CLIP_SOURCE_LABEL,
+    }
+}
+
 function galleryAssetUrl(workerUrl: string, namespaceId: string, id: string, variant: 'original' | 'original-thumb'): string {
     const base = String(workerUrl || '').trim().replace(/\/+$/, '')
     const ns = String(namespaceId || '').trim()

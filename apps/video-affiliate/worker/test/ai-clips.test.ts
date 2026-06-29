@@ -6,9 +6,12 @@ import {
     AI_CLIP_SOURCE_TYPE,
     aiClipNamespacePrefix,
     aiClipOriginalAssetKey,
+    aiClipProcessingSourceUrl,
     aiClipRecordKey,
     aiClipStatus,
+    buildAiClipProcessingQueueJob,
     buildAiClipResponse,
+    decideAiClipProcessing,
     filterAiClipsByView,
     generateAiClipId,
     isAiClipLinkValid,
@@ -212,4 +215,96 @@ test('buildAiClipResponse surfaces paired links in both camel + snake case', () 
     assert.equal(resp.lazada_link, 'https://lazada.co.th/p')
     assert.equal(resp.hasShopeeLink, true)
     assert.equal(resp.hasLazadaLink, true)
+})
+
+// ── Processing handoff helpers ───────────────────────────────────────────────────────────
+
+test('decideAiClipProcessing queues an unprocessed, not-in-flight clip', () => {
+    const d = decideAiClipProcessing(record({ id: '1234567' }), { inFlight: false, requireProductLinks: false })
+    assert.equal(d.kind, 'queue')
+    assert.equal(d.reason, 'queued')
+})
+
+test('decideAiClipProcessing skips an already-processed clip', () => {
+    const d = decideAiClipProcessing(
+        record({ id: '1234567', processedAt: '2026-06-29T01:00:00.000Z' }),
+        { inFlight: false, requireProductLinks: false },
+    )
+    assert.equal(d.kind, 'skipped_processed')
+    assert.equal(d.reason, 'already_processed')
+})
+
+test('decideAiClipProcessing skips a clip already queued/processing', () => {
+    const d = decideAiClipProcessing(record({ id: '1234567' }), { inFlight: true, requireProductLinks: false })
+    assert.equal(d.kind, 'skipped_in_flight')
+    assert.equal(d.reason, 'already_queued_or_processing')
+})
+
+test('decideAiClipProcessing processed check wins over in-flight', () => {
+    const d = decideAiClipProcessing(
+        record({ id: '1234567', processedAt: '2026-06-29T01:00:00.000Z' }),
+        { inFlight: true, requireProductLinks: false },
+    )
+    assert.equal(d.kind, 'skipped_processed')
+})
+
+test('decideAiClipProcessing blocks missing links only when links are required', () => {
+    const noLinks = record({ id: '1234567', shopeeLink: '', lazadaLink: '' })
+    // Not required (default) → still queued even without links
+    assert.equal(decideAiClipProcessing(noLinks, { inFlight: false, requireProductLinks: false }).kind, 'queue')
+    // Required + missing → blocked with explicit reason
+    const blocked = decideAiClipProcessing(noLinks, { inFlight: false, requireProductLinks: true })
+    assert.equal(blocked.kind, 'blocked_missing_links')
+    assert.equal(blocked.reason, 'missing_product_links')
+    // Required + only one link → still blocked
+    const oneLink = record({ id: '1234567', shopeeLink: 'https://shopee.co.th/p', lazadaLink: '' })
+    assert.equal(decideAiClipProcessing(oneLink, { inFlight: false, requireProductLinks: true }).kind, 'blocked_missing_links')
+    // Required + both links → queued
+    const bothLinks = record({ id: '1234567', shopeeLink: 'https://shopee.co.th/p', lazadaLink: 'https://lazada.co.th/p' })
+    assert.equal(decideAiClipProcessing(bothLinks, { inFlight: false, requireProductLinks: true }).kind, 'queue')
+})
+
+test('aiClipProcessingSourceUrl points at the internal original asset route', () => {
+    const url = aiClipProcessingSourceUrl(record({ id: '1234567' }), {
+        workerUrl: 'https://worker.example.dev',
+        namespaceId: '1774858894802785816',
+    })
+    assert.equal(
+        url,
+        'https://worker.example.dev/api/gallery/1234567/asset/original?namespace_id=1774858894802785816',
+    )
+    // No worker URL → empty (caller reports missing_original_asset_url instead of queuing)
+    assert.equal(aiClipProcessingSourceUrl(record({ id: '1234567' }), { workerUrl: '', namespaceId: 'ns' }), '')
+})
+
+test('buildAiClipProcessingQueueJob produces a legacy _queue-compatible job', () => {
+    const job = buildAiClipProcessingQueueJob(
+        record({ id: '1234567', shopeeLink: 'https://shopee.co.th/p', lazadaLink: 'https://lazada.co.th/p' }),
+        { workerUrl: 'https://worker.example.dev', namespaceId: '1774858894802785816', nowIso: '2026-06-29T02:00:00.000Z' },
+    )
+    assert.ok(job)
+    assert.equal(job.id, '1234567')
+    assert.equal(job.videoUrl, 'https://worker.example.dev/api/gallery/1234567/asset/original?namespace_id=1774858894802785816')
+    assert.equal(job.chatId, 0) // no Telegram completion DM for operator uploads
+    assert.equal(job.shopeeLink, 'https://shopee.co.th/p')
+    assert.equal(job.lazadaLink, 'https://lazada.co.th/p')
+    assert.equal(job.status, 'queued')
+    assert.equal(job.createdAt, '2026-06-29T02:00:00.000Z')
+    assert.equal(job.sourceType, AI_CLIP_SOURCE_TYPE)
+})
+
+test('buildAiClipProcessingQueueJob preserves an absent link as empty + returns null without a source url', () => {
+    const job = buildAiClipProcessingQueueJob(record({ id: '1234567', shopeeLink: '', lazadaLink: '' }), {
+        workerUrl: 'https://worker.example.dev',
+        namespaceId: '1774858894802785816',
+        nowIso: '2026-06-29T02:00:00.000Z',
+    })
+    assert.ok(job)
+    assert.equal(job.shopeeLink, '')
+    assert.equal(job.lazadaLink, '')
+    // Unbuildable source url (no worker URL) → null so the route never queues a doomed job
+    assert.equal(
+        buildAiClipProcessingQueueJob(record({ id: '1234567' }), { workerUrl: '', namespaceId: 'ns', nowIso: 'x' }),
+        null,
+    )
 })
