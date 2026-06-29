@@ -64,25 +64,14 @@
     @apply border-border;
   }
 
+  /* Natural window scrolling: the document/window is the primary scroll
+     container. The AppShell header stays put via `position: sticky` (see
+     AppShell.tsx), NOT by locking the viewport. `min-height` lets the page grow
+     with its content instead of being pinned to the viewport. */
   html,
   body,
   #root {
-    height: 100%;
-  }
-
-  /* Lock the document/window so only the dashboard's own main scroll container
-     scrolls. Without this, dragging the scrollbar to the very bottom lets the
-     body rubber-band/overscroll and the fixed AppShell header appears to bounce.
-     overscroll-behavior:none kills the rubber-band; overflow:hidden pins the
-     window so the 56px header stays put. */
-  html,
-  body {
-    overflow: hidden;
-    overscroll-behavior: none;
-  }
-
-  #root {
-    overflow: hidden;
+    min-height: 100%;
   }
 
   body {

@@ -205,13 +205,13 @@ function AppShellLayout({
   previewMount: boolean
 }) {
   return (
-    <div className="flex h-dvh flex-col overflow-hidden bg-[#f5f5f5]">
+    <div className="flex min-h-dvh flex-col bg-[#f5f5f5]">
       {/* Full-width 56px Shopee-style header: white, thin border, brand pinned
           to the 200px sidebar column on the left so it aligns with the nav.
-          `shrink-0` inside this `overflow-hidden` flex column keeps it locked at
-          the top — combined with the window scroll-lock in index.css it never
-          shifts/bounces when the main content is scrolled to the bottom. */}
-      <header className="z-20 flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
+          `sticky top-0` keeps the header pinned to the viewport top during
+          natural window scrolling — the page/body scrolls underneath it, the
+          viewport itself is NOT locked. */}
+      <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
         <div className="hidden w-[200px] shrink-0 items-center gap-2 md:flex">
           <div className="flex h-8 w-8 items-center justify-center rounded-[2px] bg-[#ee4d2d] text-sm font-bold text-white">
             P
@@ -254,8 +254,11 @@ function AppShellLayout({
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-[200px] shrink-0 flex-col border-r border-[#ededed] bg-white md:flex">
+      <div className="flex flex-1">
+        {/* Sidebar stays alongside the content via its own `sticky` offset
+            (below the 56px header) and its own scroll area, so the page/body
+            still scrolls naturally without dragging the nav off-screen. */}
+        <aside className="sticky top-14 hidden h-[calc(100dvh-3.5rem)] w-[200px] shrink-0 flex-col self-start border-r border-[#ededed] bg-white md:flex">
           <nav className="flex-1 space-y-3 overflow-y-auto py-3">
             {NAV_GROUPS.map((group, index) => (
               <div key={group.title ?? `group-${index}`} className="space-y-0.5">
@@ -277,9 +280,10 @@ function AppShellLayout({
           </div>
         </aside>
 
-        {/* The ONLY scroll container. `overscroll-contain` stops a bottom-of-page
-            scroll from chaining to the (locked) window and bouncing the header. */}
-        <main className="min-w-0 flex-1 overflow-y-auto overscroll-contain bg-[#f5f5f5] p-6">{children}</main>
+        {/* Normal-flow content — the window/body is the primary scroll
+            container. No overflow of its own, so `window.scrollY` drives the
+            page and the sticky header/sidebar stay put. */}
+        <main className="min-w-0 flex-1 bg-[#f5f5f5] p-6">{children}</main>
       </div>
     </div>
   )
