@@ -208,10 +208,13 @@ function AppShellLayout({
     <div className="flex min-h-dvh flex-col bg-[#f5f5f5]">
       {/* Full-width 56px Shopee-style header: white, thin border, brand pinned
           to the 200px sidebar column on the left so it aligns with the nav.
-          `sticky top-0` keeps the header pinned to the viewport top during
-          natural window scrolling — the page/body scrolls underneath it, the
-          viewport itself is NOT locked. */}
-      <header className="sticky top-0 z-30 flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
+          `fixed top-0 left-0 right-0` makes the header a true viewport layer
+          (Facebook-style): the page/body scrolls underneath it and the header
+          never moves visually. The window itself stays the primary scroll
+          container — only the header is lifted out of normal flow, NOT the
+          workspace/body. The content row below adds `pt-14` so nothing hides
+          beneath this 56px bar. */}
+      <header className="fixed left-0 right-0 top-0 z-50 flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
         <div className="hidden w-[200px] shrink-0 items-center gap-2 md:flex">
           <div className="flex h-8 w-8 items-center justify-center rounded-[2px] bg-[#ee4d2d] text-sm font-bold text-white">
             P
@@ -254,10 +257,13 @@ function AppShellLayout({
         </div>
       </header>
 
-      <div className="flex flex-1">
+      {/* `pt-14` reserves the 56px the fixed header no longer occupies in flow,
+          so the content row + sidebar start just below the bar instead of under
+          it. The window/body remains the primary scroll container. */}
+      <div className="flex flex-1 pt-14">
         {/* Sidebar stays alongside the content via its own `sticky` offset
-            (below the 56px header) and its own scroll area, so the page/body
-            still scrolls naturally without dragging the nav off-screen. */}
+            (below the 56px fixed header) and its own scroll area, so the
+            page/body still scrolls naturally without dragging the nav off-screen. */}
         <aside className="sticky top-14 hidden h-[calc(100dvh-3.5rem)] w-[200px] shrink-0 flex-col self-start border-r border-[#ededed] bg-white md:flex">
           <nav className="flex-1 space-y-3 overflow-y-auto py-3">
             {NAV_GROUPS.map((group, index) => (
