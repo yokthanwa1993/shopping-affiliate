@@ -308,6 +308,24 @@ import {
     serializePageAvatarSettings,
     type PageAvatarSettings,
 } from './avatar-settings'
+import {
+    AI_CLIP_MAX_BYTES,
+    aiClipRecordKey,
+    buildAiClipResponse,
+    filterAiClipsByView,
+    generateAiClipId,
+    isAiClipProcessed,
+    isAllowedAiClipUpload,
+    normalizeAiClipRecord,
+    parseAiClipView,
+    sanitizeAiClipId,
+    sanitizeAiClipTitle,
+    sortAiClipRecords,
+    aiClipNamespacePrefix,
+    AI_CLIP_SOURCE_LABEL,
+    AI_CLIP_SOURCE_TYPE,
+    type AiClipRecord,
+} from './ai-clips'
 
 type FacebookSdkApiClient = {
     call: (method: string, path: string, params?: Record<string, unknown>) => Promise<unknown>
@@ -10889,6 +10907,128 @@ app.post('/api/dashboard/video-media-library/upload', async (c) => {
             item: null,
             warning: sanitizeMetaGraphError(e),
         }, 200)
+    }
+})
+
+// ── AI Clips (operator-uploaded AI video library) ───────────────────────────────────────
+// A DEDICATED, additive workspace that is 100% separate from the legacy Chinese/LINE source
+// inventory. AI clips live under their own R2 prefix (`_ai_clips/`) so GET /api/inbox never
+// sees them and legacy behavior is untouched. The original video reuses the shared
+// `videos/{id}_original.mp4` asset key so the existing /api/gallery/:id/asset/* routes serve
+// playback + thumbnails. AI clips are registered as source inventory ONLY — never auto-posted,
+// never wired to Facebook/ads. See src/ai-clips.ts for the pure helpers.
+
+async function listAiClipRecords(bucket: R2Bucket, namespaceId: string): Promise<AiClipRecord[]> {
+    const prefix = aiClipNamespacePrefix(namespaceId)
+    if (!prefix) return []
+    const records: AiClipRecord[] = []
+    let cursor: string | undefined = undefined
+    do {
+        const list: R2Objects = await bucket.list({ prefix, cursor })
+        const loaded = await Promise.all(list.objects.map(async (obj) => {
+            const id = obj.key.slice(prefix.length).replace(/\.json$/i, '')
+            const stored = await bucket.get(aiClipRecordKey(namespaceId, id)).catch(() => null)
+            if (!stored) return null
+            const raw = await stored.json().catch(() => null) as Partial<AiClipRecord> | null
+            const record = normalizeAiClipRecord({ ...raw, namespaceId })
+            return record && record.namespaceId === namespaceId ? record : null
+        }))
+        records.push(...loaded.filter((item): item is AiClipRecord => !!item))
+        cursor = list.truncated ? list.cursor : undefined
+    } while (cursor)
+    return sortAiClipRecords(records)
+}
+
+app.get('/api/dashboard/ai-clips', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    try {
+        const namespaceId = String(c.get('botId') || '').trim()
+        if (!namespaceId || namespaceId === 'default') return c.json({ error: 'namespace_id_required', videos: [] }, 400)
+        const view = parseAiClipView(c.req.query('view'))
+        const limit = Math.min(Math.max(parseNonNegativeInt(c.req.query('limit'), 48), 1), 200)
+        const bucket = c.get('bucket')
+        const workerUrl = String(c.env.WORKER_URL || '').trim()
+
+        const allRecords = await listAiClipRecords(bucket, namespaceId)
+        const processedTotal = allRecords.filter((record) => isAiClipProcessed(record)).length
+        const unprocessedTotal = Math.max(0, allRecords.length - processedTotal)
+        const visible = filterAiClipsByView(allRecords, view).slice(0, limit)
+        return c.json({
+            ok: true,
+            view,
+            namespace_id: namespaceId,
+            total: allRecords.length,
+            processed_total: processedTotal,
+            unprocessed_total: unprocessedTotal,
+            videos: visible.map((record) => buildAiClipResponse(record, { namespaceId, workerUrl })),
+        }, 200, { 'Cache-Control': 'private, no-store' })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e), videos: [] }, 500)
+    }
+})
+
+app.post('/api/dashboard/ai-clips/upload', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    try {
+        const namespaceId = String(c.get('botId') || '').trim()
+        if (!namespaceId || namespaceId === 'default') return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+
+        const form = await c.req.formData().catch(() => null)
+        const file = form?.get('file')
+        if (!form || !(file instanceof File)) return c.json({ ok: false, error: 'file_required' }, 400)
+        const fileName = String(file.name || '').trim()
+        const contentType = String(file.type || '').trim()
+        if (!isAllowedAiClipUpload(contentType, fileName)) {
+            return c.json({ ok: false, error: 'unsupported_video_type' }, 400)
+        }
+        const sizeBytes = Number(file.size || 0)
+        if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return c.json({ ok: false, error: 'empty_file' }, 400)
+        if (sizeBytes > AI_CLIP_MAX_BYTES) return c.json({ ok: false, error: 'file_too_large' }, 413)
+
+        const title = sanitizeAiClipTitle(form.get('title'))
+        const id = sanitizeAiClipId(generateAiClipId(Date.now(), crypto.randomUUID().replace(/-/g, '')))
+        if (!id) return c.json({ ok: false, error: 'id_generation_failed' }, 500)
+
+        const bucket = c.get('bucket')
+        // Store the original under the SHARED asset key so /api/gallery/:id/asset/original serves it.
+        // Stream the Blob straight to R2 (no full-buffer in memory).
+        const originalKey = getPrimaryOriginalVideoAssetKey(id)
+        await bucket.put(originalKey, file.stream(), {
+            httpMetadata: { contentType: contentType || 'video/mp4' },
+        })
+
+        const nowIso = new Date().toISOString()
+        const record = normalizeAiClipRecord({
+            id,
+            namespaceId,
+            title,
+            sourceType: AI_CLIP_SOURCE_TYPE,
+            sourceLabel: AI_CLIP_SOURCE_LABEL,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            processedAt: '',
+            contentType,
+            originalFileName: fileName,
+            sizeBytes,
+        })
+        if (!record) {
+            await bucket.delete(originalKey).catch(() => { })
+            return c.json({ ok: false, error: 'invalid_ai_clip_record' }, 500)
+        }
+        await bucket.put(aiClipRecordKey(namespaceId, id), JSON.stringify(record), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+
+        const workerUrl = String(c.env.WORKER_URL || '').trim()
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            video: buildAiClipResponse(record, { namespaceId, workerUrl }),
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500)
     }
 })
 

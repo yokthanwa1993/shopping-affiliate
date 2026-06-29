@@ -55,9 +55,9 @@ const NAV_GROUPS: readonly NavGroup[] = [
       // 1) "คลิปจีน" opens the Chinese-clip workspace (Source Inventory →
       //    Processing → Gallery), which carries its own top-level
       //    StudioSectionTabs to switch between those three views.
-      // 2) "คลิป AI" is a placeholder folder for AI-generated clips. There is
-      //    no dedicated AI-clips route yet, so it stays disabled (non-navigating)
-      //    rather than pointing at the Facebook media library.
+      // 2) "คลิป AI" opens the dedicated AI-clips workspace at /ai-clips — the
+      //    operator's own AI-generated video library, 100% separate from the
+      //    Chinese/LINE source inventory and from the Facebook media library.
       // 3) "คลังสื่อ Facebook" opens the Facebook media/content library at
       //    /media-library — this is Facebook media, NOT Chinese clips and NOT
       //    AI clips.
@@ -69,7 +69,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
         exact: false,
         activePaths: ['/source-inventory', '/source-processing', '/processing', '/gallery'],
       },
-      { to: '/media-library', label: 'คลิป AI', sublabel: 'AI Clips', icon: Sparkles, exact: false, disabled: true },
+      { to: '/ai-clips', label: 'คลิป AI', sublabel: 'AI Clips', icon: Sparkles, exact: false },
       {
         to: '/media-library',
         label: 'คลังสื่อ Facebook',

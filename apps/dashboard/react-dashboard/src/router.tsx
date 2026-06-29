@@ -5,6 +5,7 @@ import { OverviewPage } from '@/routes/overview'
 import { GalleryPage } from '@/routes/gallery'
 import { MediaLibraryPage } from '@/routes/media-library'
 import { SourceInventoryPage } from '@/routes/source-inventory'
+import { AiClipsPage } from '@/routes/ai-clips'
 import { ProcessingPage } from '@/routes/processing'
 import { PagePostsPage } from '@/routes/page-posts'
 import { CustomLinkPage } from '@/routes/custom-link'
@@ -59,6 +60,8 @@ const sourceInventoryRoute = page('/source-inventory', SourceInventoryPage)
 // legacy /inbox + /source-processing slugs — alias them to the same page.
 const inboxRoute = page('/inbox', SourceInventoryPage)
 const sourceProcessingRoute = page('/source-processing', SourceInventoryPage)
+// Dedicated AI Clips workspace — operator-uploaded AI videos, separate from Chinese/LINE.
+const aiClipsRoute = page('/ai-clips', AiClipsPage)
 const processingRoute = page('/processing', ProcessingPage)
 const pagePostsRoute = page('/page-posts', PagePostsPage)
 // Production nav links to /page_posts (underscore); keep it as an alias.
@@ -82,6 +85,7 @@ const routeTree = rootRoute.addChildren([
   sourceInventoryRoute,
   inboxRoute,
   sourceProcessingRoute,
+  aiClipsRoute,
   processingRoute,
   pagePostsRoute,
   pagePostsAliasRoute,
