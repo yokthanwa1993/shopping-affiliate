@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchSourceInventory, type SourceItem, type SourceView } from '@/api/sourceInventory'
 import { formatThaiDateTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
+import { StudioSectionTabs } from '@/components/StudioSectionTabs'
 
 const VIEWS: Array<{ key: SourceView; label: string }> = [
   { key: 'unprocessed', label: 'ยังไม่ประมวลผล' },
@@ -291,6 +292,8 @@ export function SourceInventoryPage() {
         <h1 className="text-2xl font-semibold tracking-tight">คลังต้นฉบับ</h1>
         <p className="text-sm text-muted-foreground">คลังวิดีโอต้นฉบับ พร้อมส่งเข้า Processing</p>
       </div>
+
+      <StudioSectionTabs />
 
       <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">

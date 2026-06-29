@@ -10,6 +10,7 @@ import {
 import { formatThaiDateTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { StudioSectionTabs } from '@/components/StudioSectionTabs'
 
 const VIEWS: Array<{ key: GalleryView; label: string }> = [
   { key: 'ready', label: 'ยังไม่โพสต์' },
@@ -271,6 +272,8 @@ export function GalleryPage() {
         <h1 className="text-2xl font-semibold tracking-tight">แกลลี่</h1>
         <p className="text-sm text-muted-foreground">คลิปที่ import เข้าระบบแล้ว</p>
       </div>
+
+      <StudioSectionTabs />
 
       <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">

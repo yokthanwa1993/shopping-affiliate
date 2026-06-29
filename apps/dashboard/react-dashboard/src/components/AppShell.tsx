@@ -1,13 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ComponentType, ReactNode } from 'react'
-import { Link } from '@tanstack/react-router'
+import { Link, useRouterState } from '@tanstack/react-router'
 import {
   Check,
   ChevronDown,
-  Cpu,
   Facebook,
   Film,
-  Layers,
   LayoutDashboard,
   Link2,
   PackageOpen,
@@ -25,6 +23,7 @@ type NavItem = {
   sublabel: string
   icon: ComponentType<{ className?: string }>
   exact: boolean
+  activePaths?: readonly string[]
 }
 
 type NavGroup = {
@@ -48,10 +47,21 @@ const NAV_GROUPS: readonly NavGroup[] = [
   {
     title: 'คอนเทนต์ · Studio',
     items: [
-      { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
-      { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
-      { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
-      { to: '/media-library', label: 'คลังสื่อ', sublabel: 'Media Library', icon: Film, exact: false },
+      // Two folder-level entries. "คลิปจีน" opens the Chinese-clip workspace
+      // (Source Inventory → Processing → Gallery), which carries its own
+      // top-level StudioSectionTabs to switch between those three views. "คลิป AI"
+      // opens the AI-generated media library. The per-view rows (Source
+      // Inventory / Processing / Gallery / Media Library) were collapsed into
+      // these folders to declutter the sidebar.
+      {
+        to: '/source-inventory',
+        label: 'คลิปจีน',
+        sublabel: 'Chinese Clips',
+        icon: PackageOpen,
+        exact: false,
+        activePaths: ['/source-inventory', '/source-processing', '/processing', '/gallery'],
+      },
+      { to: '/media-library', label: 'คลิป AI', sublabel: 'AI Clips', icon: Film, exact: false },
     ],
   },
   {
@@ -92,11 +102,15 @@ const SETTINGS_NAV: NavItem = {
 // orange right rail. Inactive rows are flat dark-gray with a light hover. The
 // icon inherits `currentColor`, so it flips orange together with the label.
 function NavLink({ item }: { item: NavItem }) {
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
+  const isFolderActive = item.activePaths?.some((path) => pathname === path || pathname.startsWith(`${path}/`)) ?? false
+  const folderActiveClass = isFolderActive ? ' !border-r-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]' : ''
+
   return (
     <Link
       to={item.to}
       activeOptions={{ exact: item.exact }}
-      className="flex items-center gap-2.5 border-r-[3px] border-transparent px-4 py-2 text-[#333333] transition-colors hover:bg-[#f5f5f5]"
+      className={`flex items-center gap-2.5 border-r-[3px] border-transparent px-4 py-2 text-[#333333] transition-colors hover:bg-[#f5f5f5]${folderActiveClass}`}
       activeProps={{
         className:
           '!border-r-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]',

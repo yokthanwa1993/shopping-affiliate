@@ -5,6 +5,7 @@ import { formatThaiDateTime } from '@/lib/format'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { StudioSectionTabs } from '@/components/StudioSectionTabs'
 
 const BUCKETS: Array<{ key: ProcessingBucket; label: string }> = [
   { key: 'active', label: 'กำลังทำงาน' },
@@ -28,6 +29,8 @@ export function ProcessingPage() {
         <h1 className="text-2xl font-semibold tracking-tight">Processing</h1>
         <p className="text-sm text-muted-foreground">สถานะคิวประมวลผลวิดีโอ</p>
       </div>
+
+      <StudioSectionTabs />
 
       <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
