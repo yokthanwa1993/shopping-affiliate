@@ -32,9 +32,8 @@ function looksLikeUrl(value: string): boolean {
   return /^https?:\/\/\S+$/i.test(trimmed)
 }
 
-// Upload workspace dialog: video file (required) + optional title, Shopee link and Lazada
-// link paired with THIS specific clip. Replaces the old bare hidden file input so links can
-// be captured alongside the upload.
+// Upload workspace dialog: video file (required) + optional Shopee/Lazada links
+// paired with THIS specific clip. The clip title is system-generated from the AI clip id.
 function UploadDialog({
   isUploading,
   onClose,
@@ -45,7 +44,6 @@ function UploadDialog({
   onSubmit: (input: AiClipUploadInput) => void
 }) {
   const [file, setFile] = useState<File | null>(null)
-  const [title, setTitle] = useState('')
   const [shopeeLink, setShopeeLink] = useState('')
   const [lazadaLink, setLazadaLink] = useState('')
   const [error, setError] = useState('')
@@ -75,7 +73,6 @@ function UploadDialog({
     setError('')
     onSubmit({
       file,
-      title: title.trim(),
       shopeeLink: shopeeLink.trim(),
       lazadaLink: lazadaLink.trim(),
     })
@@ -83,7 +80,7 @@ function UploadDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4"
       onClick={() => !isUploading && onClose()}
       role="dialog"
       aria-modal="true"
@@ -126,18 +123,9 @@ function UploadDialog({
             ) : null}
           </div>
 
-          <div className="space-y-1.5">
-            <label className="text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
-              ชื่อคลิป (ไม่บังคับ)
-            </label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="เช่น รีวิวสินค้า AI"
-              className="block w-full rounded-xl border bg-background px-3 py-2 text-sm"
-            />
-          </div>
+          <p className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-xs font-medium text-violet-800">
+            ระบบจะสร้างชื่อ/id คลิปให้อัตโนมัติหลังอัปโหลด
+          </p>
 
           <div className="space-y-1.5">
             <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
@@ -308,7 +296,7 @@ function AiDetailModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
