@@ -16,7 +16,7 @@ AI agents must not wait for the user to say “อ่าน AGENTS.md”, “que
 ## Source of truth สำหรับความรู้ร่วมกัน
 
 - Knowledge base หลักอยู่ที่ Obsidian vault: `/Users/yok-macmini/Documents/Obsidian Vault`
-- ระบบจัดการ wiki ใช้ repo: `/Users/yok-macmini/Developer/obsidian-wiki`
+- ระบบจัดการ wiki ใช้ repo: `/Users/yok-macmini/SupportRepos/obsidian-wiki`
 - Config กลางอยู่ที่: `~/.obsidian-wiki/config`
 - ทั้ง Hermes, Codex CLI และ Claude Code มี obsidian-wiki skills ชุดเดียวกัน 25 ตัว และชี้ไปที่ vault เดียวกัน
 - ก่อนเริ่มงานใหญ่ ให้ค้นความรู้เดิมจาก wiki เองโดยอัตโนมัติ เช่น `wiki-query` / `$wiki-query` / `/wiki-query`
