@@ -282,7 +282,7 @@ export function buildAiClipProcessingQueueJob(
     }
 }
 
-function galleryAssetUrl(workerUrl: string, namespaceId: string, id: string, variant: 'original' | 'original-thumb'): string {
+function galleryAssetUrl(workerUrl: string, namespaceId: string, id: string, variant: 'original' | 'original-thumb' | 'public'): string {
     const base = String(workerUrl || '').trim().replace(/\/+$/, '')
     const ns = String(namespaceId || '').trim()
     const vid = sanitizeAiClipId(id)
@@ -301,6 +301,8 @@ export function buildAiClipResponse(
     const originalUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original')
     const thumbnailUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original-thumb')
     const processed = isAiClipProcessed(record)
+    const publicUrl = processed ? galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'public') : ''
+    const playbackUrl = publicUrl || originalUrl
     const shopeeLink = sanitizeAiClipLink(record.shopeeLink)
     const lazadaLink = sanitizeAiClipLink(record.lazadaLink)
     return {
@@ -316,10 +318,12 @@ export function buildAiClipResponse(
         namespaceId: String(params.namespaceId || '').trim(),
         originalUrl,
         original_url: originalUrl,
-        videoUrl: originalUrl,
-        video_url: originalUrl,
-        previewUrl: originalUrl,
-        preview_url: originalUrl,
+        videoUrl: playbackUrl,
+        video_url: playbackUrl,
+        previewUrl: playbackUrl,
+        preview_url: playbackUrl,
+        publicUrl,
+        public_url: publicUrl,
         thumbnailUrl,
         thumbnail_url: thumbnailUrl,
         fallbackThumbnailUrl: thumbnailUrl,

@@ -19,6 +19,7 @@ export interface AiClip {
   status: string
   sourceLabel: string
   originalUrl: string
+  videoUrl: string
   previewUrl: string
   thumbnailUrl: string
   createdAt: string
@@ -31,14 +32,16 @@ export interface AiClip {
 function normalize(raw: unknown, index: number): AiClip | null {
   if (!isRecord(raw)) return null
   const id = pick(raw, ['id', 'video_id', 'videoId'])
-  const originalUrl = pick(raw, ['originalUrl', 'original_url', 'videoUrl', 'video_url'])
+  const originalUrl = pick(raw, ['originalUrl', 'original_url'])
+  const videoUrl = pick(raw, ['videoUrl', 'video_url', 'publicUrl', 'public_url']) || originalUrl
   return {
     id,
     title: pick(raw, ['title', 'originalFileName'], id ? `AI ${id}` : `คลิป ${index + 1}`),
     status: pick(raw, ['status'], 'unprocessed'),
     sourceLabel: pick(raw, ['sourceLabel', 'source_label'], 'คลิป AI'),
     originalUrl,
-    previewUrl: pick(raw, ['previewUrl', 'preview_url']) || originalUrl,
+    videoUrl,
+    previewUrl: pick(raw, ['previewUrl', 'preview_url']) || videoUrl || originalUrl,
     thumbnailUrl: pick(raw, ['thumbnailUrl', 'thumbnail_url']),
     createdAt: pick(raw, ['createdAt', 'created_at']),
     processedAt: pick(raw, ['processedAt', 'processed_at']),

@@ -286,7 +286,7 @@ function AiDetailModal({
   onDelete: () => void
   isDeleting: boolean
 }) {
-  const playback = (item.originalUrl || item.previewUrl || '').trim()
+  const playback = (item.videoUrl || item.previewUrl || item.originalUrl || '').trim()
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose()

@@ -217,6 +217,23 @@ test('buildAiClipResponse surfaces paired links in both camel + snake case', () 
     assert.equal(resp.hasLazadaLink, true)
 })
 
+
+test('buildAiClipResponse uses the final public asset for processed playback', () => {
+    const resp = buildAiClipResponse(
+        record({ id: '1234567', processedAt: '2026-06-29T01:00:00.000Z' }),
+        { namespaceId: '1774858894802785816', workerUrl: 'https://worker.example.dev' },
+    )
+    assert.equal(
+        resp.videoUrl,
+        'https://worker.example.dev/api/gallery/1234567/asset/public?namespace_id=1774858894802785816',
+    )
+    assert.equal(resp.previewUrl, resp.videoUrl)
+    assert.equal(
+        resp.originalUrl,
+        'https://worker.example.dev/api/gallery/1234567/asset/original?namespace_id=1774858894802785816',
+    )
+})
+
 // ── Processing handoff helpers ───────────────────────────────────────────────────────────
 
 test('decideAiClipProcessing queues an unprocessed, not-in-flight clip', () => {
