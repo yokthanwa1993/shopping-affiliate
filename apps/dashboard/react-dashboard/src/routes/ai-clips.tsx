@@ -80,13 +80,13 @@ function UploadDialog({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
       onClick={() => !isUploading && onClose()}
       role="dialog"
       aria-modal="true"
     >
       <form
-        className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border bg-card shadow-xl"
+        className="my-auto flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-2xl border bg-card shadow-xl sm:max-h-[calc(100dvh-3rem)]"
         onClick={(e) => e.stopPropagation()}
         onSubmit={submit}
       >
@@ -102,7 +102,7 @@ function UploadDialog({
           </Button>
         </div>
 
-        <div className="space-y-4 overflow-y-auto p-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
           <div className="space-y-1.5">
             <label className="text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
               ไฟล์วิดีโอ (MP4 / MOV / WEBM)
@@ -296,13 +296,13 @@ function AiDetailModal({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-4 sm:py-6"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
     >
       <div
-        className="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border bg-card shadow-xl"
+        className="my-auto flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-2xl border bg-card shadow-xl sm:max-h-[calc(100dvh-3rem)]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
@@ -323,8 +323,8 @@ function AiDetailModal({
           </div>
         </div>
 
-        <div className="space-y-4 overflow-y-auto p-4">
-          <div className="mx-auto w-full max-w-[280px] overflow-hidden rounded-2xl border bg-black" style={{ aspectRatio: '9 / 16' }}>
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
+          <div className="mx-auto w-full max-w-[260px] overflow-hidden rounded-2xl border bg-black sm:max-w-[280px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(58dvh, 560px)' }}>
             {playback ? (
               <video
                 src={playback}
