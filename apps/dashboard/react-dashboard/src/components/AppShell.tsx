@@ -5,15 +5,16 @@ import {
   Check,
   ChevronDown,
   Facebook,
+  Images,
   LayoutDashboard,
   Library,
   Link2,
   PackageOpen,
   PenSquare,
   Settings,
-  Sparkles,
   UserCog,
   Users,
+  Wand2,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { WorkspaceProvider, useWorkspace } from '@/contexts/workspace'
@@ -51,29 +52,29 @@ const NAV_GROUPS: readonly NavGroup[] = [
   {
     title: 'คอนเทนต์ · Studio',
     items: [
-      // Three folder-level entries:
-      // 1) "คลิปจีน" opens the Chinese-clip workspace (Source Inventory →
-      //    Processing → Gallery), which carries its own top-level
-      //    StudioSectionTabs to switch between those three views.
-      // 2) "คลิป AI" opens the dedicated AI-clips workspace at /ai-clips — the
-      //    operator's own AI-generated video library, 100% separate from the
-      //    Chinese/LINE source inventory and from the Facebook media library.
-      // 3) "คลังสื่อ Facebook" opens the Facebook media/content library at
-      //    /media-library — this is Facebook media, NOT Chinese clips and NOT
-      //    AI clips.
+      // Flat Studio menu (no folder-level "Chinese Clips" / "AI Clips" labels):
+      // 1) "Source Inventory" is now the AI upload workspace at /ai-clips — the
+      //    operator uploads their AI-generated videos (paired with Shopee/Lazada
+      //    links) here. The legacy Chinese/LINE source-inventory route still
+      //    exists at /source-inventory but is no longer surfaced in the nav.
+      // 2) "Processing" / "Gallery" keep their existing routes (the Chinese-clip
+      //    workspace views) — only the labels are generic now.
+      // 3) "Media Library" stays at /media-library — Facebook media, NOT the AI
+      //    upload workspace.
       {
-        to: '/source-inventory',
-        label: 'คลิปจีน',
-        sublabel: 'Chinese Clips',
+        to: '/ai-clips',
+        label: 'คลังต้นฉบับ',
+        sublabel: 'Source Inventory',
         icon: PackageOpen,
         exact: false,
-        activePaths: ['/source-inventory', '/source-processing', '/processing', '/gallery'],
+        activePaths: ['/ai-clips', '/source-inventory', '/source-processing', '/inbox'],
       },
-      { to: '/ai-clips', label: 'คลิป AI', sublabel: 'AI Clips', icon: Sparkles, exact: false },
+      { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Wand2, exact: false },
+      { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Images, exact: false },
       {
         to: '/media-library',
-        label: 'คลังสื่อ Facebook',
-        sublabel: 'Facebook Media Library',
+        label: 'คลังสื่อ',
+        sublabel: 'Media Library',
         icon: Library,
         exact: false,
       },

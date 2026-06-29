@@ -50,6 +50,10 @@ export type AiClipRecord = {
     contentType: string
     originalFileName: string
     sizeBytes: number
+    // Product links paired with THIS specific clip. Optional; stored verbatim when they
+    // look like an http(s) URL, otherwise dropped to '' (never a partial/garbage value).
+    shopeeLink: string
+    lazadaLink: string
 }
 
 export function parseAiClipView(raw: unknown): AiClipView {
@@ -89,6 +93,26 @@ export function generateAiClipId(now: number, randomToken: string): string {
 // prefix or the `videos/{id}_original.mp4` asset key.
 export function sanitizeAiClipId(raw: unknown): string {
     return String(raw || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
+}
+
+// Product-link guard. Trim, bound length, and accept ONLY when the value looks like an
+// http(s) URL. A non-empty value that is not http(s) sanitizes to '' (it is never stored
+// half-valid). Use `isAiClipLinkValid` at the route boundary to reject a bad link loudly.
+const AI_CLIP_LINK_MAX = 2048
+
+export function sanitizeAiClipLink(raw: unknown): string {
+    const value = String(raw || '').trim().slice(0, AI_CLIP_LINK_MAX)
+    if (!value) return ''
+    return /^https?:\/\/\S+$/i.test(value) ? value : ''
+}
+
+// True when the link is empty (links are optional) OR a well-formed http(s) URL. The upload
+// route uses this to return a clear `invalid_shopee_link` / `invalid_lazada_link` instead of
+// silently dropping a mistyped link.
+export function isAiClipLinkValid(raw: unknown): boolean {
+    const value = String(raw || '').trim()
+    if (!value) return true
+    return /^https?:\/\/\S+$/i.test(value.slice(0, AI_CLIP_LINK_MAX))
 }
 
 export function sanitizeAiClipTitle(raw: unknown): string {
@@ -142,6 +166,8 @@ export function normalizeAiClipRecord(input: Partial<AiClipRecord> | null | unde
         contentType: String(input?.contentType || '').trim(),
         originalFileName: String(input?.originalFileName || '').trim().slice(0, 260),
         sizeBytes: Number.isFinite(sizeRaw) && sizeRaw >= 0 ? Math.floor(sizeRaw) : 0,
+        shopeeLink: sanitizeAiClipLink(input?.shopeeLink),
+        lazadaLink: sanitizeAiClipLink(input?.lazadaLink),
     }
 }
 
@@ -181,6 +207,8 @@ export function buildAiClipResponse(
     const originalUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original')
     const thumbnailUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original-thumb')
     const processed = isAiClipProcessed(record)
+    const shopeeLink = sanitizeAiClipLink(record.shopeeLink)
+    const lazadaLink = sanitizeAiClipLink(record.lazadaLink)
     return {
         id: record.id,
         video_id: record.id,
@@ -209,8 +237,12 @@ export function buildAiClipResponse(
         processedAt: record.processedAt,
         readyToProcess: !processed,
         canStartProcessing: !processed,
-        hasShopeeLink: false,
-        hasLazadaLink: false,
+        shopeeLink,
+        shopee_link: shopeeLink,
+        lazadaLink,
+        lazada_link: lazadaLink,
+        hasShopeeLink: !!shopeeLink,
+        hasLazadaLink: !!lazadaLink,
         sizeBytes: record.sizeBytes,
         contentType: record.contentType,
         originalFileName: record.originalFileName,

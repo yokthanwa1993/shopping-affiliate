@@ -1,7 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Sparkles, Trash2, Upload } from 'lucide-react'
-import { deleteAiClip, fetchAiClips, uploadAiClip, type AiClip, type AiClipView } from '@/api/aiClips'
+import { ExternalLink, ShoppingBag, Sparkles, Trash2, Upload, X } from 'lucide-react'
+import {
+  deleteAiClip,
+  fetchAiClips,
+  uploadAiClip,
+  type AiClip,
+  type AiClipUploadInput,
+  type AiClipView,
+} from '@/api/aiClips'
 import { formatThaiDateTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 
@@ -16,6 +23,194 @@ const VIEWS: Array<{ key: AiClipView; label: string }> = [
 ]
 
 const ACCEPT = 'video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.m4v'
+
+// Optional links: empty is fine, but a non-empty value must look like an http(s) URL. The
+// worker re-validates this server-side; this is just early, friendly feedback.
+function looksLikeUrl(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed) return true
+  return /^https?:\/\/\S+$/i.test(trimmed)
+}
+
+// Upload workspace dialog: video file (required) + optional title, Shopee link and Lazada
+// link paired with THIS specific clip. Replaces the old bare hidden file input so links can
+// be captured alongside the upload.
+function UploadDialog({
+  isUploading,
+  onClose,
+  onSubmit,
+}: {
+  isUploading: boolean
+  onClose: () => void
+  onSubmit: (input: AiClipUploadInput) => void
+}) {
+  const [file, setFile] = useState<File | null>(null)
+  const [title, setTitle] = useState('')
+  const [shopeeLink, setShopeeLink] = useState('')
+  const [lazadaLink, setLazadaLink] = useState('')
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isUploading) onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose, isUploading])
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault()
+    if (!file) {
+      setError('กรุณาเลือกไฟล์วิดีโอ')
+      return
+    }
+    if (!looksLikeUrl(shopeeLink)) {
+      setError('ลิงก์ Shopee ต้องขึ้นต้นด้วย http:// หรือ https://')
+      return
+    }
+    if (!looksLikeUrl(lazadaLink)) {
+      setError('ลิงก์ Lazada ต้องขึ้นต้นด้วย http:// หรือ https://')
+      return
+    }
+    setError('')
+    onSubmit({
+      file,
+      title: title.trim(),
+      shopeeLink: shopeeLink.trim(),
+      lazadaLink: lazadaLink.trim(),
+    })
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={() => !isUploading && onClose()}
+      role="dialog"
+      aria-modal="true"
+    >
+      <form
+        className="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border bg-card shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+        onSubmit={submit}
+      >
+        <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-1 rounded-full bg-violet-600 px-2.5 py-1 text-[11px] font-bold text-white">
+              <Sparkles className="h-3 w-3" /> AI
+            </span>
+            <p className="text-sm font-semibold">อัปโหลดคลิป AI</p>
+          </div>
+          <Button type="button" size="sm" variant="ghost" onClick={onClose} disabled={isUploading}>
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+
+        <div className="space-y-4 overflow-y-auto p-4">
+          <div className="space-y-1.5">
+            <label className="text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              ไฟล์วิดีโอ (MP4 / MOV / WEBM)
+            </label>
+            <input
+              type="file"
+              accept={ACCEPT}
+              onChange={(e) => {
+                setFile(e.target.files?.[0] ?? null)
+                setError('')
+              }}
+              className="block w-full rounded-xl border bg-background px-3 py-2 text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-violet-600 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-white"
+            />
+            {file ? (
+              <p className="truncate text-xs text-muted-foreground">
+                {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MB
+              </p>
+            ) : null}
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              ชื่อคลิป (ไม่บังคับ)
+            </label>
+            <input
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="เช่น รีวิวสินค้า AI"
+              className="block w-full rounded-xl border bg-background px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              <ShoppingBag className="h-3.5 w-3.5 text-[#ee4d2d]" /> ลิงก์ Shopee (ไม่บังคับ)
+            </label>
+            <input
+              type="url"
+              inputMode="url"
+              value={shopeeLink}
+              onChange={(e) => setShopeeLink(e.target.value)}
+              placeholder="https://shopee.co.th/..."
+              className="block w-full rounded-xl border bg-background px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              <ShoppingBag className="h-3.5 w-3.5 text-[#0f146d]" /> ลิงก์ Lazada (ไม่บังคับ)
+            </label>
+            <input
+              type="url"
+              inputMode="url"
+              value={lazadaLink}
+              onChange={(e) => setLazadaLink(e.target.value)}
+              placeholder="https://www.lazada.co.th/..."
+              className="block w-full rounded-xl border bg-background px-3 py-2 text-sm"
+            />
+          </div>
+
+          {error ? (
+            <p className="rounded-xl border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {error}
+            </p>
+          ) : null}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={isUploading}>
+            ยกเลิก
+          </Button>
+          <Button
+            type="submit"
+            disabled={isUploading || !file}
+            className="gap-2 bg-violet-600 text-white hover:bg-violet-700"
+          >
+            <Upload className="h-4 w-4" />
+            {isUploading ? 'กำลังอัปโหลด…' : 'อัปโหลด'}
+          </Button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function ProductLinkRow({ label, href, accent }: { label: string; href: string; accent: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 transition-colors hover:bg-muted"
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        <ShoppingBag className="h-4 w-4 shrink-0" style={{ color: accent }} />
+        <span className="flex min-w-0 flex-col">
+          <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">{label}</span>
+          <span className="truncate text-sm font-semibold text-foreground">{href}</span>
+        </span>
+      </span>
+      <ExternalLink className="h-4 w-4 shrink-0 text-muted-foreground" />
+    </a>
+  )
+}
 
 function compactThaiDate(value: string): string {
   const trimmed = String(value || '').trim()
@@ -168,6 +363,14 @@ function AiDetailModal({
             </p>
           </div>
 
+          {item.shopeeLink || item.lazadaLink ? (
+            <div className="space-y-2">
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">ลิงก์สินค้า</p>
+              {item.shopeeLink ? <ProductLinkRow label="Shopee" href={item.shopeeLink} accent="#ee4d2d" /> : null}
+              {item.lazadaLink ? <ProductLinkRow label="Lazada" href={item.lazadaLink} accent="#0f146d" /> : null}
+            </div>
+          ) : null}
+
           {item.id ? <DetailRow label="Video ID" value={item.id} /> : null}
           {item.createdAt ? <DetailRow label="อัปโหลดเมื่อ" value={formatThaiDateTime(item.createdAt)} /> : null}
           {item.processedAt ? <DetailRow label="ประมวลผลเมื่อ" value={formatThaiDateTime(item.processedAt)} /> : null}
@@ -180,8 +383,8 @@ function AiDetailModal({
 export function AiClipsPage() {
   const [view, setView] = useState<AiClipView>('unprocessed')
   const [selected, setSelected] = useState<AiClip | null>(null)
+  const [uploadOpen, setUploadOpen] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
   const queryClient = useQueryClient()
 
   const query = useQuery({
@@ -190,8 +393,9 @@ export function AiClipsPage() {
   })
 
   const upload = useMutation({
-    mutationFn: (file: File) => uploadAiClip(file),
+    mutationFn: (input: AiClipUploadInput) => uploadAiClip(input),
     onSuccess: async (result) => {
+      setUploadOpen(false)
       setNotice({ kind: 'ok', text: `อัปโหลดคลิป AI สำเร็จ${result.video?.id ? ` (${result.video.id})` : ''}` })
       setView('unprocessed')
       await queryClient.invalidateQueries({ queryKey: ['ai-clips'] })
@@ -215,34 +419,21 @@ export function AiClipsPage() {
 
   const items = query.data ?? []
 
-  function onPickFile(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    event.target.value = '' // allow re-selecting the same file
-    if (!file) return
-    setNotice(null)
-    upload.mutate(file)
-  }
-
   return (
     <div className="mx-auto max-w-6xl space-y-5">
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept={ACCEPT}
-        className="hidden"
-        onChange={onPickFile}
-      />
-
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-            <Sparkles className="h-6 w-6 text-violet-600" /> คลิป AI
+            <Sparkles className="h-6 w-6 text-violet-600" /> คลังต้นฉบับ
           </h1>
-          <p className="text-sm text-muted-foreground">AI Clips · คลังวิดีโอ AI ที่อัปโหลดเอง แยกจากคลิปจีน/LINE</p>
+          <p className="text-sm text-muted-foreground">Source Inventory · คลังวิดีโอ AI ที่อัปโหลดเอง แยกจากคลิปจีน/LINE</p>
         </div>
         <Button
           type="button"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => {
+            setNotice(null)
+            setUploadOpen(true)
+          }}
           disabled={upload.isPending}
           className="gap-2 bg-violet-600 text-white hover:bg-violet-700"
         >
@@ -250,6 +441,17 @@ export function AiClipsPage() {
           {upload.isPending ? 'กำลังอัปโหลด…' : 'อัปโหลดคลิป AI'}
         </Button>
       </div>
+
+      {uploadOpen ? (
+        <UploadDialog
+          isUploading={upload.isPending}
+          onClose={() => setUploadOpen(false)}
+          onSubmit={(input) => {
+            setNotice(null)
+            upload.mutate(input)
+          }}
+        />
+      ) : null}
 
       {notice ? (
         <div

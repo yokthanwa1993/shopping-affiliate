@@ -316,10 +316,12 @@ import {
     filterAiClipsByView,
     generateAiClipId,
     isAiClipProcessed,
+    isAiClipLinkValid,
     isAllowedAiClipUpload,
     normalizeAiClipRecord,
     parseAiClipView,
     sanitizeAiClipId,
+    sanitizeAiClipLink,
     sanitizeAiClipTitle,
     sortAiClipRecords,
     aiClipNamespacePrefix,
@@ -10989,6 +10991,15 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
         if (sizeBytes > AI_CLIP_MAX_BYTES) return c.json({ ok: false, error: 'file_too_large' }, 413)
 
         const title = sanitizeAiClipTitle(form.get('title'))
+        // Product links paired with THIS clip (optional). Accept either camelCase or
+        // snake_case form field. A non-empty value that is not an http(s) URL is rejected
+        // loudly so the operator notices a typo rather than losing the link silently.
+        const shopeeRaw = form.get('shopee_link') ?? form.get('shopeeLink')
+        const lazadaRaw = form.get('lazada_link') ?? form.get('lazadaLink')
+        if (!isAiClipLinkValid(shopeeRaw)) return c.json({ ok: false, error: 'invalid_shopee_link' }, 400)
+        if (!isAiClipLinkValid(lazadaRaw)) return c.json({ ok: false, error: 'invalid_lazada_link' }, 400)
+        const shopeeLink = sanitizeAiClipLink(shopeeRaw)
+        const lazadaLink = sanitizeAiClipLink(lazadaRaw)
         const id = sanitizeAiClipId(generateAiClipId(Date.now(), crypto.randomUUID().replace(/-/g, '')))
         if (!id) return c.json({ ok: false, error: 'id_generation_failed' }, 500)
 
@@ -11013,6 +11024,8 @@ app.post('/api/dashboard/ai-clips/upload', async (c) => {
             contentType,
             originalFileName: fileName,
             sizeBytes,
+            shopeeLink,
+            lazadaLink,
         })
         if (!record) {
             await bucket.delete(originalKey).catch(() => { })

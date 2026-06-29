@@ -24,6 +24,8 @@ export interface AiClip {
   createdAt: string
   processedAt: string
   sizeBytes: number
+  shopeeLink: string
+  lazadaLink: string
 }
 
 function normalize(raw: unknown, index: number): AiClip | null {
@@ -41,6 +43,8 @@ function normalize(raw: unknown, index: number): AiClip | null {
     createdAt: pick(raw, ['createdAt', 'created_at']),
     processedAt: pick(raw, ['processedAt', 'processed_at']),
     sizeBytes: Number(safeString(pick(raw, ['sizeBytes', 'size_bytes'])) || '0') || 0,
+    shopeeLink: pick(raw, ['shopeeLink', 'shopee_link']),
+    lazadaLink: pick(raw, ['lazadaLink', 'lazada_link']),
   }
 }
 
@@ -59,17 +63,30 @@ export interface AiClipUploadResult {
   video: AiClip | null
 }
 
+export interface AiClipUploadInput {
+  file: File
+  title?: string
+  shopeeLink?: string
+  lazadaLink?: string
+}
+
 // Multipart upload — raw fetch (not workerFetchJson) so the browser sets the
 // multipart boundary itself. Mirrors workerFetchJson's namespace header + same-origin
-// credentials so the dashboard passkey session authorizes the write.
+// credentials so the dashboard passkey session authorizes the write. Shopee/Lazada links
+// are optional and sent paired with this specific video (snake_case field names the worker
+// reads; trimmed here, validated again server-side).
 export async function uploadAiClip(
-  file: File,
-  title?: string,
+  input: AiClipUploadInput,
   signal?: AbortSignal,
 ): Promise<AiClipUploadResult> {
   const form = new FormData()
-  form.append('file', file)
-  if (title && title.trim()) form.append('title', title.trim())
+  form.append('file', input.file)
+  const title = input.title?.trim()
+  if (title) form.append('title', title)
+  const shopeeLink = input.shopeeLink?.trim()
+  if (shopeeLink) form.append('shopee_link', shopeeLink)
+  const lazadaLink = input.lazadaLink?.trim()
+  if (lazadaLink) form.append('lazada_link', lazadaLink)
 
   const response = await fetch(`${WORKER_API_BASE}/api/dashboard/ai-clips/upload`, {
     method: 'POST',

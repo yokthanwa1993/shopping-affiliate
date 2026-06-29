@@ -11,11 +11,13 @@ import {
     buildAiClipResponse,
     filterAiClipsByView,
     generateAiClipId,
+    isAiClipLinkValid,
     isAiClipProcessed,
     isAllowedAiClipUpload,
     normalizeAiClipRecord,
     parseAiClipView,
     sanitizeAiClipId,
+    sanitizeAiClipLink,
     sanitizeAiClipTitle,
     sortAiClipRecords,
     type AiClipRecord,
@@ -103,6 +105,38 @@ test('normalizeAiClipRecord rejects empty id and pins source type', () => {
     assert.equal(r.namespaceId, '1774858894802785816')
     assert.equal(r.sourceType, AI_CLIP_SOURCE_TYPE)
     assert.equal(r.sourceLabel, AI_CLIP_SOURCE_LABEL)
+    // Links default to '' when not provided.
+    assert.equal(r.shopeeLink, '')
+    assert.equal(r.lazadaLink, '')
+})
+
+test('sanitizeAiClipLink keeps http(s) urls, trims, and drops anything else', () => {
+    assert.equal(sanitizeAiClipLink('  https://shopee.co.th/x  '), 'https://shopee.co.th/x')
+    assert.equal(sanitizeAiClipLink('http://lazada.co.th/y'), 'http://lazada.co.th/y')
+    assert.equal(sanitizeAiClipLink(''), '')
+    assert.equal(sanitizeAiClipLink(undefined), '')
+    // Non-http(s) / malformed values are dropped to '' (never stored half-valid).
+    assert.equal(sanitizeAiClipLink('shopee.co.th/x'), '')
+    assert.equal(sanitizeAiClipLink('javascript:alert(1)'), '')
+    assert.equal(sanitizeAiClipLink('ftp://host/file'), '')
+    assert.equal(sanitizeAiClipLink('https://'), '')
+})
+
+test('isAiClipLinkValid allows empty + http(s), rejects malformed non-empty', () => {
+    assert.equal(isAiClipLinkValid(''), true)
+    assert.equal(isAiClipLinkValid(undefined), true)
+    assert.equal(isAiClipLinkValid('https://shopee.co.th/x'), true)
+    assert.equal(isAiClipLinkValid('not-a-url'), false)
+    assert.equal(isAiClipLinkValid('javascript:alert(1)'), false)
+})
+
+test('normalizeAiClipRecord persists valid links and drops invalid ones', () => {
+    const good = record({ shopeeLink: 'https://shopee.co.th/abc', lazadaLink: 'http://lazada.co.th/def' })
+    assert.equal(good.shopeeLink, 'https://shopee.co.th/abc')
+    assert.equal(good.lazadaLink, 'http://lazada.co.th/def')
+    const bad = record({ shopeeLink: 'shopee.co.th/abc', lazadaLink: 'javascript:alert(1)' })
+    assert.equal(bad.shopeeLink, '')
+    assert.equal(bad.lazadaLink, '')
 })
 
 test('processed lifecycle is driven by processedAt presence', () => {
@@ -134,6 +168,10 @@ test('buildAiClipResponse points playback/thumb at namespace-scoped asset endpoi
     assert.equal(resp.status, 'unprocessed')
     assert.equal(resp.hasShopeeLink, false)
     assert.equal(resp.hasLazadaLink, false)
+    assert.equal(resp.shopeeLink, '')
+    assert.equal(resp.shopee_link, '')
+    assert.equal(resp.lazadaLink, '')
+    assert.equal(resp.lazada_link, '')
     assert.equal(
         resp.originalUrl,
         'https://worker.example.dev/api/gallery/ai_xyz/asset/original?namespace_id=1774858894802785816',
@@ -145,4 +183,17 @@ test('buildAiClipResponse points playback/thumb at namespace-scoped asset endpoi
     // No worker URL → empty asset URLs rather than a malformed link
     const bare = buildAiClipResponse(record({ id: 'ai_xyz' }), { namespaceId: 'ns', workerUrl: '' })
     assert.equal(bare.originalUrl, '')
+})
+
+test('buildAiClipResponse surfaces paired links in both camel + snake case', () => {
+    const resp = buildAiClipResponse(
+        record({ id: 'ai_lnk', shopeeLink: 'https://shopee.co.th/p', lazadaLink: 'https://lazada.co.th/p' }),
+        { namespaceId: '1774858894802785816', workerUrl: 'https://worker.example.dev' },
+    )
+    assert.equal(resp.shopeeLink, 'https://shopee.co.th/p')
+    assert.equal(resp.shopee_link, 'https://shopee.co.th/p')
+    assert.equal(resp.lazadaLink, 'https://lazada.co.th/p')
+    assert.equal(resp.lazada_link, 'https://lazada.co.th/p')
+    assert.equal(resp.hasShopeeLink, true)
+    assert.equal(resp.hasLazadaLink, true)
 })
