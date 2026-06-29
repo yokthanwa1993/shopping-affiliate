@@ -325,11 +325,11 @@ function AiDetailModal({
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
-          <div className="mx-auto w-full max-w-[220px] overflow-hidden rounded-2xl border bg-black sm:max-w-[240px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(46dvh, 420px)' }}>
+          <div className="mx-auto w-full max-w-[220px] overflow-hidden rounded-2xl border bg-muted sm:max-w-[240px]" style={{ aspectRatio: '9 / 16', maxHeight: 'min(46dvh, 420px)' }}>
             {playback ? (
               <video
                 src={playback}
-                className="block h-full w-full bg-black object-contain"
+                className="block h-full w-full object-cover"
                 controls
                 autoPlay
                 playsInline
