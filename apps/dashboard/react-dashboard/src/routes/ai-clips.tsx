@@ -1,29 +1,109 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, ShoppingBag, Sparkles, Trash2, Upload, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  ExternalLink,
+  Loader2,
+  ShoppingBag,
+  Sparkles,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react'
 import {
   deleteAiClip,
   fetchAiClips,
   uploadAiClip,
   type AiClip,
   type AiClipUploadInput,
-  type AiClipView,
 } from '@/api/aiClips'
 import { formatThaiDateTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 
-// Dedicated AI Clips workspace — operator-uploaded AI videos, 100% separate from the
-// Chinese/LINE source inventory. Empty state is expected and clear: the library starts
-// empty and the operator fills it via the header upload button. Unprocessed/processed
-// tabs mirror the old source-inventory lifecycle.
-
-const VIEWS: Array<{ key: AiClipView; label: string }> = [
-  { key: 'unprocessed', label: 'ยังไม่ประมวลผล' },
-  { key: 'processed', label: 'ประมวลผลแล้ว' },
-]
+// Unified "Media" library — every clip the operator uploaded/sent into the system
+// (AI/manual uploads only, NOT the legacy Chinese/LINE gallery). One flat grid, newest
+// first, with a per-card status badge instead of splitting the library across
+// processed/unprocessed tabs. The empty state is expected: the library starts empty and
+// the operator fills it via the header upload button.
 
 const ACCEPT = 'video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.m4v'
+
+// Per-clip status badge. The worker currently only distinguishes processed vs
+// unprocessed (presence of processedAt), but we map the broader processing/failed
+// vocabulary too so the badge stays correct if the backend reports richer states later.
+type ClipStatusTone = 'processed' | 'processing' | 'failed' | 'waiting'
+
+function clipStatusMeta(status: string): { tone: ClipStatusTone; label: string } {
+  const s = String(status || '').trim().toLowerCase()
+  if (['processed', 'done', 'complete', 'completed', 'ready', 'success'].includes(s)) {
+    return { tone: 'processed', label: 'ประมวลผลแล้ว' }
+  }
+  if (['processing', 'running', 'in_progress', 'in-progress', 'working', 'pending'].includes(s)) {
+    return { tone: 'processing', label: 'กำลังประมวลผล' }
+  }
+  if (['failed', 'error', 'failure', 'errored'].includes(s)) {
+    return { tone: 'failed', label: 'ล้มเหลว' }
+  }
+  return { tone: 'waiting', label: 'รอประมวลผล' }
+}
+
+const STATUS_OVERLAY: Record<ClipStatusTone, string> = {
+  processed: 'bg-emerald-600/95 text-white',
+  processing: 'bg-amber-500/95 text-white',
+  failed: 'bg-red-600/95 text-white',
+  waiting: 'bg-slate-800/85 text-white',
+}
+
+const STATUS_SOLID: Record<ClipStatusTone, string> = {
+  processed: 'bg-emerald-100 text-emerald-700',
+  processing: 'bg-amber-100 text-amber-700',
+  failed: 'bg-red-100 text-red-700',
+  waiting: 'bg-slate-200 text-slate-700',
+}
+
+const STATUS_ICON: Record<ClipStatusTone, typeof CheckCircle2> = {
+  processed: CheckCircle2,
+  processing: Loader2,
+  failed: AlertTriangle,
+  waiting: Clock,
+}
+
+function StatusBadge({
+  status,
+  variant = 'overlay',
+  className = '',
+}: {
+  status: string
+  variant?: 'overlay' | 'solid'
+  className?: string
+}) {
+  const meta = clipStatusMeta(status)
+  const Icon = STATUS_ICON[meta.tone]
+  const palette = variant === 'overlay' ? STATUS_OVERLAY[meta.tone] : STATUS_SOLID[meta.tone]
+  const shadow = variant === 'overlay' ? ' shadow-lg backdrop-blur-sm' : ''
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-bold${shadow} ${palette} ${className}`}
+    >
+      <Icon className={`h-3 w-3${meta.tone === 'processing' ? ' animate-spin' : ''}`} />
+      {meta.label}
+    </span>
+  )
+}
+
+// Newest-first ordering key: prefer processedAt, fall back to createdAt. Tolerates the
+// worker's space-separated, TZ-less timestamps (mirrors compactThaiDate's parsing).
+function clipTimestamp(item: AiClip): number {
+  const raw = String(item.processedAt || item.createdAt || '').trim()
+  if (!raw) return 0
+  const hasTz = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(raw)
+  const parseable = hasTz ? raw : raw.replace(' ', 'T') + 'Z'
+  const t = new Date(parseable).getTime()
+  return Number.isNaN(t) ? 0 : t
+}
 
 // Optional links: empty is fine, but a non-empty value must look like an http(s) URL. The
 // worker re-validates this server-side; this is just early, friendly feedback.
@@ -258,6 +338,9 @@ function AiCard({ item, onOpen }: { item: AiClip; onOpen: () => void }) {
           <Sparkles className="h-3 w-3" /> AI
         </span>
       </div>
+      <div className="absolute right-2 top-2 flex items-center">
+        <StatusBadge status={item.status} />
+      </div>
       <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
         <p className="truncate text-[11px] font-extrabold">{item.title || item.id}</p>
         {dateLabel ? <p className="mt-0.5 truncate text-[10px] text-white/75">{dateLabel}</p> : null}
@@ -343,13 +426,20 @@ function AiDetailModal({
             )}
           </div>
 
-          <div className="rounded-xl bg-primary/10 px-3 py-3 text-sm text-foreground">
-            <p className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-60">คลัง AI</p>
-            <p className="mt-1 font-semibold">
-              {item.status === 'processed'
-                ? 'คลิป AI นี้ประมวลผลแล้ว'
-                : 'คลิป AI นี้อยู่ในคลัง รอประมวลผล'}
-            </p>
+          <div className="flex items-center justify-between gap-3 rounded-xl bg-muted px-3 py-3 text-sm text-foreground">
+            <div className="min-w-0">
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-60">สถานะ</p>
+              <p className="mt-1 font-semibold">
+                {clipStatusMeta(item.status).tone === 'processed'
+                  ? 'คลิปนี้ประมวลผลแล้ว'
+                  : clipStatusMeta(item.status).tone === 'processing'
+                    ? 'คลิปนี้กำลังประมวลผล'
+                    : clipStatusMeta(item.status).tone === 'failed'
+                      ? 'คลิปนี้ประมวลผลไม่สำเร็จ'
+                      : 'คลิปนี้อยู่ในคลัง รอประมวลผล'}
+              </p>
+            </div>
+            <StatusBadge status={item.status} variant="solid" className="shrink-0" />
           </div>
 
           {item.shopeeLink || item.lazadaLink ? (
@@ -370,15 +460,28 @@ function AiDetailModal({
 }
 
 export function AiClipsPage() {
-  const [view, setView] = useState<AiClipView>('unprocessed')
   const [selected, setSelected] = useState<AiClip | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
   const queryClient = useQueryClient()
 
+  // One unified list: fetch both worker views and merge into a single newest-first grid.
+  // The processed view wins on id collisions so a clip never shows up twice or regresses
+  // to a stale "waiting" card after it finishes.
   const query = useQuery({
-    queryKey: ['ai-clips', view],
-    queryFn: ({ signal }) => fetchAiClips(view, signal),
+    queryKey: ['ai-clips', 'all'],
+    queryFn: async ({ signal }) => {
+      const [processed, unprocessed] = await Promise.all([
+        fetchAiClips('processed', signal),
+        fetchAiClips('unprocessed', signal),
+      ])
+      const byId = new Map<string, AiClip>()
+      for (const clip of [...processed, ...unprocessed]) {
+        const key = clip.id || `${clip.title}|${clip.createdAt}`
+        if (!byId.has(key)) byId.set(key, clip)
+      }
+      return Array.from(byId.values()).sort((a, b) => clipTimestamp(b) - clipTimestamp(a))
+    },
   })
 
   const upload = useMutation({
@@ -386,7 +489,6 @@ export function AiClipsPage() {
     onSuccess: async (result) => {
       setUploadOpen(false)
       setNotice({ kind: 'ok', text: `อัปโหลดคลิป AI สำเร็จ${result.video?.id ? ` (${result.video.id})` : ''}` })
-      setView('unprocessed')
       await queryClient.invalidateQueries({ queryKey: ['ai-clips'] })
     },
     onError: (error) => {
@@ -413,9 +515,9 @@ export function AiClipsPage() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-            <Sparkles className="h-6 w-6 text-violet-600" /> คลังต้นฉบับ
+            <Sparkles className="h-6 w-6 text-violet-600" /> Media
           </h1>
-          <p className="text-sm text-muted-foreground">Source Inventory · คลังวิดีโอ AI ที่อัปโหลดเอง แยกจากคลิปจีน/LINE</p>
+          <p className="text-sm text-muted-foreground">คลังสื่อ · คลิปที่อัปโหลด/ส่งเข้าระบบ พร้อมสถานะการประมวลผล</p>
         </div>
         <Button
           type="button"
@@ -455,19 +557,9 @@ export function AiClipsPage() {
       ) : null}
 
       <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
-          {VIEWS.map((v) => (
-            <Button
-              key={v.key}
-              type="button"
-              size="sm"
-              variant={view === v.key ? 'default' : 'ghost'}
-              onClick={() => setView(v.key)}
-            >
-              {v.label}
-            </Button>
-          ))}
-        </div>
+        <p className="text-sm font-medium text-muted-foreground">
+          {query.isLoading ? 'กำลังโหลด…' : `ทั้งหมด ${items.length} คลิป`}
+        </p>
         <Button type="button" variant="outline" onClick={() => void query.refetch()} disabled={query.isFetching}>
           {query.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
         </Button>
@@ -488,9 +580,7 @@ export function AiClipsPage() {
       ) : items.length === 0 ? (
         <div className="rounded-xl border border-dashed p-10 text-center">
           <Sparkles className="mx-auto h-8 w-8 text-violet-400" />
-          <p className="mt-3 text-sm font-semibold text-foreground">
-            {view === 'unprocessed' ? 'ยังไม่มีคลิป AI ในเนมสเปซนี้' : 'ยังไม่มีคลิป AI ที่ประมวลผลแล้ว'}
-          </p>
+          <p className="mt-3 text-sm font-semibold text-foreground">ยังไม่มีคลิปในคลังสื่อนี้</p>
           <p className="mt-1 text-sm text-muted-foreground">
             กดปุ่ม “อัปโหลดคลิป AI” ด้านบนเพื่อเพิ่มวิดีโอ (MP4 / MOV / WEBM)
           </p>

@@ -73,8 +73,8 @@ const NAV_GROUPS: readonly NavGroup[] = [
       },
       {
         to: '/ai-clips',
-        label: 'คลังต้นฉบับ',
-        sublabel: 'Source Inventory',
+        label: 'Media',
+        sublabel: 'คลังสื่อ',
         icon: PackageOpen,
         exact: false,
         activePaths: ['/ai-clips', '/source-inventory', '/source-processing', '/inbox'],
