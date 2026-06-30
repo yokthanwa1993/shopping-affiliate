@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
     dispatchNextProcessingJob,
+    resolveProcessingDispatchMode,
     runScheduledProcessingTick,
     type ProcessingDispatchSteps,
     type ScheduledProcessingTickSteps,
@@ -169,6 +170,64 @@ test('namespace id is trimmed in the result', async () => {
     assert.equal(result.namespaceId, 'ns-2')
     assert.equal(result.started, true)
     assert.equal(result.source, 'queue')
+})
+
+// --- resolveProcessingDispatchMode: the legacy-vs-AI split that fixes the app.oomnn
+// Processing retry/autostart regression. A namespace with NO AI clip source records stays
+// in LEGACY mode (durable queue + ready inbox, no handoff deletion); a namespace backed by
+// the AI clip source library stays in AI-only mode (one clip at a time, legacy auto-pick
+// disabled, non-AI handoffs deleted). ---
+
+test('a legacy (non-AI) namespace keeps the legacy queue + ready-inbox flow', () => {
+    const mode = resolveProcessingDispatchMode(false)
+    assert.equal(mode.aiOnly, false)
+    // Legacy ready-inbox / admin-original auto-pick stays ENABLED so app.oomnn autostarts.
+    assert.equal(mode.disableLegacySources, false)
+    // A requeued failed/legacy durable-queue handoff must NEVER be deleted — it must drain.
+    assert.equal(mode.deleteNonAiQueueHandoffs, false)
+    // No AI clip source library backs a legacy namespace.
+    assert.equal(mode.allowAiClipSource, false)
+})
+
+test('an AI-clip namespace stays one-at-a-time with legacy auto-pick disabled', () => {
+    const mode = resolveProcessingDispatchMode(true)
+    assert.equal(mode.aiOnly, true)
+    // The Dashboard/Media flow never auto-picks the old Chinese/legacy backlog.
+    assert.equal(mode.disableLegacySources, true)
+    // Non-AI durable-queue handoffs are deleted rather than promoted.
+    assert.equal(mode.deleteNonAiQueueHandoffs, true)
+    // The AI clip source library is the only automatic backlog.
+    assert.equal(mode.allowAiClipSource, true)
+})
+
+test('legacy-mode dispatch drains a requeued durable-queue job (reprocess autostart)', async () => {
+    // The exact reprocess path: a failed legacy job is moved into the durable `_queue/`, then
+    // dispatch runs with the legacy plan. drainQueue (processNextInQueue) promotes it — the AI
+    // clip source step is absent (legacy namespaces never have one), legacy sources stay live.
+    const mode = resolveProcessingDispatchMode(false)
+    const calls = { hasActiveJob: 0, drainQueue: 0, startReadyInbox: 0, startAdminOriginal: 0 }
+    const steps: ProcessingDispatchSteps = {
+        hasActiveJob: async () => { calls.hasActiveJob++; return false },
+        drainQueue: async () => { calls.drainQueue++; return true }, // the requeued job drains
+        startReadyInbox: async () => { calls.startReadyInbox++; return false },
+        startAdminOriginal: async () => { calls.startAdminOriginal++; return false },
+    }
+    const result = await dispatchNextProcessingJob('1774985587565583183', steps, { disableLegacySources: mode.disableLegacySources })
+    assert.deepEqual(result, { namespaceId: '1774985587565583183', started: true, source: 'queue' })
+    assert.equal(calls.drainQueue, 1)
+    // Legacy fallbacks never need to run because the queued job already started.
+    assert.equal(calls.startReadyInbox, 0)
+})
+
+test('legacy-mode dispatch falls back to the ready inbox when the queue is empty', async () => {
+    // app.oomnn autostart: with an empty durable queue, the legacy ready-inbox picks the next
+    // item. This is the path that disableLegacySources would have wrongly suppressed.
+    const mode = resolveProcessingDispatchMode(false)
+    const { steps, calls } = makeSteps({ startReadyInbox: true })
+    const result = await dispatchNextProcessingJob('1774985587565583183', steps, { disableLegacySources: mode.disableLegacySources })
+    assert.equal(result.started, true)
+    assert.equal(result.source, 'ready_inbox')
+    assert.equal(calls.startReadyInbox, 1)
 })
 
 // --- runScheduledProcessingTick: a posting failure must never skip the

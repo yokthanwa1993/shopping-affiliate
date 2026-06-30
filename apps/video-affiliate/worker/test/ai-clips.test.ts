@@ -16,6 +16,7 @@ import {
     generateAiClipId,
     isAiClipLinkValid,
     isAiClipProcessed,
+    isAiClipQueueHandoff,
     isAllowedAiClipUpload,
     normalizeAiClipRecord,
     parseAiClipView,
@@ -445,4 +446,27 @@ test('buildAiClipProcessingQueueJob preserves an absent link as empty + returns 
         buildAiClipProcessingQueueJob(record({ id: '1234567' }), { workerUrl: '', namespaceId: 'ns', nowIso: 'x' }),
         null,
     )
+})
+
+// --- isAiClipQueueHandoff: classifies durable `_queue/` handoffs so the AI-only drain keeps
+// AI clip jobs and deletes everything else, while legacy app.oomnn jobs (no source marker)
+// are never matched here and are preserved + drained by the legacy queue path. ---
+
+test('isAiClipQueueHandoff matches the AI source type marker', () => {
+    assert.equal(isAiClipQueueHandoff({ id: '1234567', sourceType: AI_CLIP_SOURCE_TYPE }), true)
+})
+
+test('isAiClipQueueHandoff matches an English or Thai AI clip label', () => {
+    assert.equal(isAiClipQueueHandoff({ sourceLabel: 'AI Clip' }), true)
+    assert.equal(isAiClipQueueHandoff({ sourceLabel: AI_CLIP_SOURCE_LABEL }), true)
+})
+
+test('isAiClipQueueHandoff is false for a legacy app.oomnn handoff (no source marker)', () => {
+    // The exact shape /api/processing/:id/reprocess requeues for a legacy failed job: a plain
+    // video job with NO sourceType/sourceLabel. It must NOT be classified as an AI clip, so the
+    // AI-only drain never deletes it (and legacy namespaces use processNextInQueue anyway).
+    assert.equal(isAiClipQueueHandoff({ id: '3952952e', videoUrl: 'https://app.oomnn.com/v.mp4', status: 'queued' }), false)
+    assert.equal(isAiClipQueueHandoff({ sourceLabel: 'คลังต้นฉบับ' }), false)
+    assert.equal(isAiClipQueueHandoff(null), false)
+    assert.equal(isAiClipQueueHandoff(undefined), false)
 })

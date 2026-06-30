@@ -149,6 +149,17 @@ export function isAiClipProcessed(record: Pick<AiClipRecord, 'processedAt'>): bo
     return !!String(record?.processedAt || '').trim()
 }
 
+// True when a durable `_queue/` handoff originated from the AI Clips source library, i.e. it
+// carries the AI source marker (sourceType `ai_manual_upload` or a "คลิป AI" / "AI clip"
+// label). The AI-only drain keeps + promotes these and deletes everything else; legacy
+// app.oomnn handoffs carry NO source marker, so this returns false for them and they are
+// preserved + drained by the legacy queue path instead. Pure so it is unit-testable.
+export function isAiClipQueueHandoff(job: Record<string, unknown> | null | undefined): boolean {
+    const sourceType = String(job?.sourceType || '').trim()
+    const sourceLabel = String(job?.sourceLabel || '').trim().toLowerCase()
+    return sourceType === AI_CLIP_SOURCE_TYPE || sourceLabel.includes('ai clip') || sourceLabel.includes('คลิป ai')
+}
+
 export function aiClipStatus(record: Pick<AiClipRecord, 'processedAt'>): AiClipView {
     return isAiClipProcessed(record) ? 'processed' : 'unprocessed'
 }

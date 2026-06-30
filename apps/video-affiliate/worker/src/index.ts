@@ -124,6 +124,7 @@ import {
 } from './pipeline'
 import {
     dispatchNextProcessingJob,
+    resolveProcessingDispatchMode,
     runScheduledProcessingTick,
     type ProcessingDispatchResult,
 } from './processing-dispatch'
@@ -318,6 +319,7 @@ import {
     filterAiClipsByView,
     generateAiClipId,
     isAiClipProcessed,
+    isAiClipQueueHandoff,
     isAiClipLinkValid,
     isAllowedAiClipUpload,
     normalizeAiClipRecord,
@@ -26227,10 +26229,7 @@ async function drainAiClipQueueOnlyForNamespace(
     for (const obj of objects) {
         const queued = await bucket.get(obj.key).catch(() => null)
         const job = queued ? await queued.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown> : {}
-        const sourceType = String(job.sourceType || '').trim()
-        const sourceLabel = String(job.sourceLabel || '').trim().toLowerCase()
-        const isAiClip = sourceType === 'ai_manual_upload' || sourceLabel.includes('ai clip')
-        if (isAiClip) {
+        if (isAiClipQueueHandoff(job)) {
             hasAiClipQueue = true
             continue
         }
@@ -26295,6 +26294,24 @@ async function startNextAiClipSourceForNamespace(
     return started || (await hasActiveProcessingJob(bucket, botId).catch(() => false))
 }
 
+// Discriminator that decides which dispatch contract a namespace gets. The AI Clips
+// dashboard flow (e.g. the new /Media namespace) materializes ONE AI clip at a time from
+// its dedicated `_ai_clips/<namespace>/` source library and must never auto-pick the old
+// Chinese/legacy gallery-index inbox or admin originals. Legacy app.oomnn namespaces have
+// NO AI clip source records — they keep the legacy durable-queue + ready-inbox autostart,
+// and their queued/failed handoffs must NOT be deleted.
+//
+// "AI-only mode" is therefore true exactly when the namespace owns at least one AI clip
+// source record. Cheap: lists only the first object under the namespace prefix. On error we
+// fail to LEGACY mode (false) so a transient R2 hiccup never silently disables an
+// app.oomnn namespace's legacy retry/autostart paths.
+async function namespaceUsesAiClipSourceLibrary(bucket: R2Bucket, namespaceId: string): Promise<boolean> {
+    const prefix = aiClipNamespacePrefix(namespaceId)
+    if (!prefix) return false
+    const list = await bucket.list({ prefix, limit: 1 }).catch(() => null)
+    return !!(list && Array.isArray(list.objects) && list.objects.length > 0)
+}
+
 async function dispatchNextProcessingJobForNamespace(
     env: Env,
     ctx: ExecutionContext,
@@ -26308,6 +26325,33 @@ async function dispatchNextProcessingJobForNamespace(
 
     if (await hasRecentNamespaceGeminiRateLimitFailure(env, botId).catch(() => false)) {
         return { namespaceId: botId, started: false, source: 'idle', detail: 'gemini_rate_limit_cooldown' }
+    }
+
+    const aiOnlyMode = await namespaceUsesAiClipSourceLibrary(bucket, botId).catch(() => false)
+    const mode = resolveProcessingDispatchMode(aiOnlyMode)
+
+    // LEGACY namespaces (app.oomnn etc.) keep the original durable-queue + ready-inbox
+    // autostart. processNextInQueue only promotes a durable `_queue/` job — it never deletes
+    // a non-AI handoff — so a reprocessed/failed legacy job that was requeued into `_queue/`
+    // is drained and started here. Ready-inbox / admin-original auto-pick stays enabled so
+    // the Processing tab keeps self-perpetuating one-at-a-time.
+    if (!mode.aiOnly) {
+        return dispatchNextProcessingJob(botId, {
+            // On error, assume a job is active so we never race a second start.
+            hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
+            // Drain the durable queue with the legacy-capable helper (no AI-clip-only delete).
+            drainQueue: () => processNextInQueue(env, botId),
+            startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline, excludeVideoIds: options.excludeVideoIds }),
+            startAdminOriginal: async () => {
+                const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+                if (!adminNamespaceId || adminNamespaceId !== botId) return false
+                // autoImportAndProcessForAdmin starts the next waiting admin original
+                // (if any) and refills the ready inbox from member namespaces. It
+                // returns void, so confirm a job is now in flight to report `started`.
+                await autoImportAndProcessForAdmin(env, ctx)
+                return hasActiveProcessingJob(bucket, botId).catch(() => false)
+            },
+        }, { disableLegacySources: mode.disableLegacySources })
     }
 
     // New Dashboard/AI-source flow: do NOT run the old broad processNextInQueue
@@ -26342,7 +26386,7 @@ async function dispatchNextProcessingJobForNamespace(
             await autoImportAndProcessForAdmin(env, ctx)
             return hasActiveProcessingJob(bucket, botId).catch(() => false)
         },
-    }, { disableLegacySources: true })
+    }, { disableLegacySources: mode.disableLegacySources })
 }
 
 app.get('/api/processing', async (c) => {
@@ -27204,6 +27248,9 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             manualCaption?: string
             chatId?: number
             retryCount?: number
+            sourceType?: string
+            sourceLabel?: string
+            skipSubtitles?: boolean
         }
 
         const linkContextObj = await c.get('bucket').get(`_link_context/${id}.json`).catch(() => null)
@@ -27214,6 +27261,8 @@ app.post('/api/processing/:id/reprocess', async (c) => {
                 lazadaLink?: string
                 manualCaption?: string
                 chatId?: number
+                sourceType?: string
+                sourceLabel?: string
             }
             : null
 
@@ -27224,6 +27273,13 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             return c.json({ error: 'processing_payload_invalid' }, 400)
         }
 
+        // Preserve the AI-clip source marker on the requeued handoff. AI-only namespaces
+        // drain the queue via drainAiClipQueueOnlyForNamespace, which DELETES non-AI handoffs;
+        // without this an operator reprocessing a failed AI clip would have it silently dropped.
+        // Legacy app.oomnn jobs carry no sourceType, so they stay plain and drain via the
+        // legacy processNextInQueue path instead.
+        const sourceType = String(job.sourceType || linkContext?.sourceType || '').trim()
+        const sourceLabel = String(job.sourceLabel || linkContext?.sourceLabel || '').trim()
         const queuedJob = {
             id,
             videoUrl,
@@ -27234,6 +27290,9 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             createdAt: new Date().toISOString(),
             status: 'queued',
             retryCount: Number(job.retryCount || 0),
+            ...(sourceType ? { sourceType } : {}),
+            ...(sourceLabel ? { sourceLabel } : {}),
+            ...(typeof job.skipSubtitles === 'boolean' ? { skipSubtitles: job.skipSubtitles } : {}),
         }
 
         await c.get('bucket').delete(`_processing/${id}.json`)

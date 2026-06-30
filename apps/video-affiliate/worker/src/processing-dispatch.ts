@@ -72,6 +72,39 @@ export interface ProcessingDispatchOptions {
     disableLegacySources?: boolean
 }
 
+// Which automatic-dispatch contract a namespace gets. The two production shapes:
+//
+//  - AI-only (the Dashboard /Media flow): the namespace owns AI clip source records, so the
+//    AI clip source library is the ONLY automatic backlog. Legacy ready-inbox / admin-original
+//    auto-pick is disabled and non-AI durable-queue handoffs are deleted rather than promoted,
+//    keeping the strict one-clip-at-a-time behavior and never auto-picking old Chinese backlog.
+//  - Legacy (app.oomnn etc.): the namespace has NO AI clip source records, so it keeps the
+//    original durable-queue + ready-inbox autostart. Failed/reprocessed legacy jobs requeued
+//    into the durable queue MUST be drained (never deleted), and the ready inbox / admin
+//    original library remain valid automatic backlogs.
+export interface ProcessingDispatchModePlan {
+    aiOnly: boolean
+    // Maps directly to ProcessingDispatchOptions.disableLegacySources.
+    disableLegacySources: boolean
+    // True only in AI-only mode: the durable-queue drain may DELETE a non-AI handoff. In legacy
+    // mode this is false — every durable-queue handoff is preserved and promoted in order.
+    deleteNonAiQueueHandoffs: boolean
+    // True only in AI-only mode: the AI clip source library is an automatic backlog.
+    allowAiClipSource: boolean
+}
+
+// Pure decision: given whether the namespace is backed by the AI clip source library, resolve
+// the dispatch contract. Kept import-free + unit-tested so the legacy-vs-AI split can never
+// silently regress (e.g. accidentally deleting a legacy namespace's requeued failed job).
+export function resolveProcessingDispatchMode(aiOnly: boolean): ProcessingDispatchModePlan {
+    return {
+        aiOnly,
+        disableLegacySources: aiOnly,
+        deleteNonAiQueueHandoffs: aiOnly,
+        allowAiClipSource: aiOnly,
+    }
+}
+
 // Drives the steps in priority order and returns structured evidence of what
 // happened. Stops at the first step that starts (or finds) work, so it never
 // starts more than one job per call.
