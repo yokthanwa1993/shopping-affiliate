@@ -3,11 +3,13 @@ import type { KeyboardEvent } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   fetchPagePosts,
+  fetchPageVideos,
   pagePostPermalink,
   pagePostThumb,
   syncPagePosts,
   PAGE_POST_CACHE_SOURCE,
   type PagePostItem,
+  type PageVideoItem,
   type PagePostSync,
   type SyncPagePostsResult,
 } from '@/api/pagePosts'
@@ -44,7 +46,30 @@ function postTime(item: PagePostItem): number {
 }
 
 function postEngagement(item: PagePostItem): number {
-  return Number(item.reactions_count || 0) + Number(item.comments_count || 0) + Number(item.shares_count || 0)
+  const views = Number(item.views || 0)
+  return views || (Number(item.reactions_count || 0) + Number(item.comments_count || 0) + Number(item.shares_count || 0))
+}
+
+function videoToPostItem(item: PageVideoItem, pageId: string): PagePostItem {
+  const raw = item as PageVideoItem & { description?: string }
+  return {
+    page_id: pageId,
+    page_name: item.pageName || '',
+    post_id: item.postId || item.storyId || item.videoId || '',
+    video_id: item.videoId || '',
+    message: item.videoTitle || raw.description || '',
+    permalink_url: item.postUrl || '',
+    picture: item.facebookThumb || item.videoThumb || '',
+    source_url: item.videoUrl || '',
+    media_type: 'video',
+    views: Number(item.views || 0),
+    created_time: item.createdAt || item.postedAt || '',
+    reactions_count: 0,
+    comments_count: 0,
+    shares_count: 0,
+    fetched_at: '',
+    updated_at: '',
+  }
 }
 
 // Cover preview for a post card. Uses the Graph `picture` cover when present,
@@ -106,6 +131,9 @@ function PostCard({ item }: { item: PagePostItem }) {
           <span className="whitespace-nowrap">{formatThaiDateTime(item.created_time) || '—'}</span>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground tabular-nums">
+          {Number(item.views || 0) > 0 ? (
+            <span className="font-semibold text-foreground" title="ยอดวิว">▶ {formatCompactViews(item.views ?? 0)} วิว</span>
+          ) : null}
           <span title="ไลก์/รีแอกชัน">❤ {formatCompactViews(item.reactions_count ?? 0)}</span>
           <span title="คอมเมนต์">💬 {formatCompactViews(item.comments_count ?? 0)}</span>
           <span title="แชร์">↗ {formatCompactViews(item.shares_count ?? 0)}</span>
@@ -146,7 +174,7 @@ export function PagePostsPage() {
   const [syncNote, setSyncNote] = useState<string | null>(null)
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
-  const [mediaType, setMediaType] = useState('')
+  const [mediaType, setMediaType] = useState('video')
   const [sortMode, setSortMode] = useState<'newest' | 'oldest' | 'engagement_desc'>('newest')
   const [viewMode, setViewMode] = useState<'grid' | 'compact'>('grid')
 
@@ -172,6 +200,23 @@ export function PagePostsPage() {
     queryFn: async ({ pageParam, signal }) => {
       const batchIndex = pageParam as number
       const offset = batchIndex * limit
+      const clipMode = mediaType === 'video' && scope !== ALL_PAGES
+      if (clipMode) {
+        const resp = await fetchPageVideos(
+          { pageId: scope, minViews: 0, sort: sortMode === 'oldest' ? 'oldest' : sortMode === 'engagement_desc' ? 'views_desc' : 'newest', limit, offset },
+          signal,
+        )
+        const mapped = (resp.items ?? []).map((item) => videoToPostItem(item, scope))
+        const filtered = search
+          ? mapped.filter((item) => String(item.message || '').toLowerCase().includes(search.toLowerCase()))
+          : mapped
+        return {
+          items: filtered,
+          total: resp.total ?? 0,
+          sync: null,
+          dataSource: resp.data_source ?? 'facebook_page_video_cache',
+        }
+      }
       // Omit pageId in all-pages mode → the worker returns the whole namespace's
       // post cache in one query (no per-page fan-out needed).
       const resp = await fetchPagePosts(
@@ -323,7 +368,7 @@ export function PagePostsPage() {
                 onChange={(e) => setSortMode(e.target.value as typeof sortMode)}
               >
                 <option value="newest">ล่าสุดไว้บน</option>
-                <option value="engagement_desc">ยอดนิยมสูงไว้บน</option>
+                <option value="engagement_desc">ยอดวิวสูงไว้บน</option>
                 <option value="oldest">เก่าสุดไว้บน</option>
               </select>
               <select
@@ -408,14 +453,14 @@ export function PagePostsPage() {
           <CardHeader className="flex-col items-start gap-2 space-y-0 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="font-medium">
-                แสดง {items.length} โพสต์
-                {total > items.length ? ` (โหลดในแคชแล้ว ${total.toLocaleString()})` : ''}
+                แสดง {items.length} {mediaType === 'video' && scope !== ALL_PAGES ? 'คลิป' : 'โพสต์'}
+                {total > items.length ? ` (ทั้งหมดในแคช ${total.toLocaleString()})` : ''}
               </span>
               <Badge variant="outline">
                 {scope === ALL_PAGES ? `ทุกเพจ (${pages.length})` : activePage?.name || scope}
               </Badge>
               <Badge variant="outline">{dataSource}</Badge>
-              {sync?.fully_scanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : <Badge variant="outline">ยังดึงไม่ครบทั้งเพจ</Badge>}
+              {dataSource === 'facebook_page_video_cache' ? <Badge variant="success">คลิปทั้งหมดที่แคชไว้</Badge> : (sync?.fully_scanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : <Badge variant="outline">ยังดึงไม่ครบทั้งเพจ</Badge>)}
             </div>
             <div className="flex flex-col items-start gap-0.5 text-xs text-muted-foreground sm:items-end">
               {sync?.last_synced_at ? <span>sync ล่าสุด: {formatThaiDateTime(sync.last_synced_at)}</span> : null}
@@ -452,7 +497,7 @@ export function PagePostsPage() {
                   {result.isFetchingNextPage
                     ? 'กำลังโหลด…'
                     : remaining > 0
-                      ? `โหลดเพิ่ม (${formatCompactViews(remaining)} โพสต์)`
+                      ? `โหลดเพิ่ม (${formatCompactViews(remaining)} ${mediaType === 'video' && scope !== ALL_PAGES ? 'คลิป' : 'โพสต์'})`
                       : 'โหลดเพิ่ม'}
                 </Button>
               </div>

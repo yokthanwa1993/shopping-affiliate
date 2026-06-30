@@ -79,7 +79,7 @@ export interface PageVideosQuery {
   minViews?: number
   limit?: number
   offset?: number
-  sort?: 'newest' | 'oldest'
+  sort?: 'newest' | 'oldest' | 'views_desc'
 }
 
 export async function fetchPageVideos(
@@ -171,6 +171,7 @@ export const pagePostItemSchema = z
     picture: z.string().nullish(),
     source_url: z.string().nullish(),
     media_type: z.string().nullish(),
+    views: z.number().nullish(),
     created_time: z.string().nullish(),
     reactions_count: z.number().nullish(),
     comments_count: z.number().nullish(),
@@ -219,7 +220,7 @@ export interface PagePostsQuery {
   namespaceId?: string
   mediaType?: string
   q?: string
-  sort?: 'newest' | 'oldest' | 'engagement_desc'
+  sort?: 'newest' | 'oldest' | 'engagement_desc' | 'views_desc'
   limit?: number
   offset?: number
 }

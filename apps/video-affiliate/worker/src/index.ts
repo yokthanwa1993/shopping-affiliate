@@ -5118,8 +5118,8 @@ async function listFacebookPageVideoCache(db: D1Database, params: {
     minViews?: number
     limit?: number
     offset?: number
-    order?: 'newest' | 'oldest'
-    sort?: 'newest' | 'oldest'
+    order?: 'newest' | 'oldest' | 'views_desc'
+    sort?: 'newest' | 'oldest' | 'views_desc'
     fromDate?: string
     toDate?: string
 }): Promise<FacebookPageVideoCacheRow[]> {
@@ -5132,11 +5132,14 @@ async function listFacebookPageVideoCache(db: D1Database, params: {
     const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
     const offsetRaw = Number(params.offset)
     const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0
-    // Default newest-first (created_time DESC). `oldest` (order/sort) flips only the
-    // created_time direction; the views DESC tiebreaker is preserved either way.
+    // Default newest-first (created_time DESC). `views_desc` ranks the full clip
+    // cache by views first so the Posts page can show high-view clips correctly.
     // Value comes from a fixed whitelist below, so it is safe to interpolate.
     const directionRaw = String(params.order ?? params.sort ?? '').trim().toLowerCase()
     const createdTimeOrder = directionRaw === 'oldest' || directionRaw === 'asc' ? 'ASC' : 'DESC'
+    const orderBy = directionRaw === 'views_desc' || directionRaw === 'views'
+        ? 'views DESC, datetime(created_time) DESC, video_id DESC'
+        : `datetime(created_time) ${createdTimeOrder}, views DESC`
     // Optional inclusive created_time range. created_time holds sortable ISO
     // strings, so lexical comparison is correct for both date-only and ISO inputs.
     const conditions: string[] = ['page_id = ?', 'views >= ?']
@@ -5165,7 +5168,7 @@ async function listFacebookPageVideoCache(db: D1Database, params: {
                 picture, source_url, created_time, views, shopee_link, post_id, fetched_at, updated_at
          FROM facebook_page_video_cache
          WHERE ${conditions.join(' AND ')}
-         ORDER BY created_time ${createdTimeOrder}, views DESC
+         ORDER BY ${orderBy}
          LIMIT ? OFFSET ?`
     ).bind(...binds).all() as { results?: FacebookPageVideoCacheRow[] }
     return Array.isArray(result.results) ? result.results : []
@@ -8893,10 +8896,12 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
     const limitRaw = Number(c.req.query('limit') || 250)
     const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
-    // Optional ordering: sort=oldest OR order=oldest -> created_time ASC. Anything
-    // else (including absent) keeps the default newest-first behavior.
+    // Optional ordering: sort=views_desc ranks by view count; sort=oldest/order=oldest
+    // flips created_time ASC; anything else keeps newest-first.
     const sortRaw = String(c.req.query('sort') || c.req.query('order') || '').trim().toLowerCase()
-    const order: 'newest' | 'oldest' = sortRaw === 'oldest' || sortRaw === 'asc' ? 'oldest' : 'newest'
+    const order: 'newest' | 'oldest' | 'views_desc' = sortRaw === 'views_desc' || sortRaw === 'views'
+        ? 'views_desc'
+        : sortRaw === 'oldest' || sortRaw === 'asc' ? 'oldest' : 'newest'
     // Optional native SQL OFFSET, bounded to 0..10000. Default 0.
     const offsetRaw = Number(c.req.query('offset') || 0)
     const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0

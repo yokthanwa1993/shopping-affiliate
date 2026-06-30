@@ -213,15 +213,17 @@ function getManualPostReelRouteSource(): string {
     return source.slice(start, end)
 }
 
-test('facebook page video cache list applies bounded offset and oldest ordering', () => {
+test('facebook page video cache list applies bounded offset, oldest ordering, and views ranking', () => {
     const fnSource = getListFacebookPageVideoCacheSource()
 
     // Offset is bounded 0..10000 and bound as a parameter, not interpolated.
     assert.match(fnSource, /Math\.min\(10000,\s*Math\.max\(0,\s*Math\.floor\(offsetRaw\)\)\)/)
     assert.match(fnSource, /LIMIT \? OFFSET \?/)
-    // oldest/asc flips only created_time direction; views DESC tiebreaker preserved.
+    // oldest/asc keeps the created_time direction path; views_desc ranks by view count.
     assert.match(fnSource, /createdTimeOrder = directionRaw === 'oldest' \|\| directionRaw === 'asc' \? 'ASC' : 'DESC'/)
-    assert.match(fnSource, /ORDER BY created_time \$\{createdTimeOrder\}, views DESC/)
+    assert.match(fnSource, /const orderBy = directionRaw === 'views_desc'/)
+    assert.match(fnSource, /views DESC, datetime\(created_time\) DESC, video_id DESC/)
+    assert.ok(fnSource.includes('ORDER BY ${orderBy}'))
 })
 
 test('facebook page video cache list date filters are whitelisted and bound, not interpolated', () => {
