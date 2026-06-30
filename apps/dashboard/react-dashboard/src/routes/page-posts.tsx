@@ -16,7 +16,7 @@ import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 
 // Parity defaults with the Svelte PagePostsPanel: ≥100K views, 48 rows/batch.
-const DEFAULT_MIN_VIEWS = 100_000
+const DEFAULT_MIN_VIEWS = 0
 const DEFAULT_BATCH = 48
 
 // Scope sentinel for "ทุกเพจ" — aggregate every page source in the namespace.
@@ -283,7 +283,7 @@ export function PagePostsPage() {
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">Posts</h1>
         <p className="text-sm text-muted-foreground">
-          คลิปยอดวิว ≥ {formatCompactViews(minViews)} จากเพจในเวิร์กสเปซ — แสดงจากแคชเพื่อความรวดเร็ว
+          โพสต์ทั้งหมดจากเพจในเวิร์กสเปซ — เก็บปกและลิงก์ Facebook จากแคชระบบ
         </p>
       </div>
 
@@ -373,7 +373,7 @@ export function PagePostsPage() {
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="font-medium">
                 แสดง {items.length}
-                {total > items.length ? ` จาก ${formatCompactViews(total)}` : ''} คลิป
+                {total > items.length ? ` จาก ${total.toLocaleString()}` : ''} โพสต์
               </span>
               <Badge variant="outline">
                 {scope === ALL_PAGES ? `ทุกเพจ (${targetPages.length})` : targetPages[0]?.name || scope}
