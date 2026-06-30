@@ -500,7 +500,7 @@ export function ExplorePage() {
           </CardHeader>
           <CardContent className="space-y-4">
             {postsQuery.isLoading ? (
-              <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
                 {Array.from({ length: 8 }).map((_, i) => (
                   <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
                 ))}
@@ -512,7 +512,7 @@ export function ExplorePage() {
                   : 'ยังไม่มีโพสต์ที่ตรงกับเงื่อนไข — ลองกดซิงก์หรือปรับคำค้น/Min views'}
               </p>
             ) : (
-              <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
                 {items.map((item) => (
                   <PostCard key={postKey(item)} item={item} />
                 ))}

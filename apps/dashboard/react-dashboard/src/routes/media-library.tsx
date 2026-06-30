@@ -347,7 +347,7 @@ export function MediaLibraryPage() {
       ) : null}
 
       {query.isLoading ? (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {Array.from({ length: 10 }).map((_, i) => (
             <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
           ))}
@@ -357,7 +357,7 @@ export function MediaLibraryPage() {
           ยังไม่มีวิดีโอที่พร้อมแสดงผลในคลังสื่อ
         </p>
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
           {filtered.map((item) => (
             <MediaCard
               key={`${item.adAccount}:${item.systemVideoId}:${item.advideoId}`}
