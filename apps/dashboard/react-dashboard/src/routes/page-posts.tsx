@@ -93,6 +93,11 @@ function PostCard({ item }: { item: PagePostItem }) {
             {pageName}
           </span>
         ) : null}
+        {Number(item.views || 0) > 0 ? (
+          <span className="absolute right-2 top-2 rounded bg-black/75 px-2 py-1 text-[12px] font-bold tabular-nums text-white shadow" title="ยอดวิว">
+            ▶ {formatCompactViews(item.views ?? 0)}
+          </span>
+        ) : null}
         {mediaType ? (
           <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-white">
             {mediaType}

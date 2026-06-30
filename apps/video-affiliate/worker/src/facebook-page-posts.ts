@@ -54,6 +54,7 @@ export type FacebookPagePostCacheRow = {
     source_url: string
     media_type: string
     created_time: string
+    views: number
     reactions_count: number
     comments_count: number
     shares_count: number
@@ -213,6 +214,7 @@ export function normalizeFacebookPagePost(
         source_url: media.source_url,
         media_type: media.media_type,
         created_time: clean(post.created_time),
+        views: toCount(post.views),
         reactions_count: extractGraphSummaryCount(post.reactions),
         comments_count: extractGraphSummaryCount(post.comments),
         shares_count: toCount(shares?.count),
@@ -316,6 +318,7 @@ export const FACEBOOK_PAGE_POST_CACHE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fa
     source_url TEXT NOT NULL DEFAULT '',
     media_type TEXT NOT NULL DEFAULT '',
     created_time TEXT NOT NULL DEFAULT '',
+    views INTEGER NOT NULL DEFAULT 0,
     reactions_count INTEGER NOT NULL DEFAULT 0,
     comments_count INTEGER NOT NULL DEFAULT 0,
     shares_count INTEGER NOT NULL DEFAULT 0,

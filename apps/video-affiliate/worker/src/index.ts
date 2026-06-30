@@ -3904,6 +3904,7 @@ async function ensureFacebookPagePostCacheTables(db: D1Database): Promise<void> 
     if (!facebookPagePostCacheTablesReady) {
         facebookPagePostCacheTablesReady = (async () => {
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_TABLE_SQL).run()
+            await db.prepare("ALTER TABLE facebook_page_post_cache ADD COLUMN views INTEGER NOT NULL DEFAULT 0").run().catch(() => { })
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL).run().catch(() => { })
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_MEDIA_INDEX_SQL).run().catch(() => { })
             await db.prepare(FACEBOOK_PAGE_POST_SYNC_STATE_TABLE_SQL).run()
@@ -4030,9 +4031,9 @@ async function upsertFacebookPagePostCacheRows(db: D1Database, rows: FacebookPag
     await ensureFacebookPagePostCacheTables(db)
     const sql = `INSERT INTO facebook_page_post_cache (
             namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
-            picture, source_url, media_type, created_time, reactions_count, comments_count,
+            picture, source_url, media_type, created_time, views, reactions_count, comments_count,
             shares_count, raw_json, fetched_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         ON CONFLICT(namespace_id, page_id, post_id) DO UPDATE SET
             page_name = CASE WHEN excluded.page_name != '' THEN excluded.page_name ELSE facebook_page_post_cache.page_name END,
             video_id = CASE WHEN excluded.video_id != '' THEN excluded.video_id ELSE facebook_page_post_cache.video_id END,
@@ -4042,6 +4043,7 @@ async function upsertFacebookPagePostCacheRows(db: D1Database, rows: FacebookPag
             source_url = CASE WHEN excluded.source_url != '' THEN excluded.source_url ELSE facebook_page_post_cache.source_url END,
             media_type = CASE WHEN excluded.media_type != '' THEN excluded.media_type ELSE facebook_page_post_cache.media_type END,
             created_time = CASE WHEN excluded.created_time != '' THEN excluded.created_time ELSE facebook_page_post_cache.created_time END,
+            views = MAX(excluded.views, facebook_page_post_cache.views),
             reactions_count = MAX(excluded.reactions_count, facebook_page_post_cache.reactions_count),
             comments_count = MAX(excluded.comments_count, facebook_page_post_cache.comments_count),
             shares_count = MAX(excluded.shares_count, facebook_page_post_cache.shares_count),
@@ -4059,6 +4061,7 @@ async function upsertFacebookPagePostCacheRows(db: D1Database, rows: FacebookPag
         row.source_url,
         row.media_type,
         row.created_time,
+        Math.max(0, Math.floor(Number(row.views || 0))),
         row.reactions_count,
         row.comments_count,
         row.shares_count,
@@ -4105,11 +4108,11 @@ async function listFacebookPagePostCache(db: D1Database, opts: {
     const orderBy = sort === 'oldest'
         ? 'datetime(created_time) ASC, post_id ASC'
         : sort === 'engagement_desc'
-            ? '(COALESCE(reactions_count,0) + COALESCE(comments_count,0) + COALESCE(shares_count,0)) DESC, datetime(created_time) DESC, post_id DESC'
+            ? 'COALESCE(views,0) DESC, (COALESCE(reactions_count,0) + COALESCE(comments_count,0) + COALESCE(shares_count,0)) DESC, datetime(created_time) DESC, post_id DESC'
             : 'datetime(created_time) DESC, post_id DESC'
     const res = await db.prepare(
         `SELECT namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
-                picture, source_url, media_type, created_time, reactions_count, comments_count,
+                picture, source_url, media_type, created_time, views, reactions_count, comments_count,
                 shares_count, fetched_at, updated_at
          FROM facebook_page_post_cache
          WHERE ${where.join(' AND ')}
@@ -4175,6 +4178,14 @@ async function runFacebookPagePostsSyncPass(
         limit: opts.limit,
         fetchBatch: (after, limit) => fetchFacebookPagePostsBatchFromToken(token, pageId, after, limit),
         persistBatch: async (rows) => {
+            const videoIds = Array.from(new Set(rows.map((row) => String(row.video_id || '').trim()).filter(Boolean)))
+            if (videoIds.length > 0) {
+                const { viewsByVideoId } = await fetchVideoViewsResilient(token, videoIds)
+                for (const row of rows) {
+                    const videoId = String(row.video_id || '').trim()
+                    row.views = viewsByVideoId.get(videoId) ?? Math.max(0, Math.floor(Number(row.views || 0)))
+                }
+            }
             await upsertFacebookPagePostCacheRows(db, rows)
             upserted += rows.length
         },
