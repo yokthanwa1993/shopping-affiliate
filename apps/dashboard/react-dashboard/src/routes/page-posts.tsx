@@ -1,11 +1,15 @@
 import { useMemo, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  externalVideoUrl,
-  fetchPageVideos,
-  systemVideoThumbUrl,
-  type PageVideoItem,
+  fetchPagePosts,
+  pagePostPermalink,
+  pagePostThumb,
+  syncPagePosts,
+  PAGE_POST_CACHE_SOURCE,
+  type PagePostItem,
+  type PagePostSync,
+  type SyncPagePostsResult,
 } from '@/api/pagePosts'
 import { fetchSettingsPages, FALLBACK_PAGES, type SettingsPage } from '@/api/settings'
 import { formatCompactViews, formatThaiDateTime } from '@/lib/format'
@@ -15,66 +19,39 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 
-// Parity defaults with the Svelte PagePostsPanel: ≥100K views, 48 rows/batch.
-const DEFAULT_MIN_VIEWS = 0
+// Rows per fetch window. This is the read page size, NOT a cap on total posts —
+// the worker keeps every published post in facebook_page_post_cache.
 const DEFAULT_BATCH = 48
 
-// Scope sentinel for "ทุกเพจ" — aggregate every page source in the namespace.
+// Scope sentinel for "ทุกเพจ" — the worker returns every page's posts in one
+// namespace-wide query, so all-pages mode needs no per-page fan-out.
 const ALL_PAGES = '__all__'
 
-interface SyncMeta {
-  lastSyncedAt?: string | null
-  lastFullScanAt?: string | null
-  fullyScanned?: boolean | null
-}
-
-// One fetched batch (a single offset window) across the in-scope pages. For
-// all-pages mode this is the merge of one offset window per page; for a single
-// page it is just that page's window.
+// One fetched window of cached posts plus the page's sync state (single-page
+// scope only — namespace-wide mode aggregates many pages so has no single state).
 interface PostsBatch {
-  items: PageVideoItem[]
+  items: PagePostItem[]
   total: number
-  sync: SyncMeta | null
+  sync: PagePostSync | null
   dataSource: string | null
-  // True when at least one in-scope page returned a full window, so another
-  // offset window may still hold rows.
-  hasMore: boolean
-}
-
-function toSync(value: unknown): SyncMeta | null {
-  return (value ?? null) as SyncMeta | null
 }
 
 // Newest-first comparable timestamp; unparseable/missing sorts last.
-function postTime(item: PageVideoItem): number {
-  const raw = (item.postedAt || item.createdAt || '').trim()
+function postTime(item: PagePostItem): number {
+  const raw = (item.created_time || '').trim()
   if (!raw) return 0
   const ms = Date.parse(raw)
   return Number.isFinite(ms) ? ms : 0
 }
 
-// Thumbnail preview for a page-post card. Tries real thumbnail candidates in
-// order — the Worker video thumb, the Facebook thumb, then the system gallery
-// thumb for systemVideoId — advancing to the next on each load error. Only when
-// every candidate fails (or none exist) does it fall back to a play-icon
-// placeholder (no invented URLs). Reels are vertical, so the card is 9:16.
-function PostThumb({ item }: { item: PageVideoItem }) {
-  // Build the ordered candidate list once per item: real fields first, then the
-  // system gallery thumb as a last-resort fallback.
-  const candidates = useMemo(() => {
-    const list = [
-      (item.videoThumb || '').trim(),
-      (item.facebookThumb || '').trim(),
-      systemVideoThumbUrl(item) || '',
-    ]
-    // De-dupe and drop empties so onError advances cleanly to a distinct URL.
-    return Array.from(new Set(list.filter(Boolean)))
-  }, [item])
+// Cover preview for a post card. Uses the Graph `picture` cover when present,
+// otherwise a media-type-shaped placeholder (no invented URLs). Reels/videos are
+// vertical, so the card is 9:16.
+function PostCover({ item }: { item: PagePostItem }) {
+  const src = pagePostThumb(item)
+  const [failed, setFailed] = useState(false)
 
-  const [index, setIndex] = useState(0)
-  const src = candidates[index]
-
-  if (!src) {
+  if (!src || failed) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-muted text-muted-foreground">
         <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -88,67 +65,60 @@ function PostThumb({ item }: { item: PageVideoItem }) {
     <img
       key={src}
       src={src}
-      alt={item.videoTitle || item.videoId || 'video'}
+      alt={item.message || item.post_id || 'post'}
       loading="lazy"
       className="h-full w-full object-cover"
-      onError={() => setIndex((i) => i + 1)}
+      onError={() => setFailed(true)}
     />
   )
 }
 
-function PostCard({ item }: { item: PageVideoItem }) {
-  const title = item.videoTitle || item.videoId || '—'
-  const timestamp = item.postedAt || item.createdAt
-  const assetStatus = item.assetLibrary?.status ?? null
-  const pageName = (item.pageName || '').trim()
-  const openUrl = (item.postUrl || '').trim() || externalVideoUrl(item)
+function PostCard({ item }: { item: PagePostItem }) {
+  const caption = (item.message || '').trim() || '—'
+  const pageName = (item.page_name || '').trim()
+  const mediaType = (item.media_type || '').trim()
+  const openUrl = pagePostPermalink(item)
+  // Video posts open as "เปิดวิดีโอ"; everything else as "เปิดโพสต์".
+  const isVideo = /video|reel/i.test(mediaType) || !!(item.video_id || '').trim()
+  const openLabel = isVideo ? 'เปิดวิดีโอ' : 'เปิดโพสต์'
 
   return (
     <article className="flex flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition hover:border-primary/40 hover:shadow-md">
       <div className="relative aspect-[9/16] w-full overflow-hidden bg-muted">
-        <PostThumb item={item} />
+        <PostCover item={item} />
         {pageName ? (
           <span className="absolute left-2 top-2 max-w-[70%] truncate rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold text-white">
             {pageName}
           </span>
         ) : null}
-        <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-white">
-          {formatCompactViews(item.views)} วิว
-        </span>
+        {mediaType ? (
+          <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-white">
+            {mediaType}
+          </span>
+        ) : null}
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-        <p className="line-clamp-2 text-sm font-medium" title={title}>
-          {title}
+        <p className="line-clamp-2 text-sm font-medium" title={caption}>
+          {caption}
         </p>
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-          <span className="whitespace-nowrap">{formatThaiDateTime(timestamp) || '—'}</span>
-          {assetStatus ? (
-            <Badge variant="secondary" className="text-[10px]">
-              {assetStatus}
-            </Badge>
-          ) : null}
+          <span className="whitespace-nowrap">{formatThaiDateTime(item.created_time) || '—'}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground tabular-nums">
+          <span title="ไลก์/รีแอกชัน">❤ {formatCompactViews(item.reactions_count ?? 0)}</span>
+          <span title="คอมเมนต์">💬 {formatCompactViews(item.comments_count ?? 0)}</span>
+          <span title="แชร์">↗ {formatCompactViews(item.shares_count ?? 0)}</span>
         </div>
         <div className="mt-auto flex flex-wrap gap-1.5 pt-1 text-xs">
-          {item.shopeeLink ? (
-            <a
-              href={item.shopeeLink}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="เปิดลิงก์ Shopee"
-              className="rounded bg-orange-50 px-2 py-1 font-semibold text-orange-700 hover:bg-orange-100"
-            >
-              Shopee ↗
-            </a>
-          ) : null}
           {openUrl ? (
             <a
               href={openUrl}
               target="_blank"
               rel="noreferrer"
-              aria-label="เปิดโพสต์บน Facebook"
+              aria-label={`${openLabel}บน Facebook`}
               className="rounded bg-primary/10 px-2 py-1 font-semibold text-primary hover:bg-primary/20"
             >
-              เปิดโพสต์ ↗
+              {openLabel} ↗
             </a>
           ) : (
             <span
@@ -165,15 +135,14 @@ function PostCard({ item }: { item: PageVideoItem }) {
 }
 
 export function PagePostsPage() {
+  const queryClient = useQueryClient()
   // Default scope = ทุกเพจ; cards load automatically on mount (no submit).
   const [scope, setScope] = useState<string>(ALL_PAGES)
-  // Live input strings + committed numeric filters. The committed values feed
-  // the query key so changing them never requires a submit, but typing only
-  // re-queries on blur/Enter (avoids a refetch per keystroke).
-  const [minViewsInput, setMinViewsInput] = useState(String(DEFAULT_MIN_VIEWS))
+  // Live input string + committed numeric limit. The committed value feeds the
+  // query key so typing only re-queries on blur/Enter (no refetch per keystroke).
   const [limitInput, setLimitInput] = useState(String(DEFAULT_BATCH))
-  const [minViews, setMinViews] = useState(DEFAULT_MIN_VIEWS)
   const [limit, setLimit] = useState(DEFAULT_BATCH)
+  const [syncNote, setSyncNote] = useState<string | null>(null)
 
   // Redacted page source list for the namespace. Falls back to the default page
   // when the endpoint fails, so all-pages mode still shows something.
@@ -184,71 +153,48 @@ export function PagePostsPage() {
   })
   const pages: SettingsPage[] = pagesQuery.data ?? FALLBACK_PAGES
 
-  // Resolve the in-scope pages. Single page = the matching source (or default).
-  const targetPages = useMemo<SettingsPage[]>(() => {
-    if (scope === ALL_PAGES) return pages.length ? pages : FALLBACK_PAGES
-    const match = pages.find((p) => p.id === scope)
-    return match ? [match] : FALLBACK_PAGES
+  // Single-page scope resolves to that page (for the sync control + label).
+  const activePage = useMemo<SettingsPage | null>(() => {
+    if (scope === ALL_PAGES) return null
+    return pages.find((p) => p.id === scope) ?? FALLBACK_PAGES.find((p) => p.id === scope) ?? null
   }, [scope, pages])
 
-  const targetIds = targetPages.map((p) => p.id).join(',')
-
   const result = useInfiniteQuery<PostsBatch>({
-    queryKey: ['page-videos', scope, targetIds, minViews, limit],
-    // Wait for the source list to settle so all-pages mode fans out correctly;
-    // on error pagesQuery.data is undefined and we fall back to the default page.
+    queryKey: ['page-posts', scope, limit],
     enabled: !pagesQuery.isLoading,
     initialPageParam: 0,
     queryFn: async ({ pageParam, signal }) => {
       const batchIndex = pageParam as number
       const offset = batchIndex * limit
-      const byPage = await Promise.all(
-        targetPages.map(async (p) => {
-          const resp = await fetchPageVideos(
-            { pageId: p.id, minViews, limit, offset, sort: 'newest' },
-            signal,
-          )
-          // Stamp the page name so all-pages cards stay attributable.
-          const items = (resp.items ?? []).map((it) => ({
-            ...it,
-            pageName: (it.pageName || resp.page_name || p.name || '').trim(),
-          }))
-          return { resp, items }
-        }),
+      // Omit pageId in all-pages mode → the worker returns the whole namespace's
+      // post cache in one query (no per-page fan-out needed).
+      const resp = await fetchPagePosts(
+        { pageId: scope === ALL_PAGES ? undefined : scope, limit, offset },
+        signal,
       )
-      const items = byPage.flatMap((r) => r.items)
-      const total = byPage.reduce((sum, r) => sum + (r.resp.total ?? 0), 0)
-      const single = targetPages.length === 1 ? byPage[0] : null
       return {
-        items,
-        total,
-        sync: toSync(single?.resp.sync),
-        dataSource: single?.resp.data_source ?? null,
-        hasMore: byPage.some((r) => r.items.length >= limit),
+        items: resp.items ?? [],
+        total: resp.total ?? 0,
+        sync: (resp.sync ?? null) as PagePostSync | null,
+        dataSource: resp.data_source ?? null,
       }
     },
     getNextPageParam: (lastPage, allPages) => {
-      const nextIndex = allPages.length
-      if (targetPages.length > 1) {
-        // All-pages mode: keep pulling offset windows while any page is full.
-        return lastPage.hasMore ? nextIndex : undefined
-      }
-      // Single page: standard offset pagination, stop at total.
       if (!lastPage.items.length) return undefined
       const loaded = allPages.reduce((sum, page) => sum + page.items.length, 0)
-      return loaded < (lastPage.total ?? 0) ? nextIndex : undefined
+      return loaded < (lastPage.total ?? 0) ? allPages.length : undefined
     },
   })
 
-  // Flatten, de-dupe (storyId||videoId||postId), then sort newest-first so the
-  // merged all-pages stream is chronological rather than grouped by page.
+  // Flatten, de-dupe by post_id, then sort newest-first so the merged stream is
+  // chronological rather than grouped by offset window.
   const items = useMemo(() => {
     const pagesData = result.data?.pages ?? []
     const seen = new Set<string>()
-    const out: PageVideoItem[] = []
+    const out: PagePostItem[] = []
     for (const batch of pagesData) {
       for (const item of batch.items ?? []) {
-        const key = item.storyId || item.videoId || item.postId || ''
+        const key = (item.post_id || '').trim()
         if (key) {
           if (seen.has(key)) continue
           seen.add(key)
@@ -263,18 +209,42 @@ export function PagePostsPage() {
   const lastPage = result.data?.pages.at(-1)
   const total = lastPage?.total ?? 0
   const sync = lastPage?.sync ?? null
-  const dataSource = lastPage?.dataSource ?? null
+  // Always label the read source as the cache table the rows are served from.
+  const dataSource = lastPage?.dataSource || PAGE_POST_CACHE_SOURCE
   const remaining = Math.max(total - items.length, 0)
 
-  function commitFilters() {
-    setMinViews(Number(minViewsInput) || 0)
-    setLimit(Math.min(Math.max(Number(limitInput) || DEFAULT_BATCH, 1), 1000))
+  // One click = one bounded crawl batch for the selected page. The worker stores
+  // the cursor, so re-clicking resumes; this never hammers Graph.
+  const syncMutation = useMutation<SyncPagePostsResult, Error, void>({
+    mutationFn: async () => {
+      if (!activePage) throw new Error('เลือกเพจก่อนจึงจะดึงต่อได้')
+      return syncPagePosts({ pageId: activePage.id, pageName: activePage.name })
+    },
+    onSuccess: (res) => {
+      if (res.error) {
+        setSyncNote(`ดึงไม่สำเร็จ: ${res.error}`)
+        return
+      }
+      const cached = res.total_cached ?? 0
+      const done = res.fully_scanned
+        ? 'ครบทั้งเพจแล้ว'
+        : res.pending_more
+          ? 'ยังมีต่อ — กด “ดึงต่อ” อีกครั้ง'
+          : ''
+      setSyncNote(`ดึงเพิ่ม ${res.rows_upserted ?? 0} โพสต์ (รวมแคช ${cached.toLocaleString()}) ${done}`.trim())
+      void queryClient.invalidateQueries({ queryKey: ['page-posts'] })
+    },
+    onError: (err) => setSyncNote(err instanceof Error ? err.message : 'ดึงไม่สำเร็จ'),
+  })
+
+  function commitLimit() {
+    setLimit(Math.min(Math.max(Number(limitInput) || DEFAULT_BATCH, 1), 250))
   }
 
-  function onFilterKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+  function onLimitKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key === 'Enter') {
       event.preventDefault()
-      commitFilters()
+      commitLimit()
     }
   }
 
@@ -283,7 +253,7 @@ export function PagePostsPage() {
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">Posts</h1>
         <p className="text-sm text-muted-foreground">
-          โพสต์ทั้งหมดจากเพจในเวิร์กสเปซ — เก็บปกและลิงก์ Facebook จากแคชระบบ
+          โพสต์จริงทั้งหมดจากเพจในเวิร์กสเปซ — ดึงผ่าน Facebook Graph อย่างเป็นทางการ เก็บเฉพาะปก/ลิงก์/เมตา
         </p>
       </div>
 
@@ -320,18 +290,6 @@ export function PagePostsPage() {
 
           <div className="flex flex-wrap items-end gap-3">
             <div className="space-y-1">
-              <Label htmlFor="pp-min-views">Min views</Label>
-              <Input
-                id="pp-min-views"
-                inputMode="numeric"
-                className="w-28"
-                value={minViewsInput}
-                onChange={(e) => setMinViewsInput(e.target.value)}
-                onBlur={commitFilters}
-                onKeyDown={onFilterKeyDown}
-              />
-            </div>
-            <div className="space-y-1">
               <Label htmlFor="pp-limit">ต่อหน้า</Label>
               <Input
                 id="pp-limit"
@@ -339,8 +297,8 @@ export function PagePostsPage() {
                 className="w-24"
                 value={limitInput}
                 onChange={(e) => setLimitInput(e.target.value)}
-                onBlur={commitFilters}
-                onKeyDown={onFilterKeyDown}
+                onBlur={commitLimit}
+                onKeyDown={onLimitKeyDown}
               />
             </div>
             <Button
@@ -351,7 +309,19 @@ export function PagePostsPage() {
             >
               {result.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
             </Button>
+            {/* Sync control: single-page scope only (sync-page targets one page). */}
+            {activePage ? (
+              <Button
+                type="button"
+                onClick={() => syncMutation.mutate()}
+                disabled={syncMutation.isPending}
+                title="ดึงโพสต์ชุดถัดไปจาก Facebook Graph แล้วบันทึกตำแหน่งไว้"
+              >
+                {syncMutation.isPending ? 'กำลังดึง…' : 'ดึงต่อ'}
+              </Button>
+            ) : null}
           </div>
+          {syncNote ? <p className="text-xs text-muted-foreground">{syncNote}</p> : null}
         </CardContent>
       </Card>
 
@@ -376,15 +346,15 @@ export function PagePostsPage() {
                 {total > items.length ? ` จาก ${total.toLocaleString()}` : ''} โพสต์
               </span>
               <Badge variant="outline">
-                {scope === ALL_PAGES ? `ทุกเพจ (${targetPages.length})` : targetPages[0]?.name || scope}
+                {scope === ALL_PAGES ? `ทุกเพจ (${pages.length})` : activePage?.name || scope}
               </Badge>
-              {dataSource ? <Badge variant="outline">{dataSource}</Badge> : null}
-              {sync?.fullyScanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : null}
+              <Badge variant="outline">{dataSource}</Badge>
+              {sync?.fully_scanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : null}
             </div>
             <div className="flex flex-col items-start gap-0.5 text-xs text-muted-foreground sm:items-end">
-              {sync?.lastSyncedAt ? <span>sync ล่าสุด: {formatThaiDateTime(sync.lastSyncedAt)}</span> : null}
-              {sync?.lastFullScanAt ? (
-                <span>สแกนเต็มล่าสุด: {formatThaiDateTime(sync.lastFullScanAt)}</span>
+              {sync?.last_synced_at ? <span>sync ล่าสุด: {formatThaiDateTime(sync.last_synced_at)}</span> : null}
+              {sync?.last_full_scan_at ? (
+                <span>สแกนเต็มล่าสุด: {formatThaiDateTime(sync.last_full_scan_at)}</span>
               ) : null}
             </div>
           </CardHeader>
@@ -400,7 +370,7 @@ export function PagePostsPage() {
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
                 {items.map((item) => (
-                  <PostCard key={item.storyId || item.videoId || item.postId} item={item} />
+                  <PostCard key={item.post_id || item.permalink_url} item={item} />
                 ))}
               </div>
             )}
@@ -416,7 +386,7 @@ export function PagePostsPage() {
                   {result.isFetchingNextPage
                     ? 'กำลังโหลด…'
                     : remaining > 0
-                      ? `โหลดเพิ่ม (${formatCompactViews(remaining)} คลิป)`
+                      ? `โหลดเพิ่ม (${formatCompactViews(remaining)} โพสต์)`
                       : 'โหลดเพิ่ม'}
                 </Button>
               </div>

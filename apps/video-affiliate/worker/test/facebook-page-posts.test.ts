@@ -264,3 +264,67 @@ test('read endpoint exposes data_source + does not gate on min_views', () => {
     assert.ok(!body.includes('min_views'), 'all-post inventory must not filter by min_views')
     assert.equal(FACEBOOK_PAGE_POSTS_SOURCE, 'graph_published_posts')
 })
+
+// --- Graph query path (Popsters HAR parity) ---------------------------------
+
+test('Graph query string matches the Popsters published_posts request', () => {
+    // Reconstruct the URL exactly the way fetchFacebookPagePostsBatchFromToken
+    // does, so the documented contract (edge + fields + limit + after) is locked.
+    const params = new URLSearchParams({
+        fields: FACEBOOK_PAGE_POSTS_FIELDS,
+        limit: String(FACEBOOK_PAGE_POSTS_GRAPH_DEFAULT_LIMIT),
+        access_token: 'TEST_TOKEN',
+    })
+    params.set('after', 'CURSOR_ABC')
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(PAGE_ID)}/${FACEBOOK_PAGE_POSTS_EDGE}?${params.toString()}`
+
+    assert.ok(url.includes('/published_posts?'), 'must hit the published_posts edge')
+    assert.ok(url.includes('limit=25'), 'default Graph page size is 25')
+    assert.ok(url.includes('after=CURSOR_ABC'), 'cursor must be forwarded as after=')
+    // Counts requested as summary(total_count) so we store engagement, not bodies.
+    assert.ok(decodeURIComponent(url).includes('comments.limit(0).summary(total_count)'))
+    assert.ok(decodeURIComponent(url).includes('reactions.limit(0).summary(total_count)'))
+    assert.ok(decodeURIComponent(url).includes('permalink_url'))
+})
+
+test('fetch helper forwards the limit + fields to Graph (source contract)', () => {
+    const src = indexSource()
+    const start = src.indexOf('async function fetchFacebookPagePostsBatchFromToken')
+    const body = src.slice(start, start + 2000)
+    assert.ok(body.includes('fields: FACEBOOK_PAGE_POSTS_FIELDS'), 'must request the published_posts fields')
+    assert.ok(body.includes('limit: String(limit)'), 'must forward the Graph page-size limit')
+    assert.ok(body.includes('access_token'), 'must authenticate the Graph call')
+})
+
+// --- sync state persistence (budget end must NOT mark fully scanned) ---------
+
+test('sync pass persists next_after + derives fully_scanned from the crawl, not the budget', () => {
+    const src = indexSource()
+    const start = src.indexOf('async function runFacebookPagePostsSyncPass')
+    assert.notEqual(start, -1)
+    const end = src.indexOf('async function ', start + 1)
+    const body = src.slice(start, end)
+    // The resume cursor is always persisted...
+    assert.ok(body.includes('next_after: result.next_after'), 'must persist the resume cursor')
+    // ...and fully_scanned tracks the crawl result (false on budget end), never a
+    // hard-coded 1. crawlFacebookPagePosts only sets fully_scanned when Graph
+    // reports no further pages, so a budget-bounded pass leaves it false.
+    assert.ok(body.includes('fully_scanned: result.fully_scanned ? 1 : 0'), 'fully_scanned mirrors the crawl result')
+    assert.ok(body.includes('startAfter') && body.includes("priorState?.next_after"), 'must resume from the stored cursor')
+})
+
+// --- read endpoint: no token leakage ----------------------------------------
+
+test('read query selects cached post fields without raw_json or any token', () => {
+    const src = indexSource()
+    const start = src.indexOf('async function listFacebookPagePostCache')
+    assert.notEqual(start, -1)
+    const body = src.slice(start, start + 1400)
+    assert.ok(body.includes('FROM facebook_page_post_cache'), 'reads from the post cache table')
+    assert.ok(body.includes('permalink_url'), 'returns the Facebook permalink for open-post links')
+    // The raw Graph node (raw_json) and any token material must never reach the
+    // client — the SELECT column list omits raw_json entirely.
+    const selectClause = body.slice(0, body.indexOf('FROM facebook_page_post_cache'))
+    assert.ok(!selectClause.includes('raw_json'), 'raw_json must not be returned to the client')
+    assert.ok(!selectClause.toLowerCase().includes('access_token'), 'no token column is ever selected')
+})
