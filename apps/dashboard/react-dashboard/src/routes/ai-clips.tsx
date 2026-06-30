@@ -379,13 +379,12 @@ function AiCard({ item, onOpen, index = 0 }: { item: AiClip; onOpen: () => void;
           <StatusBadge status={item.status} />
         </span>
       </button>
-      <div className="space-y-2 p-3">
-        <p className="line-clamp-2 text-sm font-medium">{item.title || item.id}</p>
-        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+      <div className="space-y-1.5 p-2.5">
+        <p className="line-clamp-1 text-xs font-semibold">{item.title || item.id}</p>
+        <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
           <span className="truncate font-mono">{item.id}</span>
           {dateLabel ? <span className="shrink-0">{dateLabel}</span> : null}
         </div>
-        <StatusBadge status={item.status} variant="solid" className="w-fit" showLabel />
       </div>
     </article>
   )
@@ -665,7 +664,7 @@ export function AiClipsPage() {
       ) : null}
 
       {isInitialLoading ? (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7">
           {Array.from({ length: 10 }).map((_, i) => (
             <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
           ))}
@@ -679,7 +678,7 @@ export function AiClipsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7">
           {items.map((item, i) => (
             <AiCard key={item.id || i} item={item} index={i} onOpen={() => setSelected(item)} />
           ))}
