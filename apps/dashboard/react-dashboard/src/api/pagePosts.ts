@@ -219,6 +219,7 @@ export interface PagePostsQuery {
   namespaceId?: string
   mediaType?: string
   q?: string
+  sort?: 'newest' | 'oldest' | 'engagement_desc'
   limit?: number
   offset?: number
 }
@@ -232,6 +233,7 @@ export async function fetchPagePosts(
   if (params.namespaceId) qs.set('namespace_id', params.namespaceId)
   if (params.mediaType) qs.set('media_type', params.mediaType)
   if (params.q) qs.set('q', params.q)
+  if (params.sort) qs.set('sort', params.sort)
   if (params.limit != null) qs.set('limit', String(params.limit))
   if (params.offset != null) qs.set('offset', String(params.offset))
   const raw = await workerFetchJson<unknown>(

@@ -4075,6 +4075,7 @@ async function listFacebookPagePostCache(db: D1Database, opts: {
     pageId?: string
     mediaType?: string
     q?: string
+    sort?: string
     limit: number
     offset: number
 }): Promise<Array<Record<string, unknown>>> {
@@ -4087,13 +4088,19 @@ async function listFacebookPagePostCache(db: D1Database, opts: {
     if (mediaType) { where.push('LOWER(media_type) = ?'); binds.push(mediaType) }
     const q = String(opts.q || '').trim()
     if (q) { where.push('message LIKE ?'); binds.push(`%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`) }
+    const sort = String(opts.sort || 'newest').trim().toLowerCase()
+    const orderBy = sort === 'oldest'
+        ? 'datetime(created_time) ASC, post_id ASC'
+        : sort === 'engagement_desc'
+            ? '(COALESCE(reactions_count,0) + COALESCE(comments_count,0) + COALESCE(shares_count,0)) DESC, datetime(created_time) DESC, post_id DESC'
+            : 'datetime(created_time) DESC, post_id DESC'
     const res = await db.prepare(
         `SELECT namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
                 picture, source_url, media_type, created_time, reactions_count, comments_count,
                 shares_count, fetched_at, updated_at
          FROM facebook_page_post_cache
          WHERE ${where.join(' AND ')}
-         ORDER BY created_time DESC, post_id DESC
+         ORDER BY ${orderBy}
          LIMIT ? OFFSET ?`
     ).bind(...binds, Math.max(1, opts.limit), Math.max(0, opts.offset)).all() as { results?: Array<Record<string, unknown>> }
     return res.results || []
@@ -12876,11 +12883,12 @@ app.get('/api/dashboard/facebook-page-posts', async (c) => {
     const pageId = String(c.req.query('page_id') || '').trim()
     const mediaType = String(c.req.query('media_type') || '').trim()
     const q = String(c.req.query('q') || '').trim()
+    const sort = String(c.req.query('sort') || 'newest').trim()
     const limit = normalizeFacebookPagePostsReadLimit(c.req.query('limit'))
     const offset = normalizeFacebookPagePostsOffset(c.req.query('offset'))
 
     const [items, total] = await Promise.all([
-        listFacebookPagePostCache(c.env.DB, { namespaceId, pageId, mediaType, q, limit, offset }),
+        listFacebookPagePostCache(c.env.DB, { namespaceId, pageId, mediaType, q, sort, limit, offset }),
         countFacebookPagePostCache(c.env.DB, { namespaceId, pageId, mediaType, q }),
     ])
 
@@ -12923,6 +12931,7 @@ app.get('/api/dashboard/facebook-page-posts', async (c) => {
         namespace_id: namespaceId,
         page_id: pageId || null,
         data_source: FACEBOOK_PAGE_POSTS_SOURCE,
+        sort,
         total,
         items,
         sync,

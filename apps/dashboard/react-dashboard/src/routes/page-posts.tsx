@@ -16,7 +16,6 @@ import { formatCompactViews, formatThaiDateTime } from '@/lib/format'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 
 // Rows per fetch window. This is the read page size, NOT a cap on total posts —
@@ -42,6 +41,10 @@ function postTime(item: PagePostItem): number {
   if (!raw) return 0
   const ms = Date.parse(raw)
   return Number.isFinite(ms) ? ms : 0
+}
+
+function postEngagement(item: PagePostItem): number {
+  return Number(item.reactions_count || 0) + Number(item.comments_count || 0) + Number(item.shares_count || 0)
 }
 
 // Cover preview for a post card. Uses the Graph `picture` cover when present,
@@ -143,6 +146,11 @@ export function PagePostsPage() {
   const [limitInput, setLimitInput] = useState(String(DEFAULT_BATCH))
   const [limit, setLimit] = useState(DEFAULT_BATCH)
   const [syncNote, setSyncNote] = useState<string | null>(null)
+  const [searchInput, setSearchInput] = useState('')
+  const [search, setSearch] = useState('')
+  const [mediaType, setMediaType] = useState('')
+  const [sortMode, setSortMode] = useState<'newest' | 'oldest' | 'engagement_desc'>('newest')
+  const [viewMode, setViewMode] = useState<'grid' | 'compact'>('grid')
 
   // Redacted page source list for the namespace. Falls back to the default page
   // when the endpoint fails, so all-pages mode still shows something.
@@ -160,7 +168,7 @@ export function PagePostsPage() {
   }, [scope, pages])
 
   const result = useInfiniteQuery<PostsBatch>({
-    queryKey: ['page-posts', scope, limit],
+    queryKey: ['page-posts', scope, limit, search, mediaType, sortMode],
     enabled: !pagesQuery.isLoading,
     initialPageParam: 0,
     queryFn: async ({ pageParam, signal }) => {
@@ -169,7 +177,7 @@ export function PagePostsPage() {
       // Omit pageId in all-pages mode → the worker returns the whole namespace's
       // post cache in one query (no per-page fan-out needed).
       const resp = await fetchPagePosts(
-        { pageId: scope === ALL_PAGES ? undefined : scope, limit, offset },
+        { pageId: scope === ALL_PAGES ? undefined : scope, mediaType: mediaType || undefined, q: search || undefined, sort: sortMode, limit, offset },
         signal,
       )
       return {
@@ -202,9 +210,13 @@ export function PagePostsPage() {
         out.push(item)
       }
     }
-    out.sort((a, b) => postTime(b) - postTime(a))
+    out.sort((a, b) => {
+      if (sortMode === 'oldest') return postTime(a) - postTime(b)
+      if (sortMode === 'engagement_desc') return postEngagement(b) - postEngagement(a) || postTime(b) - postTime(a)
+      return postTime(b) - postTime(a)
+    })
     return out
-  }, [result.data])
+  }, [result.data, sortMode])
 
   const lastPage = result.data?.pages.at(-1)
   const total = lastPage?.total ?? 0
@@ -248,80 +260,136 @@ export function PagePostsPage() {
     }
   }
 
+  function commitSearch() {
+    setSearch(searchInput.trim())
+  }
+
+  function onSearchKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commitSearch()
+    }
+  }
+
+  const selectedLabel = scope === ALL_PAGES ? 'ทุกเพจ' : activePage?.name || scope
+  const pageInitial = (name: string) => (name || '?').trim().slice(0, 1).toUpperCase()
+
   return (
     <div className="mx-auto max-w-6xl space-y-6">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Posts</h1>
-        <p className="text-sm text-muted-foreground">
-          โพสต์จริงทั้งหมดจากเพจในเวิร์กสเปซ — ดึงผ่าน Facebook Graph อย่างเป็นทางการ เก็บเฉพาะปก/ลิงก์/เมตา
-        </p>
-      </div>
+      <Card className="overflow-hidden border-border/70 bg-card">
+        <CardContent className="p-0">
+          <div className="flex flex-col gap-4 border-b px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-center gap-2">
+              <h1 className="text-2xl font-semibold tracking-tight">Posts</h1>
+              <span className="text-xl text-muted-foreground" aria-hidden="true">◌</span>
+            </div>
 
-      <Card>
-        <CardContent className="space-y-3 p-4">
-          {/* Scope chips: ทุกเพจ + one chip per page source. No submit needed. */}
-          <div className="flex flex-wrap gap-1.5">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <div className="relative">
+                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground">⌕</span>
+                <Input
+                  aria-label="Search posts"
+                  placeholder="Search posts"
+                  className="h-10 w-56 rounded-full bg-muted pl-9"
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
+                  onBlur={commitSearch}
+                  onKeyDown={onSearchKeyDown}
+                />
+              </div>
+              <span className="hidden h-8 w-px bg-border md:inline-block" />
+              <select
+                aria-label="เลือกเพจ"
+                className="h-10 rounded-xl border bg-background px-3 text-sm font-medium text-foreground"
+                value={scope}
+                onChange={(e) => setScope(e.target.value)}
+              >
+                <option value={ALL_PAGES}>ทุกเพจ</option>
+                {pages.map((p) => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+              </select>
+              <select
+                aria-label="ประเภทโพสต์"
+                className="h-10 rounded-xl border bg-background px-3 text-sm text-foreground"
+                value={mediaType}
+                onChange={(e) => setMediaType(e.target.value)}
+              >
+                <option value="">All types</option>
+                <option value="video">Videos/Reels</option>
+                <option value="photo">Photos</option>
+                <option value="album">Albums</option>
+              </select>
+              <select
+                aria-label="เรียงลำดับ"
+                className="h-10 rounded-xl border bg-background px-3 text-sm text-foreground"
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value as typeof sortMode)}
+              >
+                <option value="newest">ล่าสุดไว้บน</option>
+                <option value="engagement_desc">ยอดนิยมสูงไว้บน</option>
+                <option value="oldest">เก่าสุดไว้บน</option>
+              </select>
+              <select
+                aria-label="รูปแบบการแสดงผล"
+                className="h-10 rounded-xl border bg-background px-3 text-sm text-foreground"
+                value={viewMode}
+                onChange={(e) => setViewMode(e.target.value as typeof viewMode)}
+              >
+                <option value="grid">Grid view</option>
+                <option value="compact">Compact view</option>
+              </select>
+              <span className="hidden h-8 w-px bg-border md:inline-block" />
+              <Input
+                aria-label="จำนวนต่อหน้า"
+                inputMode="numeric"
+                className="h-10 w-20 rounded-xl"
+                value={limitInput}
+                onChange={(e) => setLimitInput(e.target.value)}
+                onBlur={commitLimit}
+                onKeyDown={onLimitKeyDown}
+              />
+              {activePage ? (
+                <Button
+                  type="button"
+                  onClick={() => syncMutation.mutate()}
+                  disabled={syncMutation.isPending}
+                  title="ดึงโพสต์ชุดถัดไปจาก Facebook Graph แล้วบันทึกตำแหน่งไว้"
+                  className="h-10 rounded-xl"
+                >
+                  {syncMutation.isPending ? 'กำลังดึง…' : 'ดึงต่อ'}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 overflow-x-auto px-5 py-4">
             <button
               type="button"
               onClick={() => setScope(ALL_PAGES)}
-              className={`rounded-xl border px-3 py-1.5 text-xs font-semibold transition ${
-                scope === ALL_PAGES
-                  ? 'border-primary bg-primary text-primary-foreground'
-                  : 'border-input bg-background text-foreground hover:border-primary/40'
+              className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full border text-xl font-semibold transition ${
+                scope === ALL_PAGES ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-muted text-muted-foreground hover:border-primary/50'
               }`}
+              title="ทุกเพจ"
             >
-              ทุกเพจ
+              ☆
             </button>
             {pages.map((p) => (
               <button
                 key={p.id}
                 type="button"
                 onClick={() => setScope(p.id)}
-                className={`rounded-xl border px-3 py-1.5 text-xs font-semibold transition ${
-                  scope === p.id
-                    ? 'border-primary bg-primary text-primary-foreground'
-                    : 'border-input bg-background text-foreground hover:border-primary/40'
+                className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full border text-sm font-bold transition ${
+                  scope === p.id ? 'border-primary bg-primary text-primary-foreground shadow-sm' : 'border-border bg-muted text-foreground hover:border-primary/50'
                 }`}
+                title={p.name || p.id}
               >
-                {p.name || p.id}
+                {pageInitial(p.name || p.id)}
               </button>
             ))}
-          </div>
-
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="space-y-1">
-              <Label htmlFor="pp-limit">ต่อหน้า</Label>
-              <Input
-                id="pp-limit"
-                inputMode="numeric"
-                className="w-24"
-                value={limitInput}
-                onChange={(e) => setLimitInput(e.target.value)}
-                onBlur={commitLimit}
-                onKeyDown={onLimitKeyDown}
-              />
+            <div className="ml-auto hidden text-xs text-muted-foreground md:block">
+              เลือกอยู่: {selectedLabel}
             </div>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => void result.refetch()}
-              disabled={result.isFetching}
-            >
-              {result.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
-            </Button>
-            {/* Sync control: single-page scope only (sync-page targets one page). */}
-            {activePage ? (
-              <Button
-                type="button"
-                onClick={() => syncMutation.mutate()}
-                disabled={syncMutation.isPending}
-                title="ดึงโพสต์ชุดถัดไปจาก Facebook Graph แล้วบันทึกตำแหน่งไว้"
-              >
-                {syncMutation.isPending ? 'กำลังดึง…' : 'ดึงต่อ'}
-              </Button>
-            ) : null}
           </div>
-          {syncNote ? <p className="text-xs text-muted-foreground">{syncNote}</p> : null}
+          {syncNote ? <p className="border-t px-5 py-2 text-xs text-muted-foreground">{syncNote}</p> : null}
         </CardContent>
       </Card>
 
@@ -360,7 +428,7 @@ export function PagePostsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             {result.isLoading ? (
-              <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+              <div className={viewMode === 'compact' ? "grid gap-3 sm:grid-cols-2 lg:grid-cols-3" : "grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4"}>
                 {Array.from({ length: 8 }).map((_, i) => (
                   <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
                 ))}
@@ -368,7 +436,7 @@ export function PagePostsPage() {
             ) : items.length === 0 && !result.isFetching ? (
               <p className="py-8 text-center text-sm text-muted-foreground">ไม่พบรายการ</p>
             ) : (
-              <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+              <div className={viewMode === 'compact' ? "grid gap-3 sm:grid-cols-2 lg:grid-cols-3" : "grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4"}>
                 {items.map((item) => (
                   <PostCard key={item.post_id || item.permalink_url} item={item} />
                 ))}

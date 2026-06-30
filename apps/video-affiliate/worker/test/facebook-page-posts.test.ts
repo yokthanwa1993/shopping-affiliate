@@ -319,7 +319,7 @@ test('read query selects cached post fields without raw_json or any token', () =
     const src = indexSource()
     const start = src.indexOf('async function listFacebookPagePostCache')
     assert.notEqual(start, -1)
-    const body = src.slice(start, start + 1400)
+    const body = src.slice(start, start + 2400)
     assert.ok(body.includes('FROM facebook_page_post_cache'), 'reads from the post cache table')
     assert.ok(body.includes('permalink_url'), 'returns the Facebook permalink for open-post links')
     // The raw Graph node (raw_json) and any token material must never reach the
