@@ -272,12 +272,18 @@ import {
 import {
     DEFAULT_PAGE_POST_INVENTORY_PAGE_ID,
     PAGE_POST_INVENTORY_DATE_INDEX_SQL,
+    PAGE_POST_INVENTORY_GRAPH_DEFAULT_BATCH_SIZE,
+    PAGE_POST_INVENTORY_GRAPH_SOURCE,
     PAGE_POST_INVENTORY_RUNTIME_IMPORT_MAX_ROWS,
     PAGE_POST_INVENTORY_SOURCE,
+    PAGE_POST_INVENTORY_SYNC_STATE_TABLE_SQL,
     PAGE_POST_INVENTORY_TABLE_SQL,
     PAGE_POST_INVENTORY_TAIL_INDEX_SQL,
+    type PagePostInventoryGraphBatch,
     type PagePostInventoryRow,
+    crawlPagePostInventoryFromGraph,
     normalizePagePostInventoryDate,
+    normalizePagePostInventoryGraphMaxPages,
     normalizePagePostInventoryImportRow,
     normalizePagePostInventoryLimit,
     normalizePagePostInventoryOffset,
@@ -3864,6 +3870,7 @@ async function ensurePagePostInventoryTable(db: D1Database): Promise<void> {
             await db.prepare(PAGE_POST_INVENTORY_TABLE_SQL).run()
             await db.prepare(PAGE_POST_INVENTORY_DATE_INDEX_SQL).run().catch(() => { })
             await db.prepare(PAGE_POST_INVENTORY_TAIL_INDEX_SQL).run().catch(() => { })
+            await db.prepare(PAGE_POST_INVENTORY_SYNC_STATE_TABLE_SQL).run().catch(() => { })
         })()
     }
     await pagePostInventoryTableReady
@@ -12325,6 +12332,216 @@ app.post('/api/dashboard/facebook-page-videos/full-resync', async (c) => {
         first_error: firstError || null,
         fb_errors: fbErrors.slice(0, 5),
         debug_sample: firstSampleResponse,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// ---------------------------------------------------------------------------
+// Page posts inventory — live Graph cursor crawl
+//
+// The CSV importer (/api/dashboard/page-post-inventory/import) and the read-only
+// query (GET /api/dashboard/page-post-inventory) above are intentionally
+// fetch-free. This endpoint is the ONLY place that walks the Graph /posts edge
+// to backfill the same facebook_page_post_inventory table beyond the first page,
+// following paging.cursors.after until exhausted or the caller's caps. Crawl
+// rows never overwrite comment columns that a CSV import already populated.
+// ---------------------------------------------------------------------------
+
+// Read one /{page}/posts batch as raw inventory-shaped Graph nodes. Throws on
+// Graph errors so the crawler can record last_error and keep the resume cursor.
+async function fetchPagePostInventoryBatchFromGraphToken(token: string, pageId: string, after = ''): Promise<PagePostInventoryGraphBatch> {
+    const params = new URLSearchParams({
+        fields: 'id,message,permalink_url,created_time,attachments{media_type,target{id}}',
+        limit: String(PAGE_POST_INVENTORY_GRAPH_DEFAULT_BATCH_SIZE),
+        access_token: String(token || '').trim(),
+    })
+    if (after) params.set('after', after)
+    const response = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(pageId)}/posts?${params.toString()}`)
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '')
+        throw new Error(`facebook_graph_http_${response.status}${errorBody ? `:${errorBody.slice(0, 120)}` : ''}`)
+    }
+    const payload = await response.json().catch(() => ({})) as {
+        error?: { code?: number | string; message?: string }
+        data?: Array<Record<string, unknown>>
+        paging?: { next?: string; cursors?: { after?: string; before?: string } }
+    }
+    if (payload?.error) {
+        const code = Number(payload.error?.code || 0)
+        const message = String(payload.error?.message || 'facebook_graph_failed')
+        if (code === 368) throw new Error(`facebook_rate_limited:${code}`)
+        throw new Error(`${message}${code ? `:${code}` : ''}`)
+    }
+    return {
+        posts: Array.isArray(payload?.data) ? payload.data : [],
+        paging: payload?.paging || null,
+    }
+}
+
+async function getPagePostInventorySyncState(db: D1Database, pageId: string): Promise<Record<string, unknown> | null> {
+    await ensurePagePostInventoryTable(db)
+    return await db.prepare(
+        `SELECT page_id, next_after, last_attempt_at, last_synced_at, last_full_scan_at,
+                fully_scanned, last_batch_count, last_error, updated_at
+         FROM facebook_page_post_inventory_sync_state WHERE page_id = ?`
+    ).bind(pageId).first() as Record<string, unknown> | null
+}
+
+async function upsertPagePostInventorySyncState(db: D1Database, pageId: string, fields: {
+    next_after?: string
+    last_attempt_at?: string
+    last_synced_at?: string
+    last_full_scan_at?: string
+    fully_scanned?: number
+    last_batch_count?: number
+    last_error?: string
+}): Promise<void> {
+    await ensurePagePostInventoryTable(db)
+    const current = await getPagePostInventorySyncState(db, pageId)
+    const nextAfter = String(fields.next_after ?? current?.next_after ?? '').trim()
+    const lastAttempt = String(fields.last_attempt_at ?? current?.last_attempt_at ?? '').trim()
+    const lastSynced = String(fields.last_synced_at ?? current?.last_synced_at ?? '').trim()
+    const lastFullScan = String(fields.last_full_scan_at ?? current?.last_full_scan_at ?? '').trim()
+    const fullyScanned = Number(fields.fully_scanned ?? current?.fully_scanned ?? 0) > 0 ? 1 : 0
+    const lastBatchCount = Number(fields.last_batch_count ?? current?.last_batch_count ?? 0)
+    const lastError = String(fields.last_error ?? current?.last_error ?? '').trim()
+    await db.prepare(
+        `INSERT INTO facebook_page_post_inventory_sync_state (
+            page_id, next_after, last_attempt_at, last_synced_at, last_full_scan_at,
+            fully_scanned, last_batch_count, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(page_id) DO UPDATE SET
+            next_after = excluded.next_after,
+            last_attempt_at = excluded.last_attempt_at,
+            last_synced_at = excluded.last_synced_at,
+            last_full_scan_at = excluded.last_full_scan_at,
+            fully_scanned = excluded.fully_scanned,
+            last_batch_count = excluded.last_batch_count,
+            last_error = excluded.last_error,
+            updated_at = datetime('now')`
+    ).bind(pageId, nextAfter, lastAttempt, lastSynced, lastFullScan, fullyScanned, lastBatchCount, lastError).run()
+}
+
+// Upsert crawl-discovered posts WITHOUT clobbering comment columns that a CSV
+// import may have already populated. New rows are tagged source = GRAPH source;
+// existing rows keep their source and all page_comment* fields untouched.
+async function upsertPagePostInventoryGraphRows(db: D1Database, rows: PagePostInventoryRow[]): Promise<void> {
+    if (rows.length === 0) return
+    await ensurePagePostInventoryTable(db)
+    const sql = `INSERT INTO facebook_page_post_inventory (
+            page_id, date, time, post_id, post_id_tail, type, post_url, message,
+            page_commented, page_comment_id, page_comment_link, page_comment, source,
+            imported_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', ?, datetime('now'), datetime('now'))
+        ON CONFLICT(page_id, post_id) DO UPDATE SET
+            date = excluded.date,
+            time = excluded.time,
+            post_id_tail = excluded.post_id_tail,
+            type = excluded.type,
+            post_url = excluded.post_url,
+            message = excluded.message,
+            updated_at = excluded.updated_at`
+    const statements = rows.map((row) => db.prepare(sql).bind(
+        row.page_id,
+        row.date,
+        row.time,
+        row.post_id,
+        row.post_id_tail,
+        row.type,
+        row.post_url,
+        row.message,
+        row.source,
+    ))
+    await db.batch(statements)
+}
+
+app.post('/api/dashboard/page-post-inventory/graph-sync', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        max_pages?: number
+        max_rows?: number
+        reset_cursor?: boolean
+    }
+    const pageId = String(body.page_id || c.req.query('page_id') || DEFAULT_PAGE_POST_INVENTORY_PAGE_ID).trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400, { 'Cache-Control': 'no-store' })
+    const maxPages = normalizePagePostInventoryGraphMaxPages(body.max_pages)
+    const maxRowsRaw = Number(body.max_rows)
+    const maxRows = Number.isFinite(maxRowsRaw) && maxRowsRaw > 0 ? Math.floor(maxRowsRaw) : 0
+
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
+    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400, { 'Cache-Control': 'no-store' })
+
+    await ensurePagePostInventoryTable(c.env.DB)
+    const priorState = await getPagePostInventorySyncState(c.env.DB, pageId)
+    // Resume from the stored cursor unless the caller asks to restart from the
+    // newest posts (reset_cursor) or the page was already fully scanned.
+    const resume = !body.reset_cursor && Number(priorState?.fully_scanned || 0) === 0
+    const startAfter = resume ? String(priorState?.next_after || '').trim() : ''
+
+    const nowIso = new Date().toISOString()
+    await upsertPagePostInventorySyncState(c.env.DB, pageId, { last_attempt_at: nowIso })
+
+    let upserted = 0
+    const result = await crawlPagePostInventoryFromGraph({
+        pageId,
+        startAfter,
+        maxPages,
+        maxRows,
+        fetchBatch: (after) => fetchPagePostInventoryBatchFromGraphToken(token, pageId, after),
+        persistBatch: async (rows) => {
+            await upsertPagePostInventoryGraphRows(c.env.DB, rows)
+            upserted += rows.length
+        },
+    })
+
+    await upsertPagePostInventorySyncState(c.env.DB, pageId, {
+        next_after: result.next_after,
+        last_attempt_at: nowIso,
+        last_synced_at: result.error ? undefined : nowIso,
+        last_full_scan_at: result.fully_scanned ? nowIso : undefined,
+        fully_scanned: result.fully_scanned ? 1 : 0,
+        last_batch_count: upserted,
+        last_error: result.error || '',
+    })
+
+    return c.json({
+        ok: !result.error,
+        page_id: pageId,
+        source: PAGE_POST_INVENTORY_GRAPH_SOURCE,
+        started_after: startAfter || null,
+        resumed: resume && !!startAfter,
+        pages_scanned: result.pages_scanned,
+        max_pages: maxPages,
+        max_rows: maxRows || null,
+        rows_discovered: result.rows.length,
+        rows_upserted: upserted,
+        next_after: result.next_after,
+        fully_scanned: result.fully_scanned,
+        reached_limit: result.reached_limit,
+        error: result.error || null,
+    }, result.error ? 502 : 200, { 'Cache-Control': 'no-store' })
+})
+
+// Read-only status of the page posts inventory Graph crawl cursor/sync state.
+app.get('/api/dashboard/page-post-inventory/graph-sync/status', async (c) => {
+    const pageId = String(c.req.query('page_id') || DEFAULT_PAGE_POST_INVENTORY_PAGE_ID).trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400, { 'Cache-Control': 'no-store' })
+    const state = await getPagePostInventorySyncState(c.env.DB, pageId)
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        sync: state ? {
+            next_after: String(state.next_after || '').trim(),
+            last_attempt_at: String(state.last_attempt_at || '').trim(),
+            last_synced_at: String(state.last_synced_at || '').trim(),
+            last_full_scan_at: String(state.last_full_scan_at || '').trim(),
+            fully_scanned: Number(state.fully_scanned || 0) > 0,
+            last_batch_count: Number(state.last_batch_count || 0),
+            last_error: String(state.last_error || '').trim(),
+            updated_at: String(state.updated_at || '').trim(),
+        } : null,
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
