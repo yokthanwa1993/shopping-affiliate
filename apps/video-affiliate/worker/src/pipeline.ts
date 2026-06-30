@@ -7,7 +7,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-29.final-upload-compress.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-30.ai-clips-skip-subtitles.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -970,6 +970,14 @@ export async function updateGalleryCache(bucket: R2Bucket, videoId: string, botI
 
 // ==================== Main Pipeline ====================
 
+// Per-run pipeline options. Defaults keep ALL legacy/non-AI processing identical:
+// `skipSubtitles` defaults false so the standard analyze → voice → merge → subtitle-burn
+// flow is unchanged. AI/manual Media clips pass `skipSubtitles: true` so the merge service
+// skips Vertex SRT + ASS burn and ships the no-subtitle merged MP4.
+export type RunPipelineOptions = {
+    skipSubtitles?: boolean
+}
+
 export async function runPipeline(
     env: Env,
     videoUrl: string,
@@ -979,6 +987,7 @@ export async function runPipeline(
     botId: string,
     shopeeLink?: string | null,
     lazadaLink?: string | null,
+    options?: RunPipelineOptions,
 ) {
     let token = env.TELEGRAM_BOT_TOKEN
     try {
@@ -1058,6 +1067,10 @@ export async function runPipeline(
             bot_id: botId,
             shopee_link: String(shopeeLink || '').trim() || undefined,
             lazada_link: String(lazadaLink || '').trim() || undefined,
+            // Backwards-compatible: defaults false so the merge service burns subtitles for
+            // all legacy/non-AI jobs exactly as before. AI/manual Media clips pass true to
+            // skip the Vertex SRT + ASS burn step while keeping voice/merge/thumbnail/upload.
+            skip_subtitles: !!options?.skipSubtitles,
         })
 
         // Health check ก่อน — รอ merge service พร้อมสูงสุด 3 ครั้ง × 3 วินาที = 9 วินาที
@@ -1348,12 +1361,12 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
         // so Gemini/Vertex 429 cooldowns do not hammer the external API.
         const sorted = queueList.objects.sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
         let next: (typeof sorted)[number] | null = null
-        let job: { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string } | null = null
+        let job: { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string; skipSubtitles?: boolean } | null = null
         const nowMs = Date.now()
         for (const candidate of sorted) {
             const jobData = await botBucket.get(candidate.key)
             if (!jobData) continue
-            const candidateJob = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string }
+            const candidateJob = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string; skipSubtitles?: boolean }
             const retryNextAt = String(candidateJob.retryNextAt || '').trim()
             const retryNextMs = retryNextAt ? Date.parse(retryNextAt) : NaN
             if (Number.isFinite(retryNextMs) && retryNextMs > nowMs) {
@@ -1381,8 +1394,12 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
             httpMetadata: { contentType: 'application/json' },
         })
 
-        // เริ่ม pipeline — need to await directly since we're in waitUntil already
-        await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink)
+        // เริ่ม pipeline — need to await directly since we're in waitUntil already.
+        // Forward skipSubtitles from the queue job (AI/manual Media clips set it true);
+        // legacy/cadence jobs omit it → default false → subtitles burned as before.
+        await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink, {
+            skipSubtitles: !!job.skipSubtitles,
+        })
 
         return true
     } finally {

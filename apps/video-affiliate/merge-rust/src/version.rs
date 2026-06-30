@@ -1,1 +1,1 @@
-pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-29.final-upload-compress.01";
+pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-30.ai-clips-skip-subtitles.01";

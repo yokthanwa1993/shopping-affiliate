@@ -324,6 +324,11 @@ export type AiClipQueueJob = {
     // Provenance so completion code can recognize an AI clip without a separate lookup.
     sourceType: typeof AI_CLIP_SOURCE_TYPE
     sourceLabel: string
+    // AI/manual Media clips process with the same analyze → Thai voice/TTS → audio merge →
+    // thumbnail → upload flow, but WITHOUT burned subtitles. The flag rides the durable
+    // `_queue/` job so processNextInQueue can forward it to the merge `/pipeline` payload.
+    // Always true for AI clips; legacy inbox/cadence jobs never set it (default false).
+    skipSubtitles: true
 }
 
 // Build the durable `_queue/` job for an AI clip. Returns null when the internal source URL
@@ -346,6 +351,9 @@ export function buildAiClipProcessingQueueJob(
         createdAt: String(params.nowIso || '').trim() || new Date(0).toISOString(),
         sourceType: AI_CLIP_SOURCE_TYPE,
         sourceLabel: String(record.sourceLabel || '').trim() || AI_CLIP_SOURCE_LABEL,
+        // AI/manual clips skip burned subtitles; the rest of the flow (analyze → Thai
+        // voice/TTS → merge audio/video → thumbnail → upload) is unchanged.
+        skipSubtitles: true,
     }
 }
 

@@ -86,6 +86,19 @@ pub struct PipelineRequest {
     pub vertex_tts_location: Option<String>,
     pub vertex_tts_model: Option<String>,
     pub vertex_tts_service_account_json: Option<String>,
+    /// When true, the pipeline runs analyze → Thai voice/TTS → audio+video merge →
+    /// thumbnail → upload exactly as usual but SKIPS the Vertex Gemini audio SRT
+    /// generation, final/debug SRT, and ASS subtitle burn — the no-subtitle merged MP4
+    /// becomes the output. Defaults false so all legacy/non-AI jobs burn subtitles as
+    /// before. Accepts both `skip_subtitles` (Worker) and `skipSubtitles`.
+    #[serde(default, alias = "skipSubtitles")]
+    pub skip_subtitles: Option<bool>,
+}
+
+/// Pure: whether this request opts out of burned subtitles. Defaults false so every
+/// legacy/non-AI pipeline keeps burning subtitles unchanged.
+fn should_skip_subtitles(req: &PipelineRequest) -> bool {
+    req.skip_subtitles.unwrap_or(false)
 }
 
 #[derive(Serialize)]
@@ -698,11 +711,13 @@ async fn create_flipped_processing_input(
     // completes. Surfaces the remux error if even the copy path fails (truly
     // terminal — the source itself is unusable, not just the cosmetic flip).
     let remux_args = build_flip_fallback_remux_ffmpeg_args(input_str, output_str);
-    run_flip_ffmpeg_step(&remux_args, FLIP_FALLBACK_TIMEOUT_SECS, "flip-fallback-remux")
-        .await
-        .map_err(|remux_err| {
-            format!("FFmpeg flip fallback remux failed: {}", remux_err).into()
-        })
+    run_flip_ffmpeg_step(
+        &remux_args,
+        FLIP_FALLBACK_TIMEOUT_SECS,
+        "flip-fallback-remux",
+    )
+    .await
+    .map_err(|remux_err| format!("FFmpeg flip fallback remux failed: {}", remux_err).into())
 }
 
 fn build_gemini_transcode_ffmpeg_args(
@@ -2409,19 +2424,20 @@ mod tests {
     use super::{
         AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_VIDEO_BITRATE, AVATAR_COMPOSE_VIDEO_BUFSIZE,
         AVATAR_COMPOSE_VIDEO_MAXRATE, AVATAR_COMPOSE_VIDEO_PRESET,
-        GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
-        GeminiPreflightError, GeminiTranscodeProfile, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
-        VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
         FINAL_COMPRESS_AUDIO_BITRATE_KBPS, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS,
-        build_avatar_compose_filter_complex, build_final_compress_ffmpeg_args,
-        build_final_merge_ffmpeg_args, build_flip_fallback_remux_ffmpeg_args,
-        build_flip_processing_input_ffmpeg_args, build_gemini_inline_video_part,
-        final_compress_video_bitrate_kbps,
-        build_gemini_transcode_ffmpeg_args, build_gemini_transcode_filter,
-        build_srt_from_lines_with_timing, build_tts_payload, convert_to_ass,
-        extract_speech_srt_time_span, extract_srt_payload, ffmpeg_nonzero_status_reason,
+        GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
+        GeminiPreflightError, GeminiTranscodeProfile, PipelineRequest,
+        VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS, VERTEX_GENERATION_INLINE_MAX_BYTES,
+        build_avatar_compose_ffmpeg_args, build_avatar_compose_filter_complex,
+        build_final_compress_ffmpeg_args, build_final_merge_ffmpeg_args,
+        build_flip_fallback_remux_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
+        build_gemini_inline_video_part, build_gemini_transcode_ffmpeg_args,
+        build_gemini_transcode_filter, build_srt_from_lines_with_timing, build_tts_payload,
+        convert_to_ass, extract_speech_srt_time_span, extract_srt_payload,
+        ffmpeg_nonzero_status_reason, final_compress_video_bitrate_kbps,
         format_gemini_preflight_info, normalize_srt_blocks, parse_gemini_preflight_info,
-        parse_srt_time_range, pipeline_error_category, validate_gemini_safe_output,
+        parse_srt_time_range, pipeline_error_category, should_skip_subtitles,
+        validate_gemini_safe_output,
     };
     use serde_json::json;
 
@@ -2436,7 +2452,8 @@ mod tests {
         // 30 MB target over 60s → well above the floor, derived from size.
         let kbps = final_compress_video_bitrate_kbps(30 * 1024 * 1024, 60.0);
         let expected_total = (30.0 * 1024.0 * 1024.0 * 8.0 / 1000.0) / 60.0;
-        let expected_video = (expected_total - FINAL_COMPRESS_AUDIO_BITRATE_KBPS as f64).round() as u32;
+        let expected_video =
+            (expected_total - FINAL_COMPRESS_AUDIO_BITRATE_KBPS as f64).round() as u32;
         assert_eq!(kbps, expected_video);
         assert!(kbps > FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS);
 
@@ -2451,8 +2468,13 @@ mod tests {
 
     #[test]
     fn final_compress_args_target_size_and_preserve_burned_frames() {
-        let args =
-            build_final_compress_ffmpeg_args("/tmp/in.mp4", "/tmp/out.mp4", 1200, Some(1280), Some(30));
+        let args = build_final_compress_ffmpeg_args(
+            "/tmp/in.mp4",
+            "/tmp/out.mp4",
+            1200,
+            Some(1280),
+            Some(30),
+        );
         let value_after = |flag: &str| {
             args.iter()
                 .position(|a| a == flag)
@@ -2557,8 +2579,7 @@ mod tests {
 
     #[test]
     fn flip_fallback_remux_streams_copy_without_flip() {
-        let args =
-            build_flip_fallback_remux_ffmpeg_args("/tmp/video.mp4", "/tmp/processing.mp4");
+        let args = build_flip_fallback_remux_ffmpeg_args("/tmp/video.mp4", "/tmp/processing.mp4");
         let value_after = |flag: &str| {
             args.iter()
                 .position(|arg| arg == flag)
@@ -2956,6 +2977,50 @@ mod tests {
         assert!(!filter.contains("eof_action=repeat"));
         assert!(!filter.contains("repeatlast=1"));
     }
+
+    // Minimal PipelineRequest used to exercise the skip_subtitles gate without a network.
+    fn skip_subtitles_request_json(extra: &str) -> String {
+        format!(
+            r#"{{"token":"t","video_url":"https://x/v.mp4","chat_id":0,"r2_public_url":"https://r2","worker_url":"https://w"{}}}"#,
+            extra
+        )
+    }
+
+    #[test]
+    fn skip_subtitles_defaults_false_for_legacy_payloads() {
+        // A payload with NO skip flag (every legacy/non-AI job) must default to burning subtitles.
+        let req: PipelineRequest =
+            serde_json::from_str(&skip_subtitles_request_json("")).expect("legacy payload parses");
+        assert_eq!(req.skip_subtitles, None);
+        assert!(!should_skip_subtitles(&req));
+    }
+
+    #[test]
+    fn skip_subtitles_reads_snake_case_flag() {
+        let req: PipelineRequest =
+            serde_json::from_str(&skip_subtitles_request_json(r#","skip_subtitles":true"#))
+                .expect("snake_case payload parses");
+        assert_eq!(req.skip_subtitles, Some(true));
+        assert!(should_skip_subtitles(&req));
+    }
+
+    #[test]
+    fn skip_subtitles_reads_camel_case_alias() {
+        // Worker sends snake_case; the camelCase alias is a defensive fallback.
+        let req: PipelineRequest =
+            serde_json::from_str(&skip_subtitles_request_json(r#","skipSubtitles":true"#))
+                .expect("camelCase payload parses");
+        assert_eq!(req.skip_subtitles, Some(true));
+        assert!(should_skip_subtitles(&req));
+    }
+
+    #[test]
+    fn skip_subtitles_false_is_honored() {
+        let req: PipelineRequest =
+            serde_json::from_str(&skip_subtitles_request_json(r#","skip_subtitles":false"#))
+                .expect("explicit-false payload parses");
+        assert!(!should_skip_subtitles(&req));
+    }
 }
 
 // Convert Whisper JSON to SRT with word-level timestamps
@@ -3243,6 +3308,12 @@ async fn rust_pipeline(
         .as_deref()
         .map(|model| model.trim() == "mock")
         .unwrap_or(false);
+    // AI/manual Media clips ship without burned subtitles. Everything else (analyze,
+    // Thai voice/TTS, audio+video merge, thumbnail, upload) is unchanged.
+    let skip_subtitles = should_skip_subtitles(&req);
+    if skip_subtitles {
+        println!("[PIPELINE] skip_subtitles=true → SRT generation + ASS burn will be skipped");
+    }
 
     // 1. Download
     update_step(
@@ -3605,255 +3676,226 @@ async fn rust_pipeline(
     }
 
     // 5. Vertex Gemini SRT from generated dub audio (no whisper)
-    update_step(
-        worker_url,
-        token,
-        &bot_id,
-        &video_id,
-        4.3,
-        "📝 กำลังสร้างซับจากเสียงพากย์ (Vertex Gemini SRT)...",
-    )
-    .await;
-    edit_status(token, req.chat_id, req.msg_id, "🎬 ตัดต่อ: กำลังฝังซับไตเติ้ล").await;
-
-    let mut raw_srt = String::new();
-    if !mock_mode {
-        let t_sync = std::time::Instant::now();
-        let adjusted_bytes = fs::read(&adjusted).await?;
-        let vertex_context = vertex_generation
-            .as_ref()
-            .ok_or("Vertex service account is required for Vertex Gemini audio sync")?;
-        match tokio::time::timeout(
-            Duration::from_secs(VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS),
-            vertex_gemini_srt_from_audio_bytes(
-                &adjusted_bytes,
-                &subtitle_lines,
-                vertex_context,
-                adjusted_audio_dur,
-            ),
+    // `final_srt_path` is declared out here so the (skipped) burn branch shares its scope.
+    // The whole SRT block — Vertex audio sync, final/debug SRT, timing artifacts — is
+    // skipped entirely for AI/manual Media clips; only the audio+video merge below runs.
+    let final_srt_path = tmp_path.join("final.srt");
+    if !skip_subtitles {
+        update_step(
+            worker_url,
+            token,
+            &bot_id,
+            &video_id,
+            4.3,
+            "📝 กำลังสร้างซับจากเสียงพากย์ (Vertex Gemini SRT)...",
         )
-        .await
-        {
-            Ok(Ok(srt)) => {
-                raw_srt = srt;
-            }
-            Ok(Err(err)) => {
-                println!(
-                    "[PIPELINE] Vertex Gemini audio sync failed; deterministic subtitle fallback will be used: {}",
-                    err
-                );
-            }
-            Err(_) => {
-                println!(
-                    "[PIPELINE] Vertex Gemini audio sync timed out after {}s; deterministic subtitle fallback will be used",
-                    VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS
-                );
-            }
-        }
-        println!(
-            "[PIPELINE] Vertex Gemini audio sync -> {} chars, {} blocks ({:.1}s)",
-            raw_srt.len(),
-            raw_srt
-                .split("\n\n")
-                .filter(|s| !s.trim().is_empty())
-                .count(),
-            t_sync.elapsed().as_secs_f64()
-        );
-    } else {
-        println!("[PIPELINE] mock mode: skip Vertex Gemini audio sync");
-    }
+        .await;
+        edit_status(token, req.chat_id, req.msg_id, "🎬 ตัดต่อ: กำลังฝังซับไตเติ้ล").await;
 
-    let audio_activity_window = detect_audio_activity_window(&adjusted, adjusted_audio_dur).await;
-    if let Some((audio_speech_start_detected, audio_speech_end_detected)) = audio_activity_window {
-        let raw_span_opt = extract_srt_time_span(&raw_srt);
-        let raw_start_detected = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
-        let raw_end_detected = raw_span_opt.map(|(_, e)| e).unwrap_or(0.0);
-        let should_remap = !raw_srt.trim().is_empty()
-            && audio_speech_end_detected > audio_speech_start_detected + 0.2
-            && ((audio_speech_start_detected - raw_start_detected).abs() > 0.08
-                || (audio_speech_end_detected - raw_end_detected).abs() > 0.12);
-
-        if should_remap {
+        let mut raw_srt = String::new();
+        if !mock_mode {
+            let t_sync = std::time::Instant::now();
+            let adjusted_bytes = fs::read(&adjusted).await?;
+            let vertex_context = vertex_generation
+                .as_ref()
+                .ok_or("Vertex service account is required for Vertex Gemini audio sync")?;
+            match tokio::time::timeout(
+                Duration::from_secs(VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS),
+                vertex_gemini_srt_from_audio_bytes(
+                    &adjusted_bytes,
+                    &subtitle_lines,
+                    vertex_context,
+                    adjusted_audio_dur,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(srt)) => {
+                    raw_srt = srt;
+                }
+                Ok(Err(err)) => {
+                    println!(
+                        "[PIPELINE] Vertex Gemini audio sync failed; deterministic subtitle fallback will be used: {}",
+                        err
+                    );
+                }
+                Err(_) => {
+                    println!(
+                        "[PIPELINE] Vertex Gemini audio sync timed out after {}s; deterministic subtitle fallback will be used",
+                        VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS
+                    );
+                }
+            }
             println!(
-                "[PIPELINE] remap raw SRT to detected audio activity window ({:.3}s -> {:.3}s)",
-                audio_speech_start_detected, audio_speech_end_detected
+                "[PIPELINE] Vertex Gemini audio sync -> {} chars, {} blocks ({:.1}s)",
+                raw_srt.len(),
+                raw_srt
+                    .split("\n\n")
+                    .filter(|s| !s.trim().is_empty())
+                    .count(),
+                t_sync.elapsed().as_secs_f64()
             );
-            raw_srt = remap_srt_blocks_to_window(
-                &raw_srt,
-                audio_speech_start_detected,
-                audio_speech_end_detected,
-                adjusted_audio_dur.max(duration),
-            );
-        }
-    }
-
-    let raw_srt_blocks = raw_srt
-        .split("\n\n")
-        .filter(|s| !s.trim().is_empty())
-        .count();
-    let raw_span_opt = extract_srt_time_span(&raw_srt);
-    let raw_start = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
-    let raw_end = raw_span_opt.map(|(_, e)| e).unwrap_or(0.0);
-    let raw_span = (raw_end - raw_start).max(0.0);
-    let speech_span_opt = extract_speech_srt_time_span(&raw_srt);
-    let speech_start = speech_span_opt.map(|(s, _)| s).unwrap_or(0.0);
-    let speech_end = speech_span_opt.map(|(_, e)| e).unwrap_or(0.0);
-    let speech_span = (speech_end - speech_start).max(0.0);
-
-    let mut speech_dur = a_dur.max(1.0).min(duration.max(1.0));
-    if speech_span > 0.5 {
-        speech_dur = speech_span.min(duration.max(1.0)).max(1.0);
-    }
-    let subtitle_max_end = if speech_end > 0.12 {
-        speech_end.min(duration.max(1.0)).max(speech_dur)
-    } else {
-        speech_dur
-    };
-    println!(
-        "[PIPELINE] speech_dur={:.2}s max_end={:.2}s (a_dur={:.2}s, video_dur={:.2}s, speech_start={:.2}s, speech_end={:.2}s, speech_span={:.2}s)",
-        speech_dur, subtitle_max_end, a_dur, duration, speech_start, speech_end, speech_span
-    );
-
-    let t_srt = std::time::Instant::now();
-    let mut final_srt_text = normalize_srt_blocks(&raw_srt, subtitle_max_end);
-    if !final_srt_text.trim().is_empty() && !srt_quality_ok(&script, &final_srt_text, 120) {
-        println!("[PIPELINE] Vertex Gemini SRT quality check failed -> deterministic fallback");
-        final_srt_text.clear();
-    }
-
-    if final_srt_text.trim().is_empty() {
-        final_srt_text = if subtitle_lines.is_empty() {
-            build_srt_from_script_with_timing(&script, &raw_srt, subtitle_max_end, 15)
         } else {
-            build_srt_from_lines_with_timing(&subtitle_lines, &raw_srt, subtitle_max_end, 15)
-        };
-    }
+            println!("[PIPELINE] mock mode: skip Vertex Gemini audio sync");
+        }
 
-    if final_srt_text.trim().is_empty() {
-        println!("[PIPELINE] Final SRT empty -> simple script split fallback");
-        final_srt_text = script_to_srt_simple(&script, subtitle_max_end);
-    }
-    println!(
-        "[PIPELINE] Build SRT (Gemini-first) → {:.1}s",
-        t_srt.elapsed().as_secs_f64()
-    );
-    println!(
-        "[PIPELINE] Final SRT: {} chars, {} blocks",
-        final_srt_text.len(),
-        final_srt_text
+        let audio_activity_window =
+            detect_audio_activity_window(&adjusted, adjusted_audio_dur).await;
+        if let Some((audio_speech_start_detected, audio_speech_end_detected)) =
+            audio_activity_window
+        {
+            let raw_span_opt = extract_srt_time_span(&raw_srt);
+            let raw_start_detected = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
+            let raw_end_detected = raw_span_opt.map(|(_, e)| e).unwrap_or(0.0);
+            let should_remap = !raw_srt.trim().is_empty()
+                && audio_speech_end_detected > audio_speech_start_detected + 0.2
+                && ((audio_speech_start_detected - raw_start_detected).abs() > 0.08
+                    || (audio_speech_end_detected - raw_end_detected).abs() > 0.12);
+
+            if should_remap {
+                println!(
+                    "[PIPELINE] remap raw SRT to detected audio activity window ({:.3}s -> {:.3}s)",
+                    audio_speech_start_detected, audio_speech_end_detected
+                );
+                raw_srt = remap_srt_blocks_to_window(
+                    &raw_srt,
+                    audio_speech_start_detected,
+                    audio_speech_end_detected,
+                    adjusted_audio_dur.max(duration),
+                );
+            }
+        }
+
+        let raw_srt_blocks = raw_srt
             .split("\n\n")
             .filter(|s| !s.trim().is_empty())
-            .count()
-    );
+            .count();
+        let raw_span_opt = extract_srt_time_span(&raw_srt);
+        let raw_start = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
+        let raw_end = raw_span_opt.map(|(_, e)| e).unwrap_or(0.0);
+        let raw_span = (raw_end - raw_start).max(0.0);
+        let speech_span_opt = extract_speech_srt_time_span(&raw_srt);
+        let speech_start = speech_span_opt.map(|(s, _)| s).unwrap_or(0.0);
+        let speech_end = speech_span_opt.map(|(_, e)| e).unwrap_or(0.0);
+        let speech_span = (speech_end - speech_start).max(0.0);
 
-    let final_srt_path = tmp_path.join("final.srt");
-    fs::write(&final_srt_path, &final_srt_text).await?;
+        let mut speech_dur = a_dur.max(1.0).min(duration.max(1.0));
+        if speech_span > 0.5 {
+            speech_dur = speech_span.min(duration.max(1.0)).max(1.0);
+        }
+        let subtitle_max_end = if speech_end > 0.12 {
+            speech_end.min(duration.max(1.0)).max(speech_dur)
+        } else {
+            speech_dur
+        };
+        println!(
+            "[PIPELINE] speech_dur={:.2}s max_end={:.2}s (a_dur={:.2}s, video_dur={:.2}s, speech_start={:.2}s, speech_end={:.2}s, speech_span={:.2}s)",
+            speech_dur, subtitle_max_end, a_dur, duration, speech_start, speech_end, speech_span
+        );
 
-    // Upload debug timing artifacts for production verification
-    let debug_prefix = format!("debug/{video_id}");
-    let _ = r2_put(
-        worker_url,
-        token,
-        &bot_id,
-        &format!("{debug_prefix}/raw_gemini.srt"),
-        raw_srt.clone().into_bytes(),
-        "application/x-subrip",
-    )
-    .await;
-    // Keep legacy key for backward compatibility with existing dashboard/tools.
-    let _ = r2_put(
-        worker_url,
-        token,
-        &bot_id,
-        &format!("{debug_prefix}/raw_whisper.srt"),
-        raw_srt.clone().into_bytes(),
-        "application/x-subrip",
-    )
-    .await;
-    let _ = r2_put(
-        worker_url,
-        token,
-        &bot_id,
-        &format!("{debug_prefix}/final_subtitles.srt"),
-        final_srt_text.clone().into_bytes(),
-        "application/x-subrip",
-    )
-    .await;
-    let timing_debug = json!({
-        "video_id": video_id,
-        "timing_source": "gemini_audio_srt",
-        "raw_start": raw_start,
-        "raw_end": raw_end,
-        "raw_span": raw_span,
-        "speech_start": speech_start,
-        "speech_end": speech_end,
-        "speech_span": speech_span,
-        "speech_dur": speech_dur,
-        "subtitle_max_end": subtitle_max_end,
-        "audio_dur": a_dur,
-        "adjusted_audio_dur": adjusted_audio_dur,
-        "audio_activity_window": audio_activity_window.map(|(start, end)| json!({
-            "start": start,
-            "end": end,
-        })),
-        "video_dur": duration,
-        "raw_srt_blocks": raw_srt_blocks,
-        "final_srt_blocks": final_srt_text.split("\n\n").filter(|s| !s.trim().is_empty()).count(),
-        "pipeline_engine_version": PIPELINE_ENGINE_VERSION,
-    });
-    let _ = r2_put(
-        worker_url,
-        token,
-        &bot_id,
-        &format!("{debug_prefix}/timing.json"),
-        serde_json::to_vec(&timing_debug).unwrap_or_default(),
-        "application/json",
-    )
-    .await;
+        let t_srt = std::time::Instant::now();
+        let mut final_srt_text = normalize_srt_blocks(&raw_srt, subtitle_max_end);
+        if !final_srt_text.trim().is_empty() && !srt_quality_ok(&script, &final_srt_text, 120) {
+            println!("[PIPELINE] Vertex Gemini SRT quality check failed -> deterministic fallback");
+            final_srt_text.clear();
+        }
 
-    // 6. Burn Subtitles and Thumbnail
-    update_step(
-        worker_url,
-        token,
-        &bot_id,
-        &video_id,
-        4.8,
-        "🎨 กำลังฝังซับไตเติ้ลลงวิดีโอ...",
-    )
-    .await;
+        if final_srt_text.trim().is_empty() {
+            final_srt_text = if subtitle_lines.is_empty() {
+                build_srt_from_script_with_timing(&script, &raw_srt, subtitle_max_end, 15)
+            } else {
+                build_srt_from_lines_with_timing(&subtitle_lines, &raw_srt, subtitle_max_end, 15)
+            };
+        }
+
+        if final_srt_text.trim().is_empty() {
+            println!("[PIPELINE] Final SRT empty -> simple script split fallback");
+            final_srt_text = script_to_srt_simple(&script, subtitle_max_end);
+        }
+        println!(
+            "[PIPELINE] Build SRT (Gemini-first) → {:.1}s",
+            t_srt.elapsed().as_secs_f64()
+        );
+        println!(
+            "[PIPELINE] Final SRT: {} chars, {} blocks",
+            final_srt_text.len(),
+            final_srt_text
+                .split("\n\n")
+                .filter(|s| !s.trim().is_empty())
+                .count()
+        );
+
+        fs::write(&final_srt_path, &final_srt_text).await?;
+
+        // Upload debug timing artifacts for production verification
+        let debug_prefix = format!("debug/{video_id}");
+        let _ = r2_put(
+            worker_url,
+            token,
+            &bot_id,
+            &format!("{debug_prefix}/raw_gemini.srt"),
+            raw_srt.clone().into_bytes(),
+            "application/x-subrip",
+        )
+        .await;
+        // Keep legacy key for backward compatibility with existing dashboard/tools.
+        let _ = r2_put(
+            worker_url,
+            token,
+            &bot_id,
+            &format!("{debug_prefix}/raw_whisper.srt"),
+            raw_srt.clone().into_bytes(),
+            "application/x-subrip",
+        )
+        .await;
+        let _ = r2_put(
+            worker_url,
+            token,
+            &bot_id,
+            &format!("{debug_prefix}/final_subtitles.srt"),
+            final_srt_text.clone().into_bytes(),
+            "application/x-subrip",
+        )
+        .await;
+        let timing_debug = json!({
+            "video_id": video_id,
+            "timing_source": "gemini_audio_srt",
+            "raw_start": raw_start,
+            "raw_end": raw_end,
+            "raw_span": raw_span,
+            "speech_start": speech_start,
+            "speech_end": speech_end,
+            "speech_span": speech_span,
+            "speech_dur": speech_dur,
+            "subtitle_max_end": subtitle_max_end,
+            "audio_dur": a_dur,
+            "adjusted_audio_dur": adjusted_audio_dur,
+            "audio_activity_window": audio_activity_window.map(|(start, end)| json!({
+                "start": start,
+                "end": end,
+            })),
+            "video_dur": duration,
+            "raw_srt_blocks": raw_srt_blocks,
+            "final_srt_blocks": final_srt_text.split("\n\n").filter(|s| !s.trim().is_empty()).count(),
+            "pipeline_engine_version": PIPELINE_ENGINE_VERSION,
+        });
+        let _ = r2_put(
+            worker_url,
+            token,
+            &bot_id,
+            &format!("{debug_prefix}/timing.json"),
+            serde_json::to_vec(&timing_debug).unwrap_or_default(),
+            "application/json",
+        )
+        .await;
+    } // end `if !skip_subtitles` — Vertex SRT generation + debug artifacts
+
+    // 6. Merge audio/video, then (unless skipped) burn subtitles, then thumbnail
     let output_mp4 = tmp_path.join("output.mp4");
 
-    // Get video dimensions for ASS scaling
-    let dim_out = Command::new("ffprobe")
-        .args(&[
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0:s=x",
-            processing_video_path.to_str().unwrap(),
-        ])
-        .output()
-        .await;
-    let (vw, vh) = if let Ok(o) = dim_out {
-        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        s.split_once('x')
-            .and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
-            .unwrap_or((1080, 1920))
-    } else {
-        (1080, 1920)
-    };
-
-    // Convert SRT → ASS with FC Iconic Bold font
-    let final_srt_text_str = fs::read_to_string(&final_srt_path)
-        .await
-        .unwrap_or_default();
-    let ass_content = convert_to_ass(&final_srt_text_str, vw, vh);
-    let ass_path = tmp_path.join("subtitles.ass");
-    fs::write(&ass_path, &ass_content).await?;
-
-    // Step 1: Merge video + audio (no subtitle) — copy video stream, re-encode audio to AAC
+    // Step 1: Merge video + audio (no subtitle) — copy video stream, re-encode audio to AAC.
+    // This no-subtitle merge IS the output for AI/manual clips (skip_subtitles), and the
+    // burn input otherwise. Audio merge is identical in both paths.
     let nosub_path = tmp_path.join("merged_nosub.mp4");
     let merge_out = tokio::time::timeout(
         Duration::from_secs(300),
@@ -3873,45 +3915,103 @@ async fn rust_pipeline(
         Ok(Ok(_)) => {}
     }
 
-    // Step 2: Burn subtitles — re-encode video with libass, copy audio
-    let vf = format!(
-        "ass={}:fontsdir=/usr/local/share/fonts",
-        ass_path.to_str().unwrap()
-    );
-    let mut burn_cmd = Command::new("ffmpeg");
-    burn_cmd.kill_on_drop(true);
-    burn_cmd.args(&[
-        "-y",
-        "-i",
-        nosub_path.to_str().unwrap(),
-        "-vf",
-        &vf,
-        "-c:v",
-        "libx264",
-        "-c:a",
-        "copy",
-        "-preset",
-        "fast",
-        output_mp4.to_str().unwrap(),
-    ]);
-    let ffmpeg_burn = tokio::time::timeout(
-        Duration::from_secs(SUBTITLE_BURN_TIMEOUT_SECS),
-        burn_cmd.output(),
-    )
-    .await;
-    let burn_fallback_reason = match ffmpeg_burn {
-        Err(_) => Some(format!("timeout>{}s", SUBTITLE_BURN_TIMEOUT_SECS)),
-        Ok(Err(e)) => Some(format!("process_error={}", e)),
-        Ok(Ok(output)) => ffmpeg_nonzero_status_reason(&output),
-    };
-    if let Some(reason) = burn_fallback_reason {
-        println!(
-            "[PIPELINE] subtitle burn failed-open: {}; using no-subtitle mp4",
-            reason
-        );
+    if skip_subtitles {
+        // No subtitles: the no-subtitle merge is the final output as-is.
+        update_step(
+            worker_url,
+            token,
+            &bot_id,
+            &video_id,
+            4.8,
+            "🎬 กำลังรวมเสียง+วิดีโอ (ไม่ฝังซับ)...",
+        )
+        .await;
+        println!("[PIPELINE] skip_subtitles=true → using no-subtitle merged mp4 as output");
         let _ = fs::remove_file(&output_mp4).await;
         fs::copy(&nosub_path, &output_mp4).await?;
-    }
+    } else {
+        update_step(
+            worker_url,
+            token,
+            &bot_id,
+            &video_id,
+            4.8,
+            "🎨 กำลังฝังซับไตเติ้ลลงวิดีโอ...",
+        )
+        .await;
+
+        // Get video dimensions for ASS scaling
+        let dim_out = Command::new("ffprobe")
+            .args(&[
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                processing_video_path.to_str().unwrap(),
+            ])
+            .output()
+            .await;
+        let (vw, vh) = if let Ok(o) = dim_out {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            s.split_once('x')
+                .and_then(|(w, h)| {
+                    Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+                })
+                .unwrap_or((1080, 1920))
+        } else {
+            (1080, 1920)
+        };
+
+        // Convert SRT → ASS with FC Iconic Bold font
+        let final_srt_text_str = fs::read_to_string(&final_srt_path)
+            .await
+            .unwrap_or_default();
+        let ass_content = convert_to_ass(&final_srt_text_str, vw, vh);
+        let ass_path = tmp_path.join("subtitles.ass");
+        fs::write(&ass_path, &ass_content).await?;
+
+        // Step 2: Burn subtitles — re-encode video with libass, copy audio
+        let vf = format!(
+            "ass={}:fontsdir=/usr/local/share/fonts",
+            ass_path.to_str().unwrap()
+        );
+        let mut burn_cmd = Command::new("ffmpeg");
+        burn_cmd.kill_on_drop(true);
+        burn_cmd.args(&[
+            "-y",
+            "-i",
+            nosub_path.to_str().unwrap(),
+            "-vf",
+            &vf,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "copy",
+            "-preset",
+            "fast",
+            output_mp4.to_str().unwrap(),
+        ]);
+        let ffmpeg_burn = tokio::time::timeout(
+            Duration::from_secs(SUBTITLE_BURN_TIMEOUT_SECS),
+            burn_cmd.output(),
+        )
+        .await;
+        let burn_fallback_reason = match ffmpeg_burn {
+            Err(_) => Some(format!("timeout>{}s", SUBTITLE_BURN_TIMEOUT_SECS)),
+            Ok(Err(e)) => Some(format!("process_error={}", e)),
+            Ok(Ok(output)) => ffmpeg_nonzero_status_reason(&output),
+        };
+        if let Some(reason) = burn_fallback_reason {
+            println!(
+                "[PIPELINE] subtitle burn failed-open: {}; using no-subtitle mp4",
+                reason
+            );
+            let _ = fs::remove_file(&output_mp4).await;
+            fs::copy(&nosub_path, &output_mp4).await?;
+        }
+    } // end else (burn subtitles)
 
     let thumb_path = tmp_path.join("thumb.webp");
     let ffmpeg_thumb = tokio::time::timeout(
@@ -4009,6 +4109,11 @@ async fn rust_pipeline(
         "debugTimingKey": format!("debug/{}/timing.json", video_id),
         "debugFinalSrtKey": format!("debug/{}/final_subtitles.srt", video_id),
         "debugRawWhisperKey": format!("debug/{}/raw_whisper.srt", video_id),
+        // Non-secret marker so Dev can verify an AI/manual clip was processed without
+        // burned subtitles (voice/merge/thumbnail/upload still ran). False for all
+        // legacy/non-AI jobs, which keep burning subtitles.
+        "subtitlesSkipped": skip_subtitles,
+        "skipSubtitles": skip_subtitles,
         "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     });
     if let Some(link) = shopee_link {
