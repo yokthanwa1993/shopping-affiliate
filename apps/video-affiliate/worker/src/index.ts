@@ -4257,7 +4257,7 @@ async function countFacebookPagePostsNeedingCommentLink(
 // retried without re-scanning the whole page.
 async function selectFacebookPagePostsNeedingCommentLink(
     db: D1Database,
-    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean },
+    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean; accessToken?: string },
 ): Promise<Array<{ page_id: string; post_id: string; page_name: string; permalink_url: string }>> {
     await ensureFacebookPagePostCacheTables(db)
     const where: string[] = ['namespace_id = ?']
@@ -4322,7 +4322,7 @@ async function recordFacebookPagePostCommentLinkError(
 // recheck) and persists progress on every row.
 async function runFacebookPagePostsCommentLinkEnrich(
     db: D1Database,
-    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean },
+    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean; accessToken?: string },
 ): Promise<{
     ok: boolean
     namespace_id: string
@@ -4346,7 +4346,8 @@ async function runFacebookPagePostsCommentLinkEnrich(
     async function tokenFor(pid: string): Promise<string> {
         const key = String(pid || '').trim() || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
         if (tokenByPage.has(key)) return tokenByPage.get(key)!
-        const tok = await resolveFacebookSyncToken(db, key, namespaceId)
+        const overrideToken = String(opts.accessToken || '').trim()
+        const tok = overrideToken || await resolveFacebookSyncToken(db, key, namespaceId)
         tokenByPage.set(key, tok || '')
         return tok || ''
     }
@@ -13273,6 +13274,8 @@ app.post('/api/dashboard/facebook-page-posts/enrich-comment-links', async (c) =>
         namespace_id?: string
         limit?: number
         recheck?: boolean
+        access_token?: string
+        accessToken?: string
     }
     // page_id absent → default to the gallery page; an explicit '' means the whole
     // namespace (every page's cached posts).
@@ -13281,8 +13284,9 @@ app.post('/api/dashboard/facebook-page-posts/enrich-comment-links', async (c) =>
     const namespaceId = String(body.namespace_id || c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
     const limit = normalizeFacebookPagePostsCommentLinkLimit(body.limit ?? c.req.query('limit'))
     const recheck = body.recheck === true || c.req.query('recheck') === '1'
+    const accessToken = String(body.access_token || body.accessToken || '').trim()
 
-    const result = await runFacebookPagePostsCommentLinkEnrich(c.env.DB, { namespaceId, pageId, limit, recheck })
+    const result = await runFacebookPagePostsCommentLinkEnrich(c.env.DB, { namespaceId, pageId, limit, recheck, accessToken })
     return c.json({ ...result, limit }, result.error ? 502 : 200, { 'Cache-Control': 'no-store' })
 })
 
