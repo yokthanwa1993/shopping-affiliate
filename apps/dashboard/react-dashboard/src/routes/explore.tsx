@@ -70,62 +70,49 @@ function PostThumb({ item }: { item: ExternalPost }) {
   )
 }
 
+// Single 9:16 overlay card matching the Media (AiCard) look exactly: full-bleed
+// thumbnail, top-left page pill, top-right views badge, bottom gradient with
+// title + date. Opens the Facebook/source link when one exists; otherwise it's a
+// static visual card (no metadata panel below the image).
 function PostCard({ item }: { item: ExternalPost }) {
   const title = (item.title || item.caption || item.post_id || '—').trim() || '—'
   const pageName = (item.page_name || item.page_id || '').trim()
-  const fbUrl = (item.post_url || '').trim() || null
-  const srcUrl = (item.source_url || '').trim() || null
+  const linkUrl = (item.post_url || '').trim() || (item.source_url || '').trim() || null
+  const dateLabel = formatThaiDateTime(item.created_time)
 
-  return (
-    <article className="flex flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition hover:border-primary/40 hover:shadow-md">
-      <div className="relative aspect-[9/16] w-full overflow-hidden bg-muted">
-        <PostThumb item={item} />
-        {pageName ? (
-          <span className="absolute left-2 top-2 max-w-[70%] truncate rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold text-white">
-            {pageName}
-          </span>
-        ) : null}
-        {item.is_video ? (
-          <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-white">
-            {formatCompactViews(item.views)} วิว
-          </span>
-        ) : null}
-      </div>
-      <div className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-        <p className="line-clamp-2 text-sm font-medium" title={title}>
+  const cardClass =
+    'relative block aspect-[9/16] w-full overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95'
+
+  const overlay = (
+    <>
+      <PostThumb item={item} />
+      {pageName ? (
+        <span className="absolute left-2 top-2 inline-flex max-w-[70%] items-center gap-1 truncate rounded-full bg-black/70 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
+          {pageName}
+        </span>
+      ) : null}
+      {item.is_video ? (
+        <span className="absolute right-2 top-2 inline-flex items-center rounded-full bg-black/70 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm">
+          {formatCompactViews(item.views)} วิว
+        </span>
+      ) : null}
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
+        <p className="truncate text-[11px] font-extrabold" title={title}>
           {title}
         </p>
-        <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-          <span className="whitespace-nowrap">{formatThaiDateTime(item.created_time) || '—'}</span>
-          {item.is_video ? <Badge variant="secondary" className="text-[10px]">วิดีโอ</Badge> : null}
-        </div>
-        <div className="mt-auto flex flex-wrap gap-1.5 pt-1 text-xs">
-          {fbUrl ? (
-            <a
-              href={fbUrl}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="เปิดโพสต์บน Facebook"
-              className="rounded bg-blue-50 px-2 py-1 font-semibold text-blue-700 hover:bg-blue-100"
-            >
-              Facebook ↗
-            </a>
-          ) : null}
-          {srcUrl ? (
-            <a
-              href={srcUrl}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="เปิดไฟล์วิดีโอ"
-              className="rounded bg-muted px-2 py-1 font-semibold text-foreground hover:bg-accent"
-            >
-              เปิดวิดีโอ ↗
-            </a>
-          ) : null}
-        </div>
+        {dateLabel ? <p className="mt-0.5 truncate text-[10px] text-white/75">{dateLabel}</p> : null}
       </div>
-    </article>
+    </>
   )
+
+  if (linkUrl) {
+    return (
+      <a href={linkUrl} target="_blank" rel="noreferrer" aria-label={`เปิด ${title}`} className={cardClass}>
+        {overlay}
+      </a>
+    )
+  }
+  return <div className={cardClass}>{overlay}</div>
 }
 
 // One watched external page row: status + enable toggle + sync + remove.
@@ -498,7 +485,7 @@ export function ExplorePage() {
               </Badge>
             </div>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent className="space-y-4 !px-0">
             {postsQuery.isLoading ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
                 {Array.from({ length: 8 }).map((_, i) => (

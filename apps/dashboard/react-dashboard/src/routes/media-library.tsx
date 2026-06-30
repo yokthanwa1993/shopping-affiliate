@@ -181,54 +181,36 @@ function MediaPreviewModal({ item, onClose }: { item: VideoMediaLibraryItem; onC
   )
 }
 
+// Single 9:16 overlay card matching the Media (AiCard) look exactly: full-bleed
+// thumbnail, top-left Meta/System pill, top-right play badge, bottom gradient with
+// the system video id + date. The whole card opens the preview modal (no metadata
+// panel below the image).
 function MediaCard({ item, onOpen }: { item: VideoMediaLibraryItem; onOpen: () => void }) {
+  const meta = hasMetaSource(item)
+  const dateLabel = formatThaiDateTime(item.uploadedAt || item.updatedAt || item.createdAt)
   return (
-    <article className="overflow-hidden rounded-xl border bg-card shadow-sm transition hover:shadow-md">
-      <button
-        type="button"
-        onClick={onOpen}
-        aria-label={`ดูวิดีโอ ${item.systemVideoId}`}
-        className="relative block aspect-[9/16] w-full overflow-hidden bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={`ดูวิดีโอ ${item.systemVideoId}`}
+      className="relative block aspect-[9/16] w-full overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
+    >
+      <MediaThumb item={item} />
+      <span
+        className={`absolute left-2 top-2 inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm ${
+          meta ? 'bg-emerald-600/95' : 'bg-slate-600/90'
+        }`}
       >
-        <MediaThumb item={item} />
-        <span
-          className={`absolute left-2 top-2 rounded px-2 py-0.5 text-[11px] font-semibold text-white ${
-            hasMetaSource(item) ? 'bg-emerald-600/90' : 'bg-slate-500/90'
-          }`}
-        >
-          {hasMetaSource(item) ? 'Meta/Facebook' : 'System Preview'}
-        </span>
-        <span className="absolute bottom-2 right-2 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white">
-          <Play className="ml-0.5 h-4 w-4" fill="currentColor" />
-        </span>
-      </button>
-      <div className="space-y-2 p-3">
-        <p className="line-clamp-2 text-sm font-medium">{item.systemVideoId}</p>
-        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-          <span className="truncate font-mono">{item.advideoId}</span>
-          <span className="shrink-0">{formatThaiDateTime(item.uploadedAt || item.updatedAt || item.createdAt)}</span>
-        </div>
-        <div className="flex flex-wrap gap-1.5 pt-1 text-xs">
-          <span
-            className={`rounded px-2 py-1 font-semibold ${
-              hasMetaSource(item) ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            {hasMetaSource(item) ? 'จาก Meta' : 'พรีวิวระบบ'}
-          </span>
-          <a
-            href={mediaVideoSrc(item)}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(e) => e.stopPropagation()}
-            className="rounded bg-muted px-2 py-1 font-semibold text-foreground hover:bg-accent"
-          >
-            เปิดวิดีโอ
-          </a>
-          <CopyButton value={item.advideoId} label="Meta id" />
-        </div>
+        {meta ? 'Meta/Facebook' : 'System Preview'}
+      </span>
+      <span className="absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm">
+        <Play className="ml-0.5 h-4 w-4" fill="currentColor" />
+      </span>
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
+        <p className="truncate text-[11px] font-extrabold">{item.systemVideoId}</p>
+        {dateLabel ? <p className="mt-0.5 truncate text-[10px] text-white/75">{dateLabel}</p> : null}
       </div>
-    </article>
+    </button>
   )
 }
 
