@@ -64,7 +64,8 @@ test('normalizeFacebookPagePost requires id + page + namespace', () => {
 test('extractFacebookPostMedia pulls video_id/source/picture from attachments', () => {
     const post = graphPost('200', {
         permalink_url: 'https://www.facebook.com/videos/200',
-        picture: 'https://cdn/pic.jpg',
+        picture: 'https://cdn/small-pic.jpg',
+        full_picture: 'https://cdn/full-pic.jpg',
         attachments: {
             data: [{
                 media_type: 'video',
@@ -77,7 +78,7 @@ test('extractFacebookPostMedia pulls video_id/source/picture from attachments', 
     assert.equal(media.video_id, '987654321')
     assert.equal(media.source_url, 'https://cdn/video.mp4')
     assert.equal(media.media_type, 'video')
-    assert.equal(media.picture, 'https://cdn/pic.jpg') // top-level picture wins
+    assert.equal(media.picture, 'https://cdn/full-pic.jpg') // full_picture wins over tiny picture
 })
 
 test('extractFacebookPostMedia falls back to subattachments for video id', () => {
@@ -228,6 +229,8 @@ test('Graph fields request comments + reactions summary counts', () => {
     assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('comments.limit(0).summary(total_count)'))
     assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('reactions.limit(0).summary(total_count)'))
     assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('shares'))
+    assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('full_picture'))
+    assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('attachments{media_type,target,media,url}'))
     assert.ok(FACEBOOK_PAGE_POSTS_FIELDS.includes('permalink_url'))
     assert.equal(FACEBOOK_PAGE_POSTS_EDGE, 'published_posts')
 })
@@ -253,6 +256,8 @@ test('fetch helper hits /published_posts with the official cursor + sanitizes er
     assert.ok(body.includes('FACEBOOK_PAGE_POSTS_EDGE'), 'must use the published_posts edge constant')
     assert.ok(body.includes("params.set('after', after)"), 'must pass the after cursor when present')
     assert.ok(body.includes('sanitizeFacebookPagePostsError'), 'must sanitize Graph errors before throwing')
+    assert.ok(body.includes("fetchEdge('posts')"), 'must fall back to the public /posts edge when published_posts is permission-denied')
+    assert.ok(body.includes('Permission Denied'), 'fallback is narrowly scoped to Graph permission denial')
 })
 
 test('read endpoint exposes data_source + does not gate on min_views', () => {

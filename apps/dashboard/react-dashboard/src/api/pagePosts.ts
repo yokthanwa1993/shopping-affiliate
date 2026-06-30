@@ -308,8 +308,18 @@ export function pagePostPermalink(item: PagePostItem): string | null {
   return /^https?:\/\//i.test(v) ? v : null
 }
 
-// Safe cover/thumbnail for a post card: the Graph `picture` (http(s) only).
+// Safe cover/thumbnail for a post card. For Reels/videos, prefer the Worker
+// Graph thumbnail proxy because cached Graph `picture` can be a very small
+// preview. Keep `picture` as fallback for photos and when the proxy cannot load.
 export function pagePostThumb(item: PagePostItem): string | null {
   const p = (item.picture ?? '').trim()
-  return /^https?:\/\//i.test(p) ? p : null
+  const fallback = /^https?:\/\//i.test(p) ? p : null
+  const pageId = (item.page_id ?? '').trim()
+  const videoId = (item.video_id ?? '').trim()
+  if (pageId && videoId) {
+    const qs = new URLSearchParams({ page_id: pageId, video_id: videoId })
+    if (fallback) qs.set('fallback_url', fallback)
+    return `${WORKER_API_BASE}/api/dashboard/facebook-video-thumbnail?${qs.toString()}`
+  }
+  return fallback
 }

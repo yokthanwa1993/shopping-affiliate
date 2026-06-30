@@ -40,7 +40,7 @@ export const FACEBOOK_PAGE_POSTS_EDGE = 'published_posts'
 export const FACEBOOK_PAGE_POSTS_FIELDS =
     'comments.limit(0).summary(total_count){id},' +
     'reactions.limit(0).summary(total_count){id},' +
-    'message,shares,attachments,picture,from,created_time,permalink_url'
+    'message,shares,full_picture,picture,attachments{media_type,target,media,url},from,created_time,permalink_url'
 
 export type FacebookPagePostCacheRow = {
     namespace_id: string
@@ -162,7 +162,9 @@ export function extractFacebookPostMedia(post: Record<string, unknown>): {
     else if (subTarget && isVideoMt(subMt)) videoId = subTarget
 
     const sourceUrl = clean(attMedia?.source) || clean(subMedia?.source)
-    const picture = clean(post?.picture) || clean(attMedia?.image?.src) || clean(subMedia?.image?.src)
+    // Prefer larger Graph images. `picture` is often a tiny square preview;
+    // `full_picture` and attachment media image URLs are large enough for cards.
+    const picture = clean(post?.full_picture) || clean(attMedia?.image?.src) || clean(subMedia?.image?.src) || clean(post?.picture)
 
     let mediaType = attMt || subMt
     if (!mediaType) {

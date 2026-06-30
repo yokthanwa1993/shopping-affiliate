@@ -81,9 +81,7 @@ function PostCard({ item }: { item: PagePostItem }) {
   const pageName = (item.page_name || '').trim()
   const mediaType = (item.media_type || '').trim()
   const openUrl = pagePostPermalink(item)
-  // Video posts open as "เปิดวิดีโอ"; everything else as "เปิดโพสต์".
-  const isVideo = /video|reel/i.test(mediaType) || !!(item.video_id || '').trim()
-  const openLabel = isVideo ? 'เปิดวิดีโอ' : 'เปิดโพสต์'
+  const openLabel = 'เปิดโพสต์'
 
   return (
     <article className="flex flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition hover:border-primary/40 hover:shadow-md">
@@ -410,14 +408,14 @@ export function PagePostsPage() {
           <CardHeader className="flex-col items-start gap-2 space-y-0 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="font-medium">
-                แสดง {items.length}
-                {total > items.length ? ` จาก ${total.toLocaleString()}` : ''} โพสต์
+                แสดง {items.length} โพสต์
+                {total > items.length ? ` (โหลดในแคชแล้ว ${total.toLocaleString()})` : ''}
               </span>
               <Badge variant="outline">
                 {scope === ALL_PAGES ? `ทุกเพจ (${pages.length})` : activePage?.name || scope}
               </Badge>
               <Badge variant="outline">{dataSource}</Badge>
-              {sync?.fully_scanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : null}
+              {sync?.fully_scanned ? <Badge variant="success">sync ครบทั้งเพจ</Badge> : <Badge variant="outline">ยังดึงไม่ครบทั้งเพจ</Badge>}
             </div>
             <div className="flex flex-col items-start gap-0.5 text-xs text-muted-foreground sm:items-end">
               {sync?.last_synced_at ? <span>sync ล่าสุด: {formatThaiDateTime(sync.last_synced_at)}</span> : null}
