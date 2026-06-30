@@ -364,25 +364,30 @@ function CardThumb({ item, eager = false }: { item: AiClip; eager?: boolean }) {
 function AiCard({ item, onOpen, index = 0 }: { item: AiClip; onOpen: () => void; index?: number }) {
   const dateLabel = compactThaiDate(item.processedAt || item.createdAt)
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="relative aspect-[9/16] overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition-transform duration-200 active:scale-95"
-    >
-      <CardThumb item={item} eager={index < 8} />
-      <div className="absolute left-2 top-2 flex items-center gap-1.5">
-        <span className="inline-flex items-center gap-1 rounded-full bg-violet-600/95 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
+    <article className="overflow-hidden rounded-xl border bg-card shadow-sm transition hover:shadow-md">
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-label={`ดูคลิป ${item.title || item.id}`}
+        className="relative block aspect-[9/16] w-full overflow-hidden bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <CardThumb item={item} eager={index < 8} />
+        <span className="absolute left-2 top-2 inline-flex items-center gap-1 rounded-full bg-violet-600/95 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
           <Sparkles className="h-3 w-3" /> AI
         </span>
+        <span className="absolute right-2 top-2 inline-flex items-center">
+          <StatusBadge status={item.status} />
+        </span>
+      </button>
+      <div className="space-y-2 p-3">
+        <p className="line-clamp-2 text-sm font-medium">{item.title || item.id}</p>
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span className="truncate font-mono">{item.id}</span>
+          {dateLabel ? <span className="shrink-0">{dateLabel}</span> : null}
+        </div>
+        <StatusBadge status={item.status} variant="solid" className="w-fit" showLabel />
       </div>
-      <div className="absolute right-2 top-2 flex items-center">
-        <StatusBadge status={item.status} />
-      </div>
-      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
-        <p className="truncate text-[11px] font-extrabold">{item.title || item.id}</p>
-        {dateLabel ? <p className="mt-0.5 truncate text-[10px] text-white/75">{dateLabel}</p> : null}
-      </div>
-    </button>
+    </article>
   )
 }
 
@@ -660,9 +665,9 @@ export function AiClipsPage() {
       ) : null}
 
       {isInitialLoading ? (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
+        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
           {Array.from({ length: 10 }).map((_, i) => (
-            <div key={i} className="aspect-[9/16] animate-pulse rounded-2xl bg-muted" />
+            <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
           ))}
         </div>
       ) : items.length === 0 ? (
@@ -674,7 +679,7 @@ export function AiClipsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
+        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
           {items.map((item, i) => (
             <AiCard key={item.id || i} item={item} index={i} onOpen={() => setSelected(item)} />
           ))}
