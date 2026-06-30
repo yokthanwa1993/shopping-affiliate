@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -82,65 +82,40 @@ function PostCard({ item }: { item: PagePostItem }) {
   const pageName = (item.page_name || '').trim()
   const mediaType = (item.media_type || '').trim()
   const openUrl = pagePostPermalink(item)
-  const openLabel = 'เปิดโพสต์'
+  const dateLabel = formatThaiDateTime(item.created_time)
+  const views = Number(item.views || 0)
+  const engagement = Number(item.reactions_count || 0) + Number(item.comments_count || 0) + Number(item.shares_count || 0)
+  const Wrapper = openUrl ? 'a' : 'article'
 
   return (
-    <article className="flex flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition hover:border-primary/40 hover:shadow-md">
-      <div className="relative aspect-[9/16] w-full overflow-hidden bg-muted">
-        <PostCover item={item} />
-        {pageName ? (
-          <span className="absolute left-2 top-2 max-w-[70%] truncate rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold text-white">
-            {pageName}
-          </span>
-        ) : null}
-        {Number(item.views || 0) > 0 ? (
-          <span className="absolute right-2 top-2 rounded bg-black/75 px-2 py-1 text-[12px] font-bold tabular-nums text-white shadow" title="ยอดวิว">
-            ▶ {formatCompactViews(item.views ?? 0)}
-          </span>
-        ) : null}
-        {mediaType ? (
-          <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-white">
-            {mediaType}
-          </span>
-        ) : null}
-      </div>
-      <div className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-        <p className="line-clamp-2 text-sm font-medium" title={caption}>
-          {caption}
-        </p>
-        <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-          <span className="whitespace-nowrap">{formatThaiDateTime(item.created_time) || '—'}</span>
-        </div>
-        <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground tabular-nums">
-          {Number(item.views || 0) > 0 ? (
-            <span className="font-semibold text-foreground" title="ยอดวิว">▶ {formatCompactViews(item.views ?? 0)} วิว</span>
-          ) : null}
-          <span title="ไลก์/รีแอกชัน">❤ {formatCompactViews(item.reactions_count ?? 0)}</span>
-          <span title="คอมเมนต์">💬 {formatCompactViews(item.comments_count ?? 0)}</span>
-          <span title="แชร์">↗ {formatCompactViews(item.shares_count ?? 0)}</span>
-        </div>
-        <div className="mt-auto flex flex-wrap gap-1.5 pt-1 text-xs">
-          {openUrl ? (
-            <a
-              href={openUrl}
-              target="_blank"
-              rel="noreferrer"
-              aria-label={`${openLabel}บน Facebook`}
-              className="rounded bg-primary/10 px-2 py-1 font-semibold text-primary hover:bg-primary/20"
-            >
-              {openLabel} ↗
-            </a>
-          ) : (
-            <span
-              className="rounded px-2 py-1 text-muted-foreground"
-              title="ไม่มีลิงก์ Facebook สำหรับโพสต์นี้"
-            >
-              ไม่มีลิงก์
-            </span>
-          )}
+    <Wrapper
+      {...(openUrl ? { href: openUrl, target: '_blank', rel: 'noreferrer' } : {})}
+      aria-label={openUrl ? `เปิดโพสต์บน Facebook ${caption}` : undefined}
+      className="relative block aspect-[9/16] w-full overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
+    >
+      <PostCover item={item} />
+      {pageName ? (
+        <span className="absolute left-2 top-2 max-w-[58%] truncate rounded-full bg-black/65 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
+          {pageName}
+        </span>
+      ) : null}
+      {views > 0 ? (
+        <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดวิว">
+          ▶ {formatCompactViews(views)}
+        </span>
+      ) : engagement > 0 ? (
+        <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดนิยม">
+          ❤ {formatCompactViews(engagement)}
+        </span>
+      ) : null}
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
+        <p className="truncate text-[11px] font-extrabold" title={caption}>{caption}</p>
+        <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-white/75">
+          <span className="truncate">{dateLabel || '—'}</span>
+          {mediaType ? <span className="shrink-0 uppercase">{mediaType}</span> : null}
         </div>
       </div>
-    </article>
+    </Wrapper>
   )
 }
 
@@ -231,6 +206,25 @@ export function PagePostsPage() {
   // Always label the read source as the cache table the rows are served from.
   const dataSource = lastPage?.dataSource || PAGE_POST_CACHE_SOURCE
   const remaining = Math.max(total - items.length, 0)
+  const infiniteScrollSentinelRef = useRef<HTMLDivElement | null>(null)
+
+  // Infinite scroll: when the bottom sentinel comes near the viewport, append the next
+  // offset window automatically. The manual button below stays as a fallback.
+  useEffect(() => {
+    const node = infiniteScrollSentinelRef.current
+    if (!node || !result.hasNextPage) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.some((entry) => entry.isIntersecting)
+        if (visible && result.hasNextPage && !result.isFetchingNextPage && !result.isFetching) {
+          void result.fetchNextPage()
+        }
+      },
+      { rootMargin: '720px 0px 720px 0px', threshold: 0 },
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [result.hasNextPage, result.isFetchingNextPage, result.isFetching, result.fetchNextPage, items.length])
 
   // One click = one bounded crawl batch for the selected page. The worker stores
   // the cursor, so re-clicking resumes; this never hammers Graph.
@@ -435,20 +429,27 @@ export function PagePostsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             {result.isLoading ? (
-              <div className={viewMode === 'compact' ? "grid gap-3 sm:grid-cols-2 lg:grid-cols-3" : "grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4"}>
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
+                {Array.from({ length: 10 }).map((_, i) => (
+                  <div key={i} className="aspect-[9/16] animate-pulse rounded-2xl bg-muted" />
                 ))}
               </div>
             ) : items.length === 0 && !result.isFetching ? (
               <p className="py-8 text-center text-sm text-muted-foreground">ไม่พบรายการ</p>
             ) : (
-              <div className={viewMode === 'compact' ? "grid gap-3 sm:grid-cols-2 lg:grid-cols-3" : "grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4"}>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7">
                 {items.map((item) => (
                   <PostCard key={item.post_id || item.permalink_url} item={item} />
                 ))}
               </div>
             )}
+
+            <div ref={infiniteScrollSentinelRef} className="h-8" aria-hidden="true" />
+            {result.isFetchingNextPage ? (
+              <p className="text-center text-xs font-medium text-muted-foreground">กำลังโหลดเพิ่ม…</p>
+            ) : !result.hasNextPage && items.length > 0 ? (
+              <p className="text-center text-xs text-muted-foreground">โหลดครบแล้ว</p>
+            ) : null}
 
             {result.hasNextPage ? (
               <div className="flex justify-center pt-1">
