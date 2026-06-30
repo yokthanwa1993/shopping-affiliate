@@ -349,7 +349,7 @@ export function buildAiClipProcessingQueueJob(
     }
 }
 
-function galleryAssetUrl(workerUrl: string, namespaceId: string, id: string, variant: 'original' | 'original-thumb' | 'public'): string {
+function galleryAssetUrl(workerUrl: string, namespaceId: string, id: string, variant: 'original' | 'original-thumb' | 'thumb' | 'public'): string {
     const base = String(workerUrl || '').trim().replace(/\/+$/, '')
     const ns = String(namespaceId || '').trim()
     const vid = sanitizeAiClipId(id)
@@ -366,7 +366,12 @@ export function buildAiClipResponse(
     params: { namespaceId: string; workerUrl: string },
 ): Record<string, unknown> {
     const originalUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original')
-    const thumbnailUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original-thumb')
+    // Grid/card thumbnails use the smaller /asset/thumb (270x480 WebP, ~18KB) for fast list loading.
+    // The route serves the downscaled processed thumb when present and falls back to original-thumb
+    // (540x960) otherwise, so unprocessed clips still resolve a cover. Playback URLs stay full-res.
+    const thumbnailUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'thumb')
+    // Larger 540x960 cover kept as an explicit fallback for any consumer that wants higher-res.
+    const originalThumbUrl = galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'original-thumb')
     const processed = isAiClipProcessed(record)
     const publicUrl = processed ? galleryAssetUrl(params.workerUrl, params.namespaceId, record.id, 'public') : ''
     const playbackUrl = publicUrl || originalUrl
@@ -393,7 +398,7 @@ export function buildAiClipResponse(
         public_url: publicUrl,
         thumbnailUrl,
         thumbnail_url: thumbnailUrl,
-        fallbackThumbnailUrl: thumbnailUrl,
+        fallbackThumbnailUrl: originalThumbUrl,
         created_at: record.createdAt,
         createdAt: record.createdAt,
         updated_at: record.updatedAt,

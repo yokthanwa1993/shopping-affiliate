@@ -196,8 +196,14 @@ test('buildAiClipResponse points playback/thumb at namespace-scoped asset endpoi
         resp.originalUrl,
         'https://worker.example.dev/api/gallery/ai_xyz/asset/original?namespace_id=1774858894802785816',
     )
+    // Grid/card thumbnails use the smaller /asset/thumb route for fast list loading.
     assert.equal(
         resp.thumbnailUrl,
+        'https://worker.example.dev/api/gallery/ai_xyz/asset/thumb?namespace_id=1774858894802785816',
+    )
+    // The larger 540x960 cover is preserved as the explicit higher-res fallback.
+    assert.equal(
+        resp.fallbackThumbnailUrl,
         'https://worker.example.dev/api/gallery/ai_xyz/asset/original-thumb?namespace_id=1774858894802785816',
     )
     // No worker URL → empty asset URLs rather than a malformed link
