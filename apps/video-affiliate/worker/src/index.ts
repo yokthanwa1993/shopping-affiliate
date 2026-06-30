@@ -289,6 +289,25 @@ import {
     normalizePagePostInventoryOffset,
 } from './page-post-inventory'
 import {
+    FACEBOOK_PAGE_POSTS_EDGE,
+    FACEBOOK_PAGE_POSTS_FIELDS,
+    FACEBOOK_PAGE_POSTS_SOURCE,
+    FACEBOOK_PAGE_POSTS_SYNC_ALL_DEFAULT_BATCHES_PER_PAGE,
+    FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL,
+    FACEBOOK_PAGE_POST_CACHE_MEDIA_INDEX_SQL,
+    FACEBOOK_PAGE_POST_CACHE_TABLE_SQL,
+    FACEBOOK_PAGE_POST_SYNC_STATE_TABLE_SQL,
+    type FacebookPagePostCacheRow,
+    type FacebookPagePostsGraphBatch,
+    crawlFacebookPagePosts,
+    normalizeFacebookPagePostsBatches,
+    normalizeFacebookPagePostsGraphLimit,
+    normalizeFacebookPagePostsOffset,
+    normalizeFacebookPagePostsReadLimit,
+    normalizeFacebookPagePostsSyncAllPages,
+    sanitizeFacebookPagePostsError,
+} from './facebook-page-posts'
+import {
     PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL,
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
@@ -3673,6 +3692,7 @@ let dashboardSettingsTableReady: Promise<void> | null = null
 let pageVideoAssetWinnersTableReady: Promise<void> | null = null
 let processedVideoAssetLibraryTableReady: Promise<void> | null = null
 let pagePostInventoryTableReady: Promise<void> | null = null
+let facebookPagePostCacheTablesReady: Promise<void> | null = null
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_ID = '1008898512617594'
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME = 'เฉียบ'
 const DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID = '1774858894802785816'
@@ -3874,6 +3894,301 @@ async function ensurePagePostInventoryTable(db: D1Database): Promise<void> {
         })()
     }
     await pagePostInventoryTableReady
+}
+
+// Clean Facebook Page Posts inventory tables (facebook_page_post_cache +
+// facebook_page_post_sync_state). Idempotent; created lazily on first use so no
+// migration file is required. Distinct from facebook_page_video_cache (videos
+// only) and facebook_page_post_inventory (CSV/comments export).
+async function ensureFacebookPagePostCacheTables(db: D1Database): Promise<void> {
+    if (!facebookPagePostCacheTablesReady) {
+        facebookPagePostCacheTablesReady = (async () => {
+            await db.prepare(FACEBOOK_PAGE_POST_CACHE_TABLE_SQL).run()
+            await db.prepare(FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL).run().catch(() => { })
+            await db.prepare(FACEBOOK_PAGE_POST_CACHE_MEDIA_INDEX_SQL).run().catch(() => { })
+            await db.prepare(FACEBOOK_PAGE_POST_SYNC_STATE_TABLE_SQL).run()
+        })()
+    }
+    await facebookPagePostCacheTablesReady
+}
+
+// Read one /{page}/published_posts batch with the official cursor. Throws a
+// token-sanitized error on any Graph failure so the crawler records last_error
+// and keeps the resume cursor (never marks the page fully scanned on failure).
+async function fetchFacebookPagePostsBatchFromToken(
+    token: string,
+    pageId: string,
+    after: string,
+    limit: number,
+): Promise<FacebookPagePostsGraphBatch> {
+    const cleanToken = String(token || '').trim()
+    const params = new URLSearchParams({
+        fields: FACEBOOK_PAGE_POSTS_FIELDS,
+        limit: String(limit),
+        access_token: cleanToken,
+    })
+    if (after) params.set('after', after)
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(pageId)}/${FACEBOOK_PAGE_POSTS_EDGE}?${params.toString()}`
+    let response: Response
+    try {
+        response = await fetch(url)
+    } catch (e) {
+        throw new Error(sanitizeFacebookPagePostsError(e instanceof Error ? e.message : String(e), cleanToken) || 'facebook_graph_fetch_failed')
+    }
+    if (!response.ok) {
+        const errorBody = await response.text().catch(() => '')
+        const raw = `facebook_graph_http_${response.status}${errorBody ? `:${errorBody.slice(0, 160)}` : ''}`
+        throw new Error(sanitizeFacebookPagePostsError(raw, cleanToken))
+    }
+    const payload = await response.json().catch(() => ({})) as {
+        error?: { code?: number | string; message?: string }
+        data?: Array<Record<string, unknown>>
+        paging?: { next?: string; cursors?: { after?: string; before?: string } }
+    }
+    if (payload?.error) {
+        const code = Number(payload.error?.code || 0)
+        const message = String(payload.error?.message || 'facebook_graph_failed')
+        // 368 (temporarily blocked) / 4 / 17 / 32 are rate/limit codes; 190 is an
+        // invalid/expired token. Surface a sanitized, code-tagged error and let the
+        // caller store it + back off — we never tight-loop on a rate/auth failure.
+        const tag = code === 368 || code === 4 || code === 17 || code === 32 ? 'facebook_rate_limited' : 'facebook_graph_error'
+        throw new Error(sanitizeFacebookPagePostsError(`${tag}:${message}${code ? `:${code}` : ''}`, cleanToken))
+    }
+    return {
+        posts: Array.isArray(payload?.data) ? payload.data : [],
+        paging: payload?.paging || null,
+    }
+}
+
+async function getFacebookPagePostSyncState(db: D1Database, namespaceId: string, pageId: string): Promise<Record<string, unknown> | null> {
+    await ensureFacebookPagePostCacheTables(db)
+    return await db.prepare(
+        `SELECT namespace_id, page_id, page_name, next_after, fully_scanned, last_attempt_at,
+                last_synced_at, last_full_scan_at, last_batch_count, last_error, total_cached, updated_at
+         FROM facebook_page_post_sync_state WHERE namespace_id = ? AND page_id = ?`
+    ).bind(namespaceId, pageId).first() as Record<string, unknown> | null
+}
+
+async function upsertFacebookPagePostSyncState(db: D1Database, namespaceId: string, pageId: string, fields: {
+    page_name?: string
+    next_after?: string
+    fully_scanned?: number
+    last_attempt_at?: string
+    last_synced_at?: string
+    last_full_scan_at?: string
+    last_batch_count?: number
+    last_error?: string
+    total_cached?: number
+}): Promise<void> {
+    await ensureFacebookPagePostCacheTables(db)
+    const current = await getFacebookPagePostSyncState(db, namespaceId, pageId)
+    const pageName = String(fields.page_name ?? current?.page_name ?? '').trim()
+    const nextAfter = String(fields.next_after ?? current?.next_after ?? '').trim()
+    const fullyScanned = Number(fields.fully_scanned ?? current?.fully_scanned ?? 0) > 0 ? 1 : 0
+    const lastAttempt = String(fields.last_attempt_at ?? current?.last_attempt_at ?? '').trim()
+    const lastSynced = String(fields.last_synced_at ?? current?.last_synced_at ?? '').trim()
+    const lastFullScan = String(fields.last_full_scan_at ?? current?.last_full_scan_at ?? '').trim()
+    const lastBatchCount = Number(fields.last_batch_count ?? current?.last_batch_count ?? 0)
+    const lastError = String(fields.last_error ?? current?.last_error ?? '').trim()
+    const totalCached = Number(fields.total_cached ?? current?.total_cached ?? 0)
+    await db.prepare(
+        `INSERT INTO facebook_page_post_sync_state (
+            namespace_id, page_id, page_name, next_after, fully_scanned, last_attempt_at,
+            last_synced_at, last_full_scan_at, last_batch_count, last_error, total_cached, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(namespace_id, page_id) DO UPDATE SET
+            page_name = excluded.page_name,
+            next_after = excluded.next_after,
+            fully_scanned = excluded.fully_scanned,
+            last_attempt_at = excluded.last_attempt_at,
+            last_synced_at = excluded.last_synced_at,
+            last_full_scan_at = excluded.last_full_scan_at,
+            last_batch_count = excluded.last_batch_count,
+            last_error = excluded.last_error,
+            total_cached = excluded.total_cached,
+            updated_at = datetime('now')`
+    ).bind(namespaceId, pageId, pageName, nextAfter, fullyScanned, lastAttempt, lastSynced, lastFullScan, lastBatchCount, lastError, totalCached).run()
+}
+
+// Upsert crawl-discovered posts. Counts/metadata are refreshed on every pass
+// (engagement grows over time); fetched_at is preserved on existing rows.
+async function upsertFacebookPagePostCacheRows(db: D1Database, rows: FacebookPagePostCacheRow[]): Promise<void> {
+    if (rows.length === 0) return
+    await ensureFacebookPagePostCacheTables(db)
+    const sql = `INSERT INTO facebook_page_post_cache (
+            namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
+            picture, source_url, media_type, created_time, reactions_count, comments_count,
+            shares_count, raw_json, fetched_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(namespace_id, page_id, post_id) DO UPDATE SET
+            page_name = CASE WHEN excluded.page_name != '' THEN excluded.page_name ELSE facebook_page_post_cache.page_name END,
+            video_id = CASE WHEN excluded.video_id != '' THEN excluded.video_id ELSE facebook_page_post_cache.video_id END,
+            message = excluded.message,
+            permalink_url = CASE WHEN excluded.permalink_url != '' THEN excluded.permalink_url ELSE facebook_page_post_cache.permalink_url END,
+            picture = CASE WHEN excluded.picture != '' THEN excluded.picture ELSE facebook_page_post_cache.picture END,
+            source_url = CASE WHEN excluded.source_url != '' THEN excluded.source_url ELSE facebook_page_post_cache.source_url END,
+            media_type = CASE WHEN excluded.media_type != '' THEN excluded.media_type ELSE facebook_page_post_cache.media_type END,
+            created_time = CASE WHEN excluded.created_time != '' THEN excluded.created_time ELSE facebook_page_post_cache.created_time END,
+            reactions_count = MAX(excluded.reactions_count, facebook_page_post_cache.reactions_count),
+            comments_count = MAX(excluded.comments_count, facebook_page_post_cache.comments_count),
+            shares_count = MAX(excluded.shares_count, facebook_page_post_cache.shares_count),
+            raw_json = excluded.raw_json,
+            updated_at = datetime('now')`
+    const statements = rows.map((row) => db.prepare(sql).bind(
+        row.namespace_id,
+        row.page_id,
+        row.page_name,
+        row.post_id,
+        row.video_id,
+        row.message,
+        row.permalink_url,
+        row.picture,
+        row.source_url,
+        row.media_type,
+        row.created_time,
+        row.reactions_count,
+        row.comments_count,
+        row.shares_count,
+        row.raw_json,
+    ))
+    await db.batch(statements)
+}
+
+async function countFacebookPagePostCache(db: D1Database, opts: { namespaceId: string; pageId?: string; mediaType?: string; q?: string }): Promise<number> {
+    await ensureFacebookPagePostCacheTables(db)
+    const where: string[] = ['namespace_id = ?']
+    const binds: unknown[] = [opts.namespaceId]
+    const pageId = String(opts.pageId || '').trim()
+    if (pageId) { where.push('page_id = ?'); binds.push(pageId) }
+    const mediaType = String(opts.mediaType || '').trim().toLowerCase()
+    if (mediaType) { where.push('LOWER(media_type) = ?'); binds.push(mediaType) }
+    const q = String(opts.q || '').trim()
+    if (q) { where.push('message LIKE ?'); binds.push(`%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`) }
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS c FROM facebook_page_post_cache WHERE ${where.join(' AND ')}`
+    ).bind(...binds).first() as { c?: number } | null
+    return Number(row?.c || 0)
+}
+
+async function listFacebookPagePostCache(db: D1Database, opts: {
+    namespaceId: string
+    pageId?: string
+    mediaType?: string
+    q?: string
+    limit: number
+    offset: number
+}): Promise<Array<Record<string, unknown>>> {
+    await ensureFacebookPagePostCacheTables(db)
+    const where: string[] = ['namespace_id = ?']
+    const binds: unknown[] = [opts.namespaceId]
+    const pageId = String(opts.pageId || '').trim()
+    if (pageId) { where.push('page_id = ?'); binds.push(pageId) }
+    const mediaType = String(opts.mediaType || '').trim().toLowerCase()
+    if (mediaType) { where.push('LOWER(media_type) = ?'); binds.push(mediaType) }
+    const q = String(opts.q || '').trim()
+    if (q) { where.push('message LIKE ?'); binds.push(`%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`) }
+    const res = await db.prepare(
+        `SELECT namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
+                picture, source_url, media_type, created_time, reactions_count, comments_count,
+                shares_count, fetched_at, updated_at
+         FROM facebook_page_post_cache
+         WHERE ${where.join(' AND ')}
+         ORDER BY created_time DESC, post_id DESC
+         LIMIT ? OFFSET ?`
+    ).bind(...binds, Math.max(1, opts.limit), Math.max(0, opts.offset)).all() as { results?: Array<Record<string, unknown>> }
+    return res.results || []
+}
+
+// Run one bounded, resumable crawl pass for a single page and persist results +
+// sync state. Shared by both the sync-page and sync-all endpoints.
+async function runFacebookPagePostsSyncPass(
+    db: D1Database,
+    opts: { namespaceId: string; pageId: string; pageName?: string; reset?: boolean; limit?: number; batches?: number },
+): Promise<{
+    ok: boolean
+    page_id: string
+    namespace_id: string
+    page_name: string
+    resumed: boolean
+    started_after: string | null
+    batches_scanned: number
+    rows_discovered: number
+    rows_upserted: number
+    next_after: string
+    fully_scanned: boolean
+    pending_more: boolean
+    total_cached: number
+    error: string | null
+}> {
+    const namespaceId = opts.namespaceId
+    const pageId = opts.pageId
+    const token = await resolveFacebookSyncToken(db, pageId, namespaceId)
+    if (!token) {
+        await upsertFacebookPagePostSyncState(db, namespaceId, pageId, {
+            page_name: opts.pageName,
+            last_attempt_at: new Date().toISOString(),
+            last_error: 'facebook_sync_token_missing',
+        }).catch(() => { })
+        return {
+            ok: false, page_id: pageId, namespace_id: namespaceId, page_name: String(opts.pageName || ''),
+            resumed: false, started_after: null, batches_scanned: 0, rows_discovered: 0, rows_upserted: 0,
+            next_after: '', fully_scanned: false, pending_more: true,
+            total_cached: await countFacebookPagePostCache(db, { namespaceId, pageId }),
+            error: 'facebook_sync_token_missing',
+        }
+    }
+
+    await ensureFacebookPagePostCacheTables(db)
+    const priorState = await getFacebookPagePostSyncState(db, namespaceId, pageId)
+    const resume = !opts.reset && Number(priorState?.fully_scanned || 0) === 0
+    const startAfter = resume ? String(priorState?.next_after || '').trim() : ''
+    const nowIso = new Date().toISOString()
+    await upsertFacebookPagePostSyncState(db, namespaceId, pageId, { page_name: opts.pageName, last_attempt_at: nowIso })
+
+    let upserted = 0
+    const result = await crawlFacebookPagePosts({
+        namespaceId,
+        pageId,
+        pageName: opts.pageName,
+        startAfter,
+        batches: opts.batches,
+        limit: opts.limit,
+        fetchBatch: (after, limit) => fetchFacebookPagePostsBatchFromToken(token, pageId, after, limit),
+        persistBatch: async (rows) => {
+            await upsertFacebookPagePostCacheRows(db, rows)
+            upserted += rows.length
+        },
+    })
+
+    const totalCached = await countFacebookPagePostCache(db, { namespaceId, pageId })
+    await upsertFacebookPagePostSyncState(db, namespaceId, pageId, {
+        page_name: opts.pageName,
+        next_after: result.next_after,
+        fully_scanned: result.fully_scanned ? 1 : 0,
+        last_attempt_at: nowIso,
+        last_synced_at: result.error ? undefined : nowIso,
+        last_full_scan_at: result.fully_scanned ? nowIso : undefined,
+        last_batch_count: upserted,
+        last_error: result.error || '',
+        total_cached: totalCached,
+    })
+
+    return {
+        ok: !result.error,
+        page_id: pageId,
+        namespace_id: namespaceId,
+        page_name: String(opts.pageName || priorState?.page_name || ''),
+        resumed: resume && !!startAfter,
+        started_after: startAfter || null,
+        batches_scanned: result.batches_scanned,
+        rows_discovered: result.rows.length,
+        rows_upserted: upserted,
+        next_after: result.next_after,
+        fully_scanned: result.fully_scanned,
+        pending_more: result.pending_more,
+        total_cached: totalCached,
+        error: result.error || null,
+    }
 }
 
 async function ensureDashboardSettingsTable(db: D1Database): Promise<void> {
@@ -12542,6 +12857,174 @@ app.get('/api/dashboard/page-post-inventory/graph-sync/status', async (c) => {
             last_error: String(state.last_error || '').trim(),
             updated_at: String(state.updated_at || '').trim(),
         } : null,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// ---------------------------------------------------------------------------
+// Clean Facebook Page Posts inventory — official Graph reads only.
+//
+// Captures EVERY real post of a Page via /{page}/published_posts cursor
+// pagination (no HTML scraping, no view-count filter). There is no artificial
+// total-post cap: each sync invocation walks a bounded number of cursor pages and
+// persists a resume cursor, so the UI/cron simply calls again while pending_more
+// stays true. Reads serve from facebook_page_post_cache for speed.
+// ---------------------------------------------------------------------------
+
+// Read cached posts. No min_views filter — this is a full-post inventory.
+app.get('/api/dashboard/facebook-page-posts', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const mediaType = String(c.req.query('media_type') || '').trim()
+    const q = String(c.req.query('q') || '').trim()
+    const limit = normalizeFacebookPagePostsReadLimit(c.req.query('limit'))
+    const offset = normalizeFacebookPagePostsOffset(c.req.query('offset'))
+
+    const [items, total] = await Promise.all([
+        listFacebookPagePostCache(c.env.DB, { namespaceId, pageId, mediaType, q, limit, offset }),
+        countFacebookPagePostCache(c.env.DB, { namespaceId, pageId, mediaType, q }),
+    ])
+
+    // Surface sync state: a single page's row, or every page's row in all-pages mode.
+    let sync: Record<string, unknown> | null = null
+    let syncAll: Array<Record<string, unknown>> | null = null
+    if (pageId) {
+        const state = await getFacebookPagePostSyncState(c.env.DB, namespaceId, pageId)
+        sync = state ? {
+            page_id: pageId,
+            page_name: String(state.page_name || '').trim(),
+            next_after: String(state.next_after || '').trim(),
+            fully_scanned: Number(state.fully_scanned || 0) > 0,
+            last_attempt_at: String(state.last_attempt_at || '').trim(),
+            last_synced_at: String(state.last_synced_at || '').trim(),
+            last_full_scan_at: String(state.last_full_scan_at || '').trim(),
+            last_batch_count: Number(state.last_batch_count || 0),
+            last_error: String(state.last_error || '').trim(),
+            total_cached: Number(state.total_cached || 0),
+        } : null
+    } else {
+        await ensureFacebookPagePostCacheTables(c.env.DB)
+        const states = await c.env.DB.prepare(
+            `SELECT page_id, page_name, fully_scanned, last_synced_at, last_full_scan_at, total_cached, last_error
+             FROM facebook_page_post_sync_state WHERE namespace_id = ? ORDER BY page_name COLLATE NOCASE ASC`
+        ).bind(namespaceId).all() as { results?: Array<Record<string, unknown>> }
+        syncAll = (states.results || []).map((s) => ({
+            page_id: String(s.page_id || '').trim(),
+            page_name: String(s.page_name || '').trim(),
+            fully_scanned: Number(s.fully_scanned || 0) > 0,
+            last_synced_at: String(s.last_synced_at || '').trim(),
+            last_full_scan_at: String(s.last_full_scan_at || '').trim(),
+            total_cached: Number(s.total_cached || 0),
+            last_error: String(s.last_error || '').trim(),
+        }))
+    }
+
+    return c.json({
+        ok: true,
+        namespace_id: namespaceId,
+        page_id: pageId || null,
+        data_source: FACEBOOK_PAGE_POSTS_SOURCE,
+        total,
+        items,
+        sync,
+        sync_all: syncAll,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Sync ONE page: walk a bounded number of cursor pages, persist after every Graph
+// page, and report pending_more so the caller can resume until fully_scanned.
+app.post('/api/dashboard/facebook-page-posts/sync-page', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        page_name?: string
+        namespace_id?: string
+        reset?: boolean
+        limit?: number
+        batches?: number
+    }
+    const pageId = String(body.page_id || c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400, { 'Cache-Control': 'no-store' })
+    const namespaceId = String(body.namespace_id || c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    const pageName = String(body.page_name || c.req.query('page_name') || '').trim()
+    const reset = body.reset === true || c.req.query('reset') === '1'
+    const limit = normalizeFacebookPagePostsGraphLimit(body.limit ?? c.req.query('limit'))
+    const batches = normalizeFacebookPagePostsBatches(body.batches ?? c.req.query('batches'))
+
+    const result = await runFacebookPagePostsSyncPass(c.env.DB, { namespaceId, pageId, pageName, reset, limit, batches })
+    return c.json({ ...result, edge: FACEBOOK_PAGE_POSTS_EDGE, graph_limit: limit, batches }, result.error ? 502 : 200, { 'Cache-Control': 'no-store' })
+})
+
+// Sync ALL configured pages in the namespace, advancing a few pages per call.
+// Prioritizes pages that still have work (not fully scanned) and aggregates
+// pending_more so the caller keeps invoking until the whole namespace is done.
+app.post('/api/dashboard/facebook-page-posts/sync-all', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+
+    const body = await c.req.json().catch(() => ({})) as {
+        namespace_id?: string
+        pages_limit?: number
+        limit?: number
+        batches_per_page?: number
+        reset?: boolean
+    }
+    const namespaceId = String(body.namespace_id || c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400, { 'Cache-Control': 'no-store' })
+    const pagesLimit = normalizeFacebookPagePostsSyncAllPages(body.pages_limit ?? c.req.query('pages_limit'))
+    const limit = normalizeFacebookPagePostsGraphLimit(body.limit ?? c.req.query('limit'))
+    const batchesPerPage = normalizeFacebookPagePostsBatches(
+        body.batches_per_page ?? c.req.query('batches_per_page') ?? FACEBOOK_PAGE_POSTS_SYNC_ALL_DEFAULT_BATCHES_PER_PAGE,
+    )
+    const reset = body.reset === true || c.req.query('reset') === '1'
+
+    await ensureFacebookPagePostCacheTables(c.env.DB)
+
+    // Source the page list the same way the dashboard page-sources endpoint does:
+    // every page in the namespace, active first.
+    const pageRows = await c.env.DB.prepare(
+        `SELECT id, name FROM pages WHERE bot_id = ?
+         ORDER BY CASE WHEN is_active = 1 THEN 0 ELSE 1 END, name COLLATE NOCASE ASC`
+    ).bind(namespaceId).all() as { results?: Array<{ id?: string; name?: string }> }
+    const allPages = (pageRows.results || [])
+        .map((r) => ({ id: String(r.id || '').trim(), name: String(r.name || '').trim() }))
+        .filter((p) => p.id)
+
+    // Which pages still need work? On reset, everyone; otherwise pages not yet
+    // fully scanned (no state row counts as "needs work").
+    const states = await c.env.DB.prepare(
+        `SELECT page_id, fully_scanned FROM facebook_page_post_sync_state WHERE namespace_id = ?`
+    ).bind(namespaceId).all() as { results?: Array<{ page_id?: string; fully_scanned?: number }> }
+    const scannedSet = new Set<string>()
+    for (const s of (states.results || [])) {
+        if (Number(s.fully_scanned || 0) > 0) scannedSet.add(String(s.page_id || '').trim())
+    }
+    const pending = reset ? allPages : allPages.filter((p) => !scannedSet.has(p.id))
+    const toProcess = pending.slice(0, pagesLimit)
+
+    const results: Array<Record<string, unknown>> = []
+    for (const page of toProcess) {
+        const res = await runFacebookPagePostsSyncPass(c.env.DB, {
+            namespaceId, pageId: page.id, pageName: page.name, reset, limit, batches: batchesPerPage,
+        })
+        results.push(res)
+    }
+
+    // More work remains if any processed page still has a cursor/error, OR there
+    // are pending pages we did not reach this call.
+    const pendingMore = results.some((r) => r.pending_more) || pending.length > toProcess.length
+    return c.json({
+        ok: results.every((r) => r.ok !== false) || results.length === 0,
+        namespace_id: namespaceId,
+        edge: FACEBOOK_PAGE_POSTS_EDGE,
+        graph_limit: limit,
+        batches_per_page: batchesPerPage,
+        total_pages: allPages.length,
+        pending_pages: pending.length,
+        processed_pages: toProcess.length,
+        pending_more: pendingMore,
+        results,
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
