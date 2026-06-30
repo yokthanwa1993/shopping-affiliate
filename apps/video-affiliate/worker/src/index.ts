@@ -3928,15 +3928,28 @@ async function fetchFacebookPagePostsBatchFromToken(
         access_token: cleanToken,
     })
     if (after) params.set('after', after)
-    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(pageId)}/${FACEBOOK_PAGE_POSTS_EDGE}?${params.toString()}`
-    let response: Response
-    try {
-        response = await fetch(url)
-    } catch (e) {
-        throw new Error(sanitizeFacebookPagePostsError(e instanceof Error ? e.message : String(e), cleanToken) || 'facebook_graph_fetch_failed')
+    async function fetchEdge(edge: string): Promise<{ response: Response; body: string }> {
+        const edgeUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(pageId)}/${edge}?${params.toString()}`
+        try {
+            const response = await fetch(edgeUrl)
+            const body = response.ok ? '' : await response.text().catch(() => '')
+            return { response, body }
+        } catch (e) {
+            throw new Error(sanitizeFacebookPagePostsError(e instanceof Error ? e.message : String(e), cleanToken) || 'facebook_graph_fetch_failed')
+        }
+    }
+
+    let { response, body: errorBody } = await fetchEdge(FACEBOOK_PAGE_POSTS_EDGE)
+    if (!response.ok && response.status === 400 && /Permission Denied|\"code\"\s*:\s*10/.test(errorBody)) {
+        // `published_posts` is ideal for owned Pages, but some valid read tokens only
+        // allow the public /posts edge (the same cursor model). Fall back once so
+        // the inventory does not stay empty with Permission Denied. Tokens remain
+        // query-only and sanitized from stored errors.
+        const fallback = await fetchEdge('posts')
+        response = fallback.response
+        errorBody = fallback.body
     }
     if (!response.ok) {
-        const errorBody = await response.text().catch(() => '')
         const raw = `facebook_graph_http_${response.status}${errorBody ? `:${errorBody.slice(0, 160)}` : ''}`
         throw new Error(sanitizeFacebookPagePostsError(raw, cleanToken))
     }
