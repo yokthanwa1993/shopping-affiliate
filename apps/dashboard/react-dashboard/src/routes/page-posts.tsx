@@ -4,7 +4,6 @@ import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import {
   externalVideoUrl,
   fetchPageVideos,
-  systemVideoDownloadUrl,
   systemVideoThumbUrl,
   type PageVideoItem,
 } from '@/api/pagePosts'
@@ -102,8 +101,7 @@ function PostCard({ item }: { item: PageVideoItem }) {
   const timestamp = item.postedAt || item.createdAt
   const assetStatus = item.assetLibrary?.status ?? null
   const pageName = (item.pageName || '').trim()
-  const sysUrl = systemVideoDownloadUrl(item)
-  const extUrl = sysUrl ? null : externalVideoUrl(item)
+  const openUrl = (item.postUrl || '').trim() || externalVideoUrl(item)
 
   return (
     <article className="flex flex-col overflow-hidden rounded-xl border bg-card shadow-sm transition hover:border-primary/40 hover:shadow-md">
@@ -142,34 +140,22 @@ function PostCard({ item }: { item: PageVideoItem }) {
               Shopee ↗
             </a>
           ) : null}
-          {sysUrl ? (
-            // download=1 forces the worker's attachment streaming (shouldForceAttachment).
+          {openUrl ? (
             <a
-              href={sysUrl}
-              download
+              href={openUrl}
               target="_blank"
               rel="noreferrer"
-              aria-label="ดาวน์โหลดวิดีโอระบบ"
+              aria-label="เปิดโพสต์บน Facebook"
               className="rounded bg-primary/10 px-2 py-1 font-semibold text-primary hover:bg-primary/20"
             >
-              ดาวน์โหลด ↓
-            </a>
-          ) : extUrl ? (
-            <a
-              href={extUrl}
-              target="_blank"
-              rel="noreferrer"
-              aria-label="เปิดวิดีโอภายนอก"
-              className="rounded bg-muted px-2 py-1 font-semibold text-foreground hover:bg-accent"
-            >
-              เปิดวิดีโอ ↗
+              เปิดโพสต์ ↗
             </a>
           ) : (
             <span
               className="rounded px-2 py-1 text-muted-foreground"
-              title="ไม่มีวิดีโอระบบที่ match กับโพสต์นี้"
+              title="ไม่มีลิงก์ Facebook สำหรับโพสต์นี้"
             >
-              ไม่มีวิดีโอ
+              ไม่มีลิงก์
             </span>
           )}
         </div>
@@ -295,7 +281,7 @@ export function PagePostsPage() {
   return (
     <div className="mx-auto max-w-6xl space-y-6">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">โพสต์เพจ</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Posts</h1>
         <p className="text-sm text-muted-foreground">
           คลิปยอดวิว ≥ {formatCompactViews(minViews)} จากเพจในเวิร์กสเปซ — แสดงจากแคชเพื่อความรวดเร็ว
         </p>

@@ -90,7 +90,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
     items: [
       { to: '/create-post', label: 'สร้างโพสต์', sublabel: 'Create Post', icon: PenSquare, exact: false },
       { to: '/create-ads', label: 'สร้างแอด', sublabel: 'Create Ads', icon: Users, exact: false },
-      { to: '/page-posts', label: 'โพสต์เพจ', sublabel: 'Page Posts', icon: Facebook, exact: false },
+      { to: '/posts', label: 'Posts', sublabel: 'All Posts', icon: Facebook, exact: false },
     ],
   },
   {

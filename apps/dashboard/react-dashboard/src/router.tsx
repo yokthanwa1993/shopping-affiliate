@@ -78,9 +78,21 @@ const galleryRoute = page('/gallery', RedirectToMedia)
 const exploreRoute = page('/explore', ExplorePage)
 // Processing is folded into Media cards; keep the old URL as a redirect.
 const processingRoute = page('/processing', RedirectToMedia)
-const pagePostsRoute = page('/page-posts', PagePostsPage)
-// Production nav links to /page_posts (underscore); keep it as an alias.
-const pagePostsAliasRoute = page('/page_posts', PagePostsPage)
+const postsRoute = page('/posts', PagePostsPage)
+
+function RedirectToPosts() {
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const prefix = basepath === '/' ? '' : basepath
+    window.location.replace(`${prefix}/posts${window.location.search}${window.location.hash}`)
+  }, [])
+  return <PagePostsPage />
+}
+
+// Legacy aliases: keep old bookmarks working but move the browser to /dashboard/posts.
+const pagePostsRoute = page('/page-posts', RedirectToPosts)
+// Production used /page_posts (underscore); keep it as a redirect alias.
+const pagePostsAliasRoute = page('/page_posts', RedirectToPosts)
 const customLinkRoute = page('/custom-link', CustomLinkPage)
 const campaignsRoute = page('/campaigns', CampaignsPage)
 const createPostRoute = page('/create-post', CreatePostPage)
@@ -104,6 +116,7 @@ const routeTree = rootRoute.addChildren([
   aiClipsRoute,
   exploreRoute,
   processingRoute,
+  postsRoute,
   pagePostsRoute,
   pagePostsAliasRoute,
   customLinkRoute,
