@@ -11,6 +11,7 @@
 // Worker wires a real fetch + D1 persistence on top.
 
 import { extractPagePostInventoryGraphCursor } from './page-post-inventory.js'
+import { extractUrlsFromText, isCustomlinkLink, isShopeeLink } from './comment-link-registry.js'
 
 // Per-request Graph page size. This is the number of posts fetched per cursor
 // page — NOT a cap on the total number of posts captured for a Page.
@@ -134,6 +135,116 @@ export function sanitizeFacebookPagePostsError(message: unknown, token?: unknown
     // Generic long bearer-ish blobs (EAAB..., EAAD6V...) just in case.
     out = out.replace(/\bEAA[A-Za-z0-9]{12,}\b/g, '[redacted]')
     return out.slice(0, 300)
+}
+
+// ---------------------------------------------------------------------------
+// Page-owned comment link enrichment (pure helpers).
+//
+// Many Page posts/Reels carry their Shopee/custom affiliate link in a comment
+// the Page itself posted. These network-free helpers turn a live Graph
+// /{post}/comments read into the link + evidence we attach to a cache row. The
+// Worker owns the bounded, resumable Graph reads; every decision that can be made
+// from strings alone lives here so it is unit-testable without any I/O.
+// ---------------------------------------------------------------------------
+
+export type FacebookPageCommentLite = {
+    id: string
+    message: string
+    fromId: string
+    fromName: string
+}
+
+export type PageCommentLinkEvidence = {
+    page_comment_id: string
+    page_comment_message: string
+    shopee_url: string
+    page_comment_url: string
+}
+
+export const EMPTY_PAGE_COMMENT_LINK_EVIDENCE: PageCommentLinkEvidence = {
+    page_comment_id: '', page_comment_message: '', shopee_url: '', page_comment_url: '',
+}
+
+// A comment counts as Page-owned when its author id matches the page id. Some
+// read tokens omit `from.id` but include `from.name`; ONLY then do we fall back
+// to a name match, so we never mis-attribute an ordinary user comment to the
+// Page just because the name happens to collide.
+export function isPageOwnedComment(comment: FacebookPageCommentLite | null | undefined, ctx: { pageId: string; pageName?: string }): boolean {
+    const fromId = clean(comment?.fromId)
+    const pageId = clean(ctx.pageId)
+    if (fromId) return !!pageId && fromId === pageId
+    const fromName = clean(comment?.fromName)
+    const pageName = clean(ctx.pageName)
+    return !!pageName && !!fromName && fromName === pageName
+}
+
+// Affiliate links we attach to a post card: Shopee (shopee.co.th / s.shopee.co.th
+// / shp.ee) or the customlink.wwoom.com wrapper. Other shortlinks are ignored
+// here on purpose — this is the narrow set the dashboard surfaces.
+export function isPageCommentAffiliateUrl(url: string): boolean {
+    return isShopeeLink(url) || isCustomlinkLink(url)
+}
+
+// Pick the single affiliate URL from one comment message. customlink wrapper wins
+// (it is the managed link), else the first Shopee link. Trailing punctuation is
+// already stripped by extractUrlsFromText.
+export function pickCommentShopeeUrl(message: string): string {
+    const urls = extractUrlsFromText(String(message || ''))
+    return urls.find(isCustomlinkLink) || urls.find(isShopeeLink) || ''
+}
+
+// Best-effort permalink to the specific comment, built from the post permalink +
+// the Graph comment id (`<post>_<comment>`). Returns '' when the post permalink
+// is missing/not http(s) or the comment id is empty.
+export function buildPageCommentPermalink(permalinkUrl: unknown, commentId: unknown): string {
+    const permalink = clean(permalinkUrl)
+    const id = clean(commentId)
+    if (!id || !/^https?:\/\//i.test(permalink)) return ''
+    const tail = id.includes('_') ? id.slice(id.lastIndexOf('_') + 1) : id
+    if (!tail) return ''
+    const sep = permalink.includes('?') ? '&' : '?'
+    return `${permalink}${sep}comment_id=${encodeURIComponent(tail)}`
+}
+
+// Walk Page-owned comments (in Graph order) and return the first affiliate link
+// found, with the owning comment as evidence. Returns the empty evidence when no
+// Page-owned comment carries a Shopee/custom link.
+export function extractPageCommentLinkEvidence(
+    comments: ReadonlyArray<FacebookPageCommentLite>,
+    ctx: { pageId: string; pageName?: string; permalinkUrl?: string },
+): PageCommentLinkEvidence {
+    const list = Array.isArray(comments) ? comments : []
+    for (const comment of list) {
+        if (!isPageOwnedComment(comment, ctx)) continue
+        const url = pickCommentShopeeUrl(comment.message)
+        if (!url) continue
+        const commentId = clean(comment.id)
+        return {
+            page_comment_id: commentId,
+            page_comment_message: clean(comment.message).slice(0, 1000),
+            shopee_url: url,
+            page_comment_url: buildPageCommentPermalink(ctx.permalinkUrl, commentId),
+        }
+    }
+    return { ...EMPTY_PAGE_COMMENT_LINK_EVIDENCE }
+}
+
+// Graph rate/limit error codes. 368 = temporarily blocked, 4/17/32 = app/user
+// rate limits, 613 = calls-per-hour. The enrich batch stops early (rather than
+// continuing per row) when it sees one of these, so it never hammers Graph.
+export function isFacebookRateLimitCode(code: unknown): boolean {
+    const n = Number(code)
+    return n === 368 || n === 4 || n === 17 || n === 32 || n === 613
+}
+
+// Bounds for the bounded, resumable comment-link enrichment batch.
+export const FACEBOOK_PAGE_POSTS_COMMENT_LINK_DEFAULT_LIMIT = 25
+export const FACEBOOK_PAGE_POSTS_COMMENT_LINK_MAX_LIMIT = 100
+
+export function normalizeFacebookPagePostsCommentLinkLimit(value: unknown): number {
+    const n = Number(value)
+    if (!Number.isFinite(n)) return FACEBOOK_PAGE_POSTS_COMMENT_LINK_DEFAULT_LIMIT
+    return Math.min(FACEBOOK_PAGE_POSTS_COMMENT_LINK_MAX_LIMIT, Math.max(1, Math.floor(n)))
 }
 
 // Build the Graph attachment-derived media facets for a post. Best-effort: source
@@ -323,10 +434,28 @@ export const FACEBOOK_PAGE_POST_CACHE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fa
     comments_count INTEGER NOT NULL DEFAULT 0,
     shares_count INTEGER NOT NULL DEFAULT 0,
     raw_json TEXT NOT NULL DEFAULT '',
+    page_comment_id TEXT NOT NULL DEFAULT '',
+    page_comment_message TEXT NOT NULL DEFAULT '',
+    shopee_url TEXT NOT NULL DEFAULT '',
+    page_comment_url TEXT NOT NULL DEFAULT '',
+    comment_link_checked_at TEXT NOT NULL DEFAULT '',
+    comment_link_error TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (namespace_id, page_id, post_id)
 )`
+
+// Columns added after the cache table shipped. Applied as idempotent ALTERs at
+// runtime (see ensureFacebookPagePostCacheTables) so existing D1 databases gain
+// the comment-link enrichment fields without a migration file.
+export const FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS: ReadonlyArray<string> = [
+    'page_comment_id',
+    'page_comment_message',
+    'shopee_url',
+    'page_comment_url',
+    'comment_link_checked_at',
+    'comment_link_error',
+]
 
 export const FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL = `CREATE INDEX IF NOT EXISTS idx_fb_page_post_cache_ns_page_created
 ON facebook_page_post_cache(namespace_id, page_id, created_time DESC)`

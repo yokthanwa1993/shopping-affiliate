@@ -293,6 +293,7 @@ import {
     FACEBOOK_PAGE_POSTS_FIELDS,
     FACEBOOK_PAGE_POSTS_SOURCE,
     FACEBOOK_PAGE_POSTS_SYNC_ALL_DEFAULT_BATCHES_PER_PAGE,
+    FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS,
     FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL,
     FACEBOOK_PAGE_POST_CACHE_MEDIA_INDEX_SQL,
     FACEBOOK_PAGE_POST_CACHE_TABLE_SQL,
@@ -300,7 +301,10 @@ import {
     type FacebookPagePostCacheRow,
     type FacebookPagePostsGraphBatch,
     crawlFacebookPagePosts,
+    extractPageCommentLinkEvidence,
+    isFacebookRateLimitCode,
     normalizeFacebookPagePostsBatches,
+    normalizeFacebookPagePostsCommentLinkLimit,
     normalizeFacebookPagePostsGraphLimit,
     normalizeFacebookPagePostsOffset,
     normalizeFacebookPagePostsReadLimit,
@@ -3905,6 +3909,11 @@ async function ensureFacebookPagePostCacheTables(db: D1Database): Promise<void> 
         facebookPagePostCacheTablesReady = (async () => {
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_TABLE_SQL).run()
             await db.prepare("ALTER TABLE facebook_page_post_cache ADD COLUMN views INTEGER NOT NULL DEFAULT 0").run().catch(() => { })
+            // Page-owned comment link enrichment columns. Idempotent: existing DBs
+            // gain them here; fresh DBs already have them from the CREATE TABLE SQL.
+            for (const col of FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS) {
+                await db.prepare(`ALTER TABLE facebook_page_post_cache ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`).run().catch(() => { })
+            }
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_CREATED_INDEX_SQL).run().catch(() => { })
             await db.prepare(FACEBOOK_PAGE_POST_CACHE_MEDIA_INDEX_SQL).run().catch(() => { })
             await db.prepare(FACEBOOK_PAGE_POST_SYNC_STATE_TABLE_SQL).run()
@@ -4113,7 +4122,8 @@ async function listFacebookPagePostCache(db: D1Database, opts: {
     const res = await db.prepare(
         `SELECT namespace_id, page_id, page_name, post_id, video_id, message, permalink_url,
                 picture, source_url, media_type, created_time, views, reactions_count, comments_count,
-                shares_count, fetched_at, updated_at
+                shares_count, page_comment_id, page_comment_message, shopee_url, page_comment_url,
+                comment_link_checked_at, comment_link_error, fetched_at, updated_at
          FROM facebook_page_post_cache
          WHERE ${where.join(' AND ')}
          ORDER BY ${orderBy}
@@ -4219,6 +4229,187 @@ async function runFacebookPagePostsSyncPass(
         pending_more: result.pending_more,
         total_cached: totalCached,
         error: result.error || null,
+    }
+}
+
+// Count cached posts whose Page-owned comment link has not been resolved yet.
+// "Not enriched" = comment_link_checked_at is still empty. Drives has_more so the
+// caller keeps invoking the bounded enrich endpoint until the page is drained.
+async function countFacebookPagePostsNeedingCommentLink(
+    db: D1Database,
+    opts: { namespaceId: string; pageId?: string },
+): Promise<number> {
+    await ensureFacebookPagePostCacheTables(db)
+    const where: string[] = ['namespace_id = ?']
+    const binds: unknown[] = [opts.namespaceId]
+    const pageId = String(opts.pageId || '').trim()
+    if (pageId) { where.push('page_id = ?'); binds.push(pageId) }
+    where.push("comment_link_checked_at = ''")
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS c FROM facebook_page_post_cache WHERE ${where.join(' AND ')}`
+    ).bind(...binds).first() as { c?: number } | null
+    return Number(row?.c || 0)
+}
+
+// Select a bounded batch of cached posts to resolve comment links for. Default:
+// only rows never checked. With recheck=true, also re-pick rows whose last check
+// recorded a (sanitized) error, so a transient Graph/rate-limit failure can be
+// retried without re-scanning the whole page.
+async function selectFacebookPagePostsNeedingCommentLink(
+    db: D1Database,
+    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean },
+): Promise<Array<{ page_id: string; post_id: string; page_name: string; permalink_url: string }>> {
+    await ensureFacebookPagePostCacheTables(db)
+    const where: string[] = ['namespace_id = ?']
+    const binds: unknown[] = [opts.namespaceId]
+    const pageId = String(opts.pageId || '').trim()
+    if (pageId) { where.push('page_id = ?'); binds.push(pageId) }
+    where.push(opts.recheck
+        ? "(comment_link_checked_at = '' OR comment_link_error != '')"
+        : "comment_link_checked_at = ''")
+    const res = await db.prepare(
+        `SELECT page_id, post_id, page_name, permalink_url
+         FROM facebook_page_post_cache
+         WHERE ${where.join(' AND ')}
+         ORDER BY datetime(created_time) DESC, post_id DESC
+         LIMIT ?`
+    ).bind(...binds, Math.max(1, opts.limit)).all() as { results?: Array<Record<string, unknown>> }
+    return (res.results || []).map((r) => ({
+        page_id: String(r.page_id || '').trim(),
+        post_id: String(r.post_id || '').trim(),
+        page_name: String(r.page_name || '').trim(),
+        permalink_url: String(r.permalink_url || '').trim(),
+    }))
+}
+
+// Persist a resolved comment link onto a cache row. Always stamps
+// comment_link_checked_at so the row is not re-picked by the default batch.
+async function updateFacebookPagePostCommentLink(
+    db: D1Database,
+    key: { namespaceId: string; pageId: string; postId: string },
+    fields: { page_comment_id: string; page_comment_message: string; shopee_url: string; page_comment_url: string; checkedAt: string },
+): Promise<void> {
+    await db.prepare(
+        `UPDATE facebook_page_post_cache
+         SET page_comment_id = ?, page_comment_message = ?, shopee_url = ?, page_comment_url = ?,
+             comment_link_error = '', comment_link_checked_at = ?, updated_at = datetime('now')
+         WHERE namespace_id = ? AND page_id = ? AND post_id = ?`
+    ).bind(
+        fields.page_comment_id, fields.page_comment_message, fields.shopee_url, fields.page_comment_url,
+        fields.checkedAt, key.namespaceId, key.pageId, key.postId,
+    ).run()
+}
+
+// Record a sanitized failure for a row WITHOUT clobbering any previously found
+// link. Stamps comment_link_checked_at so the default batch advances; recheck=true
+// can re-pick it later.
+async function recordFacebookPagePostCommentLinkError(
+    db: D1Database,
+    key: { namespaceId: string; pageId: string; postId: string },
+    fields: { error: string; checkedAt: string },
+): Promise<void> {
+    await db.prepare(
+        `UPDATE facebook_page_post_cache
+         SET comment_link_error = ?, comment_link_checked_at = ?, updated_at = datetime('now')
+         WHERE namespace_id = ? AND page_id = ? AND post_id = ?`
+    ).bind(fields.error, fields.checkedAt, key.namespaceId, key.pageId, key.postId).run()
+}
+
+// One bounded, resumable pass that resolves Page-owned comment links for a batch
+// of cached posts. Official Graph only (one /{post}/comments read per row). Fails
+// soft per row; stops early on a rate-limit code so it never hammers Graph. Safe
+// to call repeatedly — it only touches rows not yet enriched (or error rows on
+// recheck) and persists progress on every row.
+async function runFacebookPagePostsCommentLinkEnrich(
+    db: D1Database,
+    opts: { namespaceId: string; pageId?: string; limit: number; recheck?: boolean },
+): Promise<{
+    ok: boolean
+    namespace_id: string
+    page_id: string | null
+    processed: number
+    found: number
+    skipped: number
+    errors: number
+    has_more: boolean
+    remaining: number
+    stopped: string | null
+    error: string | null
+}> {
+    const namespaceId = opts.namespaceId
+    const pageId = String(opts.pageId || '').trim()
+    // Token resolved per-page (memoized) so namespace-wide mode uses each page's
+    // own sync token rather than one page's token for everyone. Single-page mode
+    // resolves exactly one. Empty string = "no token for this page" (cached so we
+    // don't re-resolve a missing token every row).
+    const tokenByPage = new Map<string, string>()
+    async function tokenFor(pid: string): Promise<string> {
+        const key = String(pid || '').trim() || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
+        if (tokenByPage.has(key)) return tokenByPage.get(key)!
+        const tok = await resolveFacebookSyncToken(db, key, namespaceId)
+        tokenByPage.set(key, tok || '')
+        return tok || ''
+    }
+
+    // Single-page mode with no token at all is a hard, reportable failure.
+    if (pageId && !(await tokenFor(pageId))) {
+        return {
+            ok: false, namespace_id: namespaceId, page_id: pageId,
+            processed: 0, found: 0, skipped: 0, errors: 0,
+            has_more: true, remaining: await countFacebookPagePostsNeedingCommentLink(db, { namespaceId, pageId }),
+            stopped: null, error: 'facebook_sync_token_missing',
+        }
+    }
+
+    const rows = await selectFacebookPagePostsNeedingCommentLink(db, { namespaceId, pageId, limit: opts.limit, recheck: opts.recheck })
+    let processed = 0
+    let found = 0
+    let skipped = 0
+    let errors = 0
+    let stopped: string | null = null
+
+    for (const row of rows) {
+        const nowIso = new Date().toISOString()
+        const key = { namespaceId, pageId: row.page_id, postId: row.post_id }
+        processed++
+        // A page with no resolvable token fails soft for this row (recorded, never
+        // throws) so namespace-wide mode keeps draining the pages that do have one.
+        const token = await tokenFor(row.page_id)
+        if (!token) {
+            errors++
+            await recordFacebookPagePostCommentLinkError(db, key, { error: 'facebook_sync_token_missing', checkedAt: nowIso }).catch(() => { })
+            continue
+        }
+        // The cache post_id is the canonical <page_id>_<post_id> page-story object,
+        // which is the correct /comments target — no extra resolution needed.
+        const fetched = await fetchPageCommentsLive(row.post_id, token)
+        if (!fetched.ok) {
+            const errObj = (fetched.error || {}) as { code?: unknown; message?: unknown }
+            const code = errObj.code
+            const sanitized = sanitizeFacebookPagePostsError(
+                `facebook_comment_fetch_failed:${String(errObj.message || 'comment_fetch_failed')}${code != null ? `:${code}` : ''}`,
+                token,
+            )
+            errors++
+            await recordFacebookPagePostCommentLinkError(db, key, { error: sanitized, checkedAt: nowIso }).catch(() => { })
+            if (isFacebookRateLimitCode(code)) { stopped = 'facebook_rate_limited'; break }
+            continue
+        }
+        const evidence = extractPageCommentLinkEvidence(fetched.comments, {
+            pageId: row.page_id,
+            pageName: row.page_name,
+            permalinkUrl: row.permalink_url,
+        })
+        await updateFacebookPagePostCommentLink(db, key, { ...evidence, checkedAt: nowIso }).catch(() => { })
+        if (evidence.shopee_url) found++
+        else skipped++
+    }
+
+    const remaining = await countFacebookPagePostsNeedingCommentLink(db, { namespaceId, pageId })
+    return {
+        ok: true, namespace_id: namespaceId, page_id: pageId || null,
+        processed, found, skipped, errors,
+        has_more: remaining > 0, remaining, stopped, error: null,
     }
 }
 
@@ -13064,6 +13255,35 @@ app.post('/api/dashboard/facebook-page-posts/sync-all', async (c) => {
         pending_more: pendingMore,
         results,
     }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Enrich a bounded batch of cached posts with the Page-owned comment's
+// Shopee/custom affiliate link. Official Graph only (one /{post}/comments read
+// per row). Incremental + resumable: it only touches rows not yet checked (or
+// error rows when recheck=1), persists progress per row, and reports has_more so
+// the caller keeps invoking until the page is drained — never the whole inventory
+// at once. Default page = the gallery page (เฉียบ); pass page_id='' for the whole
+// namespace. Same dashboard auth session as the sync endpoints.
+app.post('/api/dashboard/facebook-page-posts/enrich-comment-links', async (c) => {
+    const auth = await requireAuthSession(c)
+    if (!auth.ok) return auth.response
+
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        namespace_id?: string
+        limit?: number
+        recheck?: boolean
+    }
+    // page_id absent → default to the gallery page; an explicit '' means the whole
+    // namespace (every page's cached posts).
+    const rawPage = body.page_id ?? c.req.query('page_id')
+    const pageId = rawPage === undefined ? DASHBOARD_FACEBOOK_GALLERY_PAGE_ID : String(rawPage).trim()
+    const namespaceId = String(body.namespace_id || c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    const limit = normalizeFacebookPagePostsCommentLinkLimit(body.limit ?? c.req.query('limit'))
+    const recheck = body.recheck === true || c.req.query('recheck') === '1'
+
+    const result = await runFacebookPagePostsCommentLinkEnrich(c.env.DB, { namespaceId, pageId, limit, recheck })
+    return c.json({ ...result, limit }, result.error ? 502 : 200, { 'Cache-Control': 'no-store' })
 })
 
 // Refresh view counts for ALL cached videos in one shot.

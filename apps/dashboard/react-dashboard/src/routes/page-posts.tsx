@@ -2,11 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  enrichPagePostCommentLinks,
   fetchPagePosts,
+  pagePostCommentShopeeLink,
   pagePostPermalink,
   pagePostThumb,
   syncPagePosts,
   PAGE_POST_CACHE_SOURCE,
+  type EnrichCommentLinksResult,
   type PagePostItem,
   type PagePostSync,
   type SyncPagePostsResult,
@@ -82,40 +85,60 @@ function PostCard({ item }: { item: PagePostItem }) {
   const pageName = (item.page_name || '').trim()
   const mediaType = (item.media_type || '').trim()
   const openUrl = pagePostPermalink(item)
+  // Shopee/custom affiliate link found in the Page's own comment (if enriched).
+  const shopeeUrl = pagePostCommentShopeeLink(item)
   const dateLabel = formatThaiDateTime(item.created_time)
   const views = Number(item.views || 0)
   const engagement = Number(item.reactions_count || 0) + Number(item.comments_count || 0) + Number(item.shares_count || 0)
   const Wrapper = openUrl ? 'a' : 'article'
 
+  // The Shopee badge is a sibling anchor (not nested in the post link — nested
+  // anchors are invalid HTML), so it stays clickable while the card opens the FB
+  // post. Keeps the 9:16 media-card visual style intact.
   return (
-    <Wrapper
-      {...(openUrl ? { href: openUrl, target: '_blank', rel: 'noreferrer' } : {})}
-      aria-label={openUrl ? `เปิดโพสต์บน Facebook ${caption}` : undefined}
-      className="relative block aspect-[9/16] w-full overflow-hidden rounded-2xl bg-muted text-left shadow-sm transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
-    >
-      <PostCover item={item} />
-      {pageName ? (
-        <span className="absolute left-2 top-2 max-w-[58%] truncate rounded-full bg-black/65 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
-          {pageName}
-        </span>
-      ) : null}
-      {views > 0 ? (
-        <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดวิว">
-          ▶ {formatCompactViews(views)}
-        </span>
-      ) : engagement > 0 ? (
-        <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดนิยม">
-          ❤ {formatCompactViews(engagement)}
-        </span>
-      ) : null}
-      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
-        <p className="truncate text-[11px] font-extrabold" title={caption}>{caption}</p>
-        <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-white/75">
-          <span className="truncate">{dateLabel || '—'}</span>
-          {mediaType ? <span className="shrink-0 uppercase">{mediaType}</span> : null}
+    <div className="relative aspect-[9/16] w-full overflow-hidden rounded-2xl bg-muted shadow-sm">
+      <Wrapper
+        {...(openUrl ? { href: openUrl, target: '_blank', rel: 'noreferrer' } : {})}
+        aria-label={openUrl ? `เปิดโพสต์บน Facebook ${caption}` : undefined}
+        className="absolute inset-0 block text-left transition hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
+      >
+        <PostCover item={item} />
+        {pageName ? (
+          <span className="absolute left-2 top-2 max-w-[58%] truncate rounded-full bg-black/65 px-2 py-1 text-[10px] font-bold text-white shadow-lg backdrop-blur-sm">
+            {pageName}
+          </span>
+        ) : null}
+        {views > 0 ? (
+          <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดวิว">
+            ▶ {formatCompactViews(views)}
+          </span>
+        ) : engagement > 0 ? (
+          <span className="absolute right-2 top-2 rounded-full bg-black/75 px-2 py-1 text-[10px] font-bold tabular-nums text-white shadow-lg backdrop-blur-sm" title="ยอดนิยม">
+            ❤ {formatCompactViews(engagement)}
+          </span>
+        ) : null}
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
+          <p className="truncate text-[11px] font-extrabold" title={caption}>{caption}</p>
+          <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-white/75">
+            <span className="truncate">{dateLabel || '—'}</span>
+            {mediaType ? <span className="shrink-0 uppercase">{mediaType}</span> : null}
+          </div>
         </div>
-      </div>
-    </Wrapper>
+      </Wrapper>
+      {shopeeUrl ? (
+        <a
+          href={shopeeUrl}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          title="ลิงก์ Shopee/คัสตอมจากคอมเมนต์ของเพจ"
+          aria-label="เปิดลิงก์ Shopee จากคอมเมนต์ของเพจ"
+          className="absolute bottom-12 right-2 z-10 inline-flex items-center gap-1 rounded-full bg-[#ee4d2d] px-2 py-1 text-[10px] font-bold text-white shadow-lg ring-1 ring-white/30 backdrop-blur-sm transition hover:bg-[#d8431f] active:scale-95"
+        >
+          🛒 ลิงก์
+        </a>
+      ) : null}
+    </div>
   )
 }
 
@@ -250,6 +273,27 @@ export function PagePostsPage() {
     onError: (err) => setSyncNote(err instanceof Error ? err.message : 'ดึงไม่สำเร็จ'),
   })
 
+  // One click = one bounded comment-link enrichment batch. The worker only checks
+  // rows not yet enriched and reports has_more, so re-clicking drains the page
+  // without ever hammering Graph. All-pages scope enriches the whole namespace.
+  const enrichMutation = useMutation<EnrichCommentLinksResult, Error, void>({
+    mutationFn: async () =>
+      enrichPagePostCommentLinks(scope === ALL_PAGES ? { pageId: '' } : { pageId: scope }),
+    onSuccess: (res) => {
+      if (res.error) {
+        setSyncNote(`ดึงลิงก์ไม่สำเร็จ: ${res.error}`)
+        return
+      }
+      const remaining = Number(res.remaining || 0)
+      const more = res.has_more ? ` — เหลือ ${remaining.toLocaleString()} โพสต์ กด “ดึงลิงก์” อีกครั้ง` : ' — ครบแล้ว'
+      const stopped = res.stopped ? ` (หยุดชั่วคราว: ${res.stopped})` : ''
+      const errNote = Number(res.errors || 0) > 0 ? ` ผิดพลาด ${res.errors}` : ''
+      setSyncNote(`ดึงลิงก์คอมเมนต์: ตรวจ ${res.processed ?? 0} พบลิงก์ ${res.found ?? 0}${errNote}${stopped}${more}`)
+      void queryClient.invalidateQueries({ queryKey: ['page-posts'] })
+    },
+    onError: (err) => setSyncNote(err instanceof Error ? err.message : 'ดึงลิงก์ไม่สำเร็จ'),
+  })
+
   function commitLimit() {
     setLimit(Math.min(Math.max(Number(limitInput) || DEFAULT_BATCH, 1), 250))
   }
@@ -359,6 +403,16 @@ export function PagePostsPage() {
                   {syncMutation.isPending ? 'กำลังดึง…' : 'ดึงต่อ'}
                 </Button>
               ) : null}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => enrichMutation.mutate()}
+                disabled={enrichMutation.isPending}
+                title="ดึงลิงก์ Shopee/คัสตอมจากคอมเมนต์ของเพจ (ทีละชุด ปลอดภัยต่อ Graph)"
+                className="h-10 rounded-xl"
+              >
+                {enrichMutation.isPending ? 'กำลังดึงลิงก์…' : '🛒 ดึงลิงก์คอมเมนต์'}
+              </Button>
             </div>
           </div>
 

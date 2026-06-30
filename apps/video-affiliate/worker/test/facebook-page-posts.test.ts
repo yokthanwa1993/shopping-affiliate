@@ -2,22 +2,32 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
+    FACEBOOK_PAGE_POSTS_COMMENT_LINK_DEFAULT_LIMIT,
+    FACEBOOK_PAGE_POSTS_COMMENT_LINK_MAX_LIMIT,
     FACEBOOK_PAGE_POSTS_EDGE,
     FACEBOOK_PAGE_POSTS_FIELDS,
     FACEBOOK_PAGE_POSTS_GRAPH_DEFAULT_LIMIT,
     FACEBOOK_PAGE_POSTS_GRAPH_MAX_LIMIT,
     FACEBOOK_PAGE_POSTS_SOURCE,
+    FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS,
     FACEBOOK_PAGE_POST_CACHE_TABLE_SQL,
     FACEBOOK_PAGE_POST_SYNC_STATE_TABLE_SQL,
+    type FacebookPageCommentLite,
     type FacebookPagePostCacheRow,
     type FacebookPagePostsGraphBatch,
+    buildPageCommentPermalink,
     crawlFacebookPagePosts,
     extractFacebookPostMedia,
     extractGraphSummaryCount,
+    extractPageCommentLinkEvidence,
+    isFacebookRateLimitCode,
+    isPageOwnedComment,
     normalizeFacebookPagePost,
     normalizeFacebookPagePostsBatches,
+    normalizeFacebookPagePostsCommentLinkLimit,
     normalizeFacebookPagePostsGraphLimit,
     normalizeFacebookPagePostsReadLimit,
+    pickCommentShopeeUrl,
     sanitizeFacebookPagePostsError,
 } from '../src/facebook-page-posts.js'
 
@@ -235,17 +245,159 @@ test('Graph fields request comments + reactions summary counts', () => {
     assert.equal(FACEBOOK_PAGE_POSTS_EDGE, 'published_posts')
 })
 
+// --- page-owned comment link enrichment (pure) ------------------------------
+
+function comment(over: Partial<FacebookPageCommentLite>): FacebookPageCommentLite {
+    return { id: `${PAGE_ID}_900`, message: '', fromId: PAGE_ID, fromName: 'เฉียบ', ...over }
+}
+
+test('isPageOwnedComment: from.id match wins, user comment rejected', () => {
+    assert.equal(isPageOwnedComment(comment({ fromId: PAGE_ID }), { pageId: PAGE_ID }), true)
+    assert.equal(isPageOwnedComment(comment({ fromId: '99999' }), { pageId: PAGE_ID }), false)
+})
+
+test('isPageOwnedComment: from.name fallback only when from.id is absent', () => {
+    // No id but matching name → owned (some tokens omit from.id).
+    assert.equal(isPageOwnedComment(comment({ fromId: '', fromName: 'เฉียบ' }), { pageId: PAGE_ID, pageName: 'เฉียบ' }), true)
+    // No id and non-matching name → not owned.
+    assert.equal(isPageOwnedComment(comment({ fromId: '', fromName: 'someone' }), { pageId: PAGE_ID, pageName: 'เฉียบ' }), false)
+    // A user comment whose name collides but HAS a (different) id must NOT be owned
+    // by name — the id is authoritative.
+    assert.equal(isPageOwnedComment(comment({ fromId: '99999', fromName: 'เฉียบ' }), { pageId: PAGE_ID, pageName: 'เฉียบ' }), false)
+})
+
+test('pickCommentShopeeUrl: extracts shopee/customlink, strips trailing punctuation, prefers customlink', () => {
+    assert.equal(pickCommentShopeeUrl('สนใจกดที่ลิงก์ https://s.shopee.co.th/abc123)'), 'https://s.shopee.co.th/abc123')
+    assert.equal(pickCommentShopeeUrl('ซื้อเลย https://shopee.co.th/product-i.1.2'), 'https://shopee.co.th/product-i.1.2')
+    // customlink wrapper wins over a bare shopee link in the same comment.
+    assert.equal(
+        pickCommentShopeeUrl('shopee https://shopee.co.th/x แต่ใช้ https://customlink.wwoom.com/s/AAA'),
+        'https://customlink.wwoom.com/s/AAA',
+    )
+    // Non-affiliate links are ignored.
+    assert.equal(pickCommentShopeeUrl('ดูที่ https://example.com/foo'), '')
+    assert.equal(pickCommentShopeeUrl('no link here'), '')
+})
+
+test('extractPageCommentLinkEvidence: first page-owned comment with a link wins; user comment ignored', () => {
+    const comments: FacebookPageCommentLite[] = [
+        comment({ id: `${PAGE_ID}_1`, fromId: '99999', fromName: 'ลูกค้า', message: 'อยากได้ลิงก์ https://s.shopee.co.th/USER' }),
+        comment({ id: `${PAGE_ID}_2`, fromId: PAGE_ID, message: 'พิกัด https://s.shopee.co.th/PAGE.' }),
+    ]
+    const ev = extractPageCommentLinkEvidence(comments, { pageId: PAGE_ID, pageName: 'เฉียบ', permalinkUrl: 'https://www.facebook.com/100/posts/2' })
+    // The user comment's link must NOT be picked even though it appears first.
+    assert.equal(ev.shopee_url, 'https://s.shopee.co.th/PAGE')
+    assert.equal(ev.page_comment_id, `${PAGE_ID}_2`)
+    assert.ok(ev.page_comment_message.includes('พิกัด'))
+    assert.equal(ev.page_comment_url, 'https://www.facebook.com/100/posts/2?comment_id=2')
+})
+
+test('extractPageCommentLinkEvidence: no page-owned link → empty evidence', () => {
+    const comments: FacebookPageCommentLite[] = [
+        comment({ fromId: '99999', message: 'https://s.shopee.co.th/USER' }),
+        comment({ fromId: PAGE_ID, message: 'ขอบคุณค่ะ' }),
+    ]
+    const ev = extractPageCommentLinkEvidence(comments, { pageId: PAGE_ID })
+    assert.equal(ev.shopee_url, '')
+    assert.equal(ev.page_comment_id, '')
+    assert.equal(ev.page_comment_url, '')
+})
+
+test('buildPageCommentPermalink: appends comment_id tail, requires http(s) permalink', () => {
+    assert.equal(
+        buildPageCommentPermalink('https://www.facebook.com/100/posts/2', `${PAGE_ID}_55`),
+        'https://www.facebook.com/100/posts/2?comment_id=55',
+    )
+    // Existing query string → use & separator.
+    assert.equal(
+        buildPageCommentPermalink('https://www.facebook.com/x?y=1', '88'),
+        'https://www.facebook.com/x?y=1&comment_id=88',
+    )
+    assert.equal(buildPageCommentPermalink('', `${PAGE_ID}_55`), '')
+    assert.equal(buildPageCommentPermalink('javascript:alert(1)', '55'), '')
+    assert.equal(buildPageCommentPermalink('https://x/y', ''), '')
+})
+
+test('isFacebookRateLimitCode: flags Graph rate/limit codes only', () => {
+    for (const c of [368, 4, 17, 32, 613]) assert.equal(isFacebookRateLimitCode(c), true, `code ${c}`)
+    for (const c of [190, 100, 0, undefined, null, 'x']) assert.equal(isFacebookRateLimitCode(c), false, `code ${c}`)
+})
+
+test('comment-link limit normalizer clamps to bounds', () => {
+    assert.equal(FACEBOOK_PAGE_POSTS_COMMENT_LINK_DEFAULT_LIMIT, 25)
+    assert.equal(FACEBOOK_PAGE_POSTS_COMMENT_LINK_MAX_LIMIT, 100)
+    assert.equal(normalizeFacebookPagePostsCommentLinkLimit(undefined), 25)
+    assert.equal(normalizeFacebookPagePostsCommentLinkLimit(999), 100)
+    assert.equal(normalizeFacebookPagePostsCommentLinkLimit(0), 1)
+    assert.equal(normalizeFacebookPagePostsCommentLinkLimit(50), 50)
+})
+
+test('cache table SQL declares comment-link enrichment columns', () => {
+    const sql = FACEBOOK_PAGE_POST_CACHE_TABLE_SQL
+    for (const col of FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS) {
+        assert.ok(sql.includes(col), `cache table must declare ${col}`)
+    }
+    assert.deepEqual(FACEBOOK_PAGE_POST_CACHE_COMMENT_LINK_COLUMNS.slice().sort(), [
+        'comment_link_checked_at', 'comment_link_error', 'page_comment_id',
+        'page_comment_message', 'page_comment_url', 'shopee_url',
+    ])
+})
+
 // --- index.ts wiring (source-text assertions) -------------------------------
 
 function indexSource(): string {
     return readFileSync('src/index.ts', 'utf8')
 }
 
-test('index.ts wires the three facebook-page-posts endpoints', () => {
+test('index.ts wires the facebook-page-posts endpoints (incl. comment-link enrich)', () => {
     const src = indexSource()
     assert.ok(src.includes("app.get('/api/dashboard/facebook-page-posts'"), 'read endpoint must exist')
     assert.ok(src.includes("app.post('/api/dashboard/facebook-page-posts/sync-page'"), 'sync-page endpoint must exist')
     assert.ok(src.includes("app.post('/api/dashboard/facebook-page-posts/sync-all'"), 'sync-all endpoint must exist')
+    assert.ok(src.includes("app.post('/api/dashboard/facebook-page-posts/enrich-comment-links'"), 'enrich endpoint must exist')
+})
+
+test('enrich endpoint is auth-gated, bounded, and reports incremental counts', () => {
+    const src = indexSource()
+    const start = src.indexOf("app.post('/api/dashboard/facebook-page-posts/enrich-comment-links'")
+    assert.notEqual(start, -1)
+    const end = src.indexOf('app.', start + 1)
+    const body = src.slice(start, end)
+    assert.ok(body.includes('requireAuthSession'), 'must require a dashboard auth session')
+    assert.ok(body.includes('normalizeFacebookPagePostsCommentLinkLimit'), 'must clamp the batch limit')
+    assert.ok(body.includes('runFacebookPagePostsCommentLinkEnrich'), 'must delegate to the bounded enrich pass')
+})
+
+test('enrich pass: bounded, page-owned filter, fails soft, stops on rate-limit', () => {
+    const src = indexSource()
+    const start = src.indexOf('async function runFacebookPagePostsCommentLinkEnrich')
+    assert.notEqual(start, -1)
+    // Anchor on the next TOP-LEVEL function (the pass has a nested `async function
+    // tokenFor`, so a bare 'async function ' search would truncate the body early).
+    const end = src.indexOf('async function ensureDashboardSettingsTable', start + 1)
+    const body = src.slice(start, end)
+    // Reads comments per row via the live Graph helper, with the canonical post id
+    // as the /comments target.
+    assert.ok(body.includes('fetchPageCommentsLive(row.post_id'), 'must read comments for the post-story object')
+    assert.ok(body.includes('extractPageCommentLinkEvidence'), 'must use the page-owned link extractor')
+    // Fails soft per row + records a sanitized error, and stops early on rate-limit.
+    assert.ok(body.includes('sanitizeFacebookPagePostsError'), 'must sanitize Graph errors before storing')
+    assert.ok(body.includes('recordFacebookPagePostCommentLinkError'), 'must record a per-row failure')
+    assert.ok(body.includes('isFacebookRateLimitCode'), 'must detect rate-limit codes')
+    assert.ok(body.includes("stopped = 'facebook_rate_limited'") && body.includes('break'), 'must stop early on rate-limit')
+    assert.ok(body.includes('has_more'), 'must report has_more for resumable batching')
+})
+
+test('read query returns the comment-link columns (no raw_json)', () => {
+    const src = indexSource()
+    const start = src.indexOf('async function listFacebookPagePostCache')
+    assert.notEqual(start, -1)
+    const body = src.slice(start, start + 2400)
+    for (const col of ['shopee_url', 'page_comment_id', 'page_comment_url', 'comment_link_checked_at', 'comment_link_error']) {
+        assert.ok(body.includes(col), `read SELECT must return ${col}`)
+    }
+    const selectClause = body.slice(0, body.indexOf('FROM facebook_page_post_cache'))
+    assert.ok(!selectClause.includes('raw_json'), 'raw_json must not be returned to the client')
 })
 
 test('fetch helper hits /published_posts with the official cursor + sanitizes errors', () => {

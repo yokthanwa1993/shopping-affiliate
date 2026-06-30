@@ -176,6 +176,13 @@ export const pagePostItemSchema = z
     reactions_count: z.number().nullish(),
     comments_count: z.number().nullish(),
     shares_count: z.number().nullish(),
+    // Page-owned comment affiliate link enrichment (filled by the enrich endpoint).
+    page_comment_id: z.string().nullish(),
+    page_comment_message: z.string().nullish(),
+    shopee_url: z.string().nullish(),
+    page_comment_url: z.string().nullish(),
+    comment_link_checked_at: z.string().nullish(),
+    comment_link_error: z.string().nullish(),
     fetched_at: z.string().nullish(),
     updated_at: z.string().nullish(),
   })
@@ -302,10 +309,72 @@ export async function syncPagePosts(
   return syncPagePostsResultSchema.parse(raw)
 }
 
+export const enrichCommentLinksResultSchema = z
+  .object({
+    ok: z.boolean().optional(),
+    namespace_id: z.string().nullish(),
+    page_id: z.string().nullish(),
+    processed: z.number().nullish(),
+    found: z.number().nullish(),
+    skipped: z.number().nullish(),
+    errors: z.number().nullish(),
+    has_more: z.boolean().nullish(),
+    remaining: z.number().nullish(),
+    stopped: z.string().nullish(),
+    error: z.string().nullish(),
+    limit: z.number().nullish(),
+  })
+  .passthrough()
+
+export type EnrichCommentLinksResult = z.infer<typeof enrichCommentLinksResultSchema>
+
+export interface EnrichCommentLinksParams {
+  // Omit pageId for the namespace default page (gallery page). Pass '' to enrich
+  // every page's cached posts in the namespace.
+  pageId?: string
+  namespaceId?: string
+  limit?: number
+  // recheck=true re-picks rows whose last check recorded an error (retry).
+  recheck?: boolean
+}
+
+// Resolve Page-owned comment affiliate links for ONE bounded batch of cached
+// posts. The worker only touches rows not yet enriched (or error rows on
+// recheck) and persists progress per row, so this is safe to call repeatedly
+// until has_more is false. Requires a dashboard auth session (same-origin cookie).
+export async function enrichPagePostCommentLinks(
+  params: EnrichCommentLinksParams = {},
+  signal?: AbortSignal,
+): Promise<EnrichCommentLinksResult> {
+  const raw = await workerFetchJson<unknown>(
+    '/api/dashboard/facebook-page-posts/enrich-comment-links',
+    {
+      method: 'POST',
+      body: {
+        page_id: params.pageId,
+        namespace_id: params.namespaceId,
+        limit: params.limit,
+        recheck: params.recheck === true ? true : undefined,
+      },
+      signal,
+      timeoutMs: 120_000,
+    },
+  )
+  return enrichCommentLinksResultSchema.parse(raw)
+}
+
 // Safe permalink for a post card: only http(s) (rejects javascript:/data: and
 // any other scheme). Returns null when there's no usable Facebook URL.
 export function pagePostPermalink(item: PagePostItem): string | null {
   const v = (item.permalink_url ?? '').trim()
+  return /^https?:\/\//i.test(v) ? v : null
+}
+
+// Safe affiliate link found in the Page-owned comment, for the card's
+// Shopee/custom-link badge. Only http(s) (rejects javascript:/data:). Returns
+// null when no comment link was resolved.
+export function pagePostCommentShopeeLink(item: PagePostItem): string | null {
+  const v = (item.shopee_url ?? '').trim()
   return /^https?:\/\//i.test(v) ? v : null
 }
 
