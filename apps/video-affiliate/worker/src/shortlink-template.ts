@@ -69,7 +69,7 @@ export function buildShortlinkRequestUrlFromTemplate(
 }
 
 // Posting-time Sub ID overrides attached to a freshly published post/reel/ad.
-// sub2 = the Facebook post id, sub3 = the Facebook page id, sub4 = reserved
+// sub2 = the Facebook page id, sub3 = the Facebook post id tail, sub4 = reserved
 // (kept empty for the current outbound-tracking policy).
 export type PostingCommentShortlinkSubIds = {
     postSubId2: string
@@ -78,8 +78,8 @@ export type PostingCommentShortlinkSubIds = {
 }
 
 // Facebook story/post ids arrive as either a bare post id or `pageId_postId`.
-// Sub ID 2 must be the POST id tail, never the page id, so split on `_` and keep
-// the tail. A bare value (no `_`) is already the post id.
+// The post-id sub must be the POST id tail, never the page id, so split on `_`
+// and keep the tail. A bare value (no `_`) is already the post id.
 export function normalizeFacebookPostSubIdForShortlink(value: string | null | undefined): string {
     const raw = String(value || '').trim()
     if (!raw) return ''
@@ -88,8 +88,8 @@ export function normalizeFacebookPostSubIdForShortlink(value: string | null | un
 }
 
 // Derive the posting-time comment Sub IDs for a freshly published Facebook post:
-//   sub2 = post id tail (from story_id `pageId_postId` → `postId`)
-//   sub3 = the page id that owns the post
+//   sub2 = the page id that owns the post
+//   sub3 = post id tail (from story_id `pageId_postId` → `postId`)
 //   sub4 = '' (post_history/log ids stay internal under the current policy)
 export function buildPostingCommentShortlinkSubIds(input: {
     canonicalPostId?: string | null
@@ -99,12 +99,16 @@ export function buildPostingCommentShortlinkSubIds(input: {
     historyId?: number | string | null
     logPrefix: string
 }): PostingCommentShortlinkSubIds {
-    const postSubId2 = normalizeFacebookPostSubIdForShortlink(input.canonicalPostId)
+    const postSubId2 = normalizeShortlinkSubId(input.pageId || '')
     if (!postSubId2) {
-        console.log(`[${input.logPrefix}] Shopee comment shortlink sub2 missing: missing_page_story_object_id`)
+        console.log(`[${input.logPrefix}] Shopee comment shortlink sub2 missing: missing_page_id`)
     }
 
-    const postSubId3 = normalizeShortlinkSubId(input.pageId || '')
+    const postSubId3 = normalizeFacebookPostSubIdForShortlink(input.canonicalPostId)
+    if (!postSubId3) {
+        console.log(`[${input.logPrefix}] Shopee comment shortlink sub3 missing: missing_page_story_object_id`)
+    }
+
     // New outbound tracking policy: keep post_history/log ids internal only.
     // Do not send them as Shopee/customlink sub4 for newly posted comments.
     const postSubId4 = ''

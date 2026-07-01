@@ -15749,7 +15749,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     bridgeResult.comment_target_story_id = adStoryIdForProof
     // comment_target_post_id stays the final story/post tail — it names WHICH post is targeted, and is
     // independent of the shortlink sub order below.
-    bridgeResult.comment_target_post_id = commentSubIds.postSubId2
+    bridgeResult.comment_target_post_id = commentSubIds.postSubId3
     const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
     const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
     const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
@@ -15757,10 +15757,10 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     // Final CTA/comment shortlink uses the THREE-sub click-link contract exactly: sub1 = the page
     // campaign/sub-campaign code, sub2 = the page id, sub3 = the final dark story/post tail. This mirrors
     // the two-sub caption/creative link above with the post tail appended once the story exists.
-    // buildPostingCommentShortlinkSubIds returns postSubId2 = post tail and postSubId3 = page id, so the
-    // page id maps to sub2 and the post tail maps to sub3.
-    const finalCtaSub2 = commentSubIds.postSubId3 // page id
-    const finalCtaSub3 = commentSubIds.postSubId2 // final story/post tail
+    // buildPostingCommentShortlinkSubIds returns postSubId2 = page id and postSubId3 = post tail, so the
+    // page id maps to sub2 and the post tail maps to sub3 directly.
+    const finalCtaSub2 = commentSubIds.postSubId2 // page id
+    const finalCtaSub3 = commentSubIds.postSubId3 // final story/post tail
     bridgeResult.sub1 = finalSub1
     bridgeResult.cta_sub1 = finalSub1
     bridgeResult.cta_sub2 = finalCtaSub2
@@ -34943,15 +34943,14 @@ async function shortenShopeeLinkForNamespace(params: {
     pageId?: string
     allowFallbackWhenEnforced?: boolean
     // Optional override for Sub ID 2 used only at posting/comment time. When
-    // supplied (e.g. Facebook post id like `pageId_postId`), it replaces the
-    // namespace-configured sub_id2 for this request only. Processing-time
-    // conversion callers should leave this undefined so settings sub_id2
-    // continues to apply.
+    // supplied (e.g. the Facebook page id), it replaces the namespace-configured
+    // sub_id2 for this request only so the affiliate report can attribute clicks
+    // back to the specific page that owns the post. Processing-time conversion
+    // callers should leave this undefined so settings sub_id2 continues to apply.
     postSubId2?: string
     // Optional override for Sub ID 3 used only at posting/comment time. When
-    // supplied (e.g. Facebook page id), it replaces the namespace-configured
-    // sub_id3 for this request only so the affiliate report can attribute
-    // clicks back to the specific page that owns the post. Processing-time
+    // supplied (e.g. the Facebook post id tail from `pageId_postId`), it replaces
+    // the namespace-configured sub_id3 for this request only. Processing-time
     // conversion callers should leave this undefined so settings sub_id3
     // continues to apply.
     postSubId3?: string
@@ -35240,15 +35239,15 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     pageId?: string
     shopeeLink: string
     logPrefix: string
-    // Facebook post id (`pageId_postId`) used to populate shortlink Sub ID 2
-    // for the comment that will be attached to a freshly published post/reel.
-    // Pass undefined when no post id is available so the namespace-configured
-    // sub_id2 is used instead.
-    postSubId2?: string
-    // Facebook page id used to populate shortlink Sub ID 3 for the comment
-    // that will be attached to the freshly published post/reel so the operator
+    // Facebook page id used to populate shortlink Sub ID 2 for the comment
+    // that will be attached to a freshly published post/reel so the operator
     // can attribute clicks back to a specific page. Pass undefined when no
-    // page id is available so the namespace-configured sub_id3 is used.
+    // page id is available so the namespace-configured sub_id2 is used instead.
+    postSubId2?: string
+    // Facebook post id tail (`pageId_postId` → `postId`) used to populate
+    // shortlink Sub ID 3 for the comment that will be attached to the freshly
+    // published post/reel. Pass undefined when no post id is available so the
+    // namespace-configured sub_id3 is used.
     postSubId3?: string
     // Internal post_history/log id for Sub ID 4 on fresh post comments. Pass an
     // empty string when this is a posting/comment call but no log id exists; that
@@ -35323,7 +35322,7 @@ type OneCardCommentShortlinkRemint = {
     // Final Shopee shortlink to use for the ad's first comment. Always non-empty:
     // re-minted with sub2/sub3 when possible, else the original managed link.
     commentShopeeLink: string
-    // Sub ID 2 (Facebook post id tail) and Sub ID 3 (Facebook page id) that were
+    // Sub ID 2 (Facebook page id) and Sub ID 3 (Facebook post id tail) that were
     // injected into the re-minted link, exposed so Dev can verify utm_content.
     sub2: string
     sub3: string
@@ -35344,8 +35343,8 @@ function isDirectShopeeShortlink(link: string): boolean {
 
 // Re-mint the OneCard/Ads first-comment Shopee shortlink AFTER the page post's
 // story_id exists, so the comment link carries:
-//   sub2 = Facebook post id tail (story_id `pageId_postId` → `postId`)
-//   sub3 = Facebook page id
+//   sub2 = Facebook page id
+//   sub3 = Facebook post id tail (story_id `pageId_postId` → `postId`)
 // while sub1/campaign and sub4/sub5 defaults stay whatever the namespace settings
 // resolve to (resolvePostingShopeeLinkForNamespace preserves configured sub4/sub5
 // when no postSubId4 override is passed). OneCard CTA promotion requires a newly shortened
@@ -35370,13 +35369,13 @@ async function remintOneCardCommentShortlink(params: {
         historyId: params.historyId ?? null,
         logPrefix: params.logPrefix,
     })
-    if (!fallback || !subIds.postSubId2) {
+    if (!fallback || !subIds.postSubId3) {
         return {
             commentShopeeLink: fallback,
             sub2: subIds.postSubId2,
             sub3: subIds.postSubId3,
             reminted: false,
-            error: !fallback ? 'no_managed_shopee_link' : 'missing_post_id_sub2',
+            error: !fallback ? 'no_managed_shopee_link' : 'missing_post_id_sub3',
         }
     }
     try {
@@ -35413,7 +35412,7 @@ async function remintOneCardCommentShortlink(params: {
 
 // Post-first OneCard/Ads is opt-in via env ADS_POST_FIRST_ENABLED='1'. Default OFF so the
 // proven single-shot create-ad path is untouched in production; Dev/Thanwa flip it on a test
-// page to verify that the ad CTA == the final comment link (sub2=post id, sub3=page id).
+// page to verify that the ad CTA == the final comment link (sub2=page id, sub3=post id).
 function oneCardPostFirstEnabled(env: Env): boolean {
     return String((env as Record<string, unknown>).ADS_POST_FIRST_ENABLED || '').trim() === '1'
 }

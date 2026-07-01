@@ -298,19 +298,19 @@ test('ad-history record for the unsupported path carries status + error, no resu
 
 // Active click-link/ad-only finalization: after the bridge returns the dark-post story_id, the worker
 // re-mints the CTA/comment shortlink to the THREE-sub click-link contract — sub1 = campaign code, sub2 =
-// PAGE ID, sub3 = the final story/post tail. buildPostingCommentShortlinkSubIds returns postSubId2 = post
-// tail and postSubId3 = page id, so the finalization maps postSubId3 → sub2 (page id) and postSubId2 →
-// sub3 (post tail). This test fails on the OLD reversed order (sub2 = post tail, sub3 = page id).
+// PAGE ID, sub3 = the final story/post tail. buildPostingCommentShortlinkSubIds returns postSubId2 = page
+// id and postSubId3 = post tail, so the finalization maps postSubId2 → sub2 (page id) and postSubId3 →
+// sub3 (post tail) directly. This test fails on the OLD reversed order (sub2 = post tail, sub3 = page id).
 test('active ad-only re-mint maps sub2 = page id and sub3 = bridge story-id tail (three-sub contract)', () => {
     const bridgeStoryId = '111_222' // bridge effective_object_story_id = PAGEID_POSTID
     const pageId = '111'
     const subs = buildPostingCommentShortlinkSubIds({ canonicalPostId: bridgeStoryId, pageId, logPrefix: 'AD-ONLY ACTIVE' })
-    assert.equal(subs.postSubId2, '222') // post id tail
-    assert.equal(subs.postSubId3, '111') // page id
+    assert.equal(subs.postSubId2, '111') // page id
+    assert.equal(subs.postSubId3, '222') // post id tail
 
-    // The finalization maps page id → sub2 and post tail → sub3.
-    const finalSub2 = subs.postSubId3 // page id
-    const finalSub3 = subs.postSubId2 // final story/post tail
+    // The finalization maps page id → sub2 and post tail → sub3 directly.
+    const finalSub2 = subs.postSubId2 // page id
+    const finalSub3 = subs.postSubId3 // final story/post tail
     const url = buildAdOnlyShortlinkRequestUrl({
         template: 'https://short.wwoom.com/?id=X&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}',
         shopeeLink: 'https://shopee.co.th/product',
@@ -430,16 +430,16 @@ test('create-ad-only records ad-story proof separately from old source signal id
     assert.match(routeSource, /bridgeResult\.final_shortlink = finalLink/)
     assert.match(routeSource, /bridgeResult\.sub1 = finalSub1/)
     assert.match(routeSource, /bridgeResult\.cta_sub1 = finalSub1/)
-    // Three-sub click-link contract: cta_sub2 = page id (postSubId3), cta_sub3 = post tail (postSubId2).
-    assert.match(routeSource, /const finalCtaSub2 = commentSubIds\.postSubId3/)
-    assert.match(routeSource, /const finalCtaSub3 = commentSubIds\.postSubId2/)
+    // Three-sub click-link contract: cta_sub2 = page id (postSubId2), cta_sub3 = post tail (postSubId3).
+    assert.match(routeSource, /const finalCtaSub2 = commentSubIds\.postSubId2/)
+    assert.match(routeSource, /const finalCtaSub3 = commentSubIds\.postSubId3/)
     assert.match(routeSource, /bridgeResult\.cta_sub2 = finalCtaSub2/)
     assert.match(routeSource, /bridgeResult\.cta_sub3 = finalCtaSub3/)
     assert.match(routeSource, /sub2: finalCtaSub2/)
     assert.match(routeSource, /sub3: finalCtaSub3/)
-    // Must NOT keep the old reversed mapping (cta_sub2 = post tail, cta_sub3 = page id).
-    assert.doesNotMatch(routeSource, /bridgeResult\.cta_sub2 = commentSubIds\.postSubId2/)
-    assert.doesNotMatch(routeSource, /bridgeResult\.cta_sub3 = commentSubIds\.postSubId3/)
+    // Must NOT keep the old reversed mapping (cta_sub2 = post tail via postSubId3, cta_sub3 = page id via postSubId2).
+    assert.doesNotMatch(routeSource, /const finalCtaSub2 = commentSubIds\.postSubId3/)
+    assert.doesNotMatch(routeSource, /const finalCtaSub3 = commentSubIds\.postSubId2/)
     assert.doesNotMatch(routeSource, /sourceCommentTargetRaw/)
     assert.doesNotMatch(routeSource, /source_comment_target_story_id = sourceCommentTargetStoryId/)
 })

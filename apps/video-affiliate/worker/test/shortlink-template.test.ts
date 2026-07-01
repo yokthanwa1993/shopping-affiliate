@@ -141,7 +141,7 @@ test('buildShortlinkRequestUrlFromTemplate fills sub_id3 with provided page id',
 })
 
 test('normalizeFacebookPostSubIdForShortlink takes the POST id tail from pageId_postId', () => {
-    // story_id is `pageId_postId` — sub2 must be the POST id, never the page id.
+    // story_id is `pageId_postId` — the post-id sub (sub3) must be the POST id, never the page id.
     assert.equal(
         normalizeFacebookPostSubIdForShortlink('1008898512617594_1277758961195466'),
         '1277758961195466',
@@ -159,10 +159,9 @@ test('normalizeFacebookPostSubIdForShortlink returns empty for blank/missing inp
     assert.equal(normalizeFacebookPostSubIdForShortlink('   '), '')
 })
 
-test('buildPostingCommentShortlinkSubIds sets sub2=post id tail and sub3=page id (the live-link bug)', () => {
-    // Reproduces the reported bug: live URL showed utm_content=<campaign>---- with
-    // sub2/sub3 blank. The fix derives sub2 from the post id tail and sub3 from the
-    // page id so the comment link carries both.
+test('buildPostingCommentShortlinkSubIds sets sub2=page id and sub3=post id tail (page→sub2, post→sub3)', () => {
+    // New contract: the visible page-post comment link carries the page id in sub2 and
+    // the post id tail in sub3. sub2/sub3 must never be blank when both ids are known.
     const pageId = '1008898512617594'
     const storyId = `${pageId}_1277758961195466`
     const subs = buildPostingCommentShortlinkSubIds({
@@ -170,20 +169,31 @@ test('buildPostingCommentShortlinkSubIds sets sub2=post id tail and sub3=page id
         pageId,
         logPrefix: 'TEST',
     })
-    assert.equal(subs.postSubId2, '1277758961195466', 'sub2 must be the post id tail, not the page id')
-    assert.notEqual(subs.postSubId2, pageId, 'sub2 must never equal the page id')
-    assert.equal(subs.postSubId3, pageId, 'sub3 must be the page id')
+    assert.equal(subs.postSubId2, pageId, 'sub2 must be the page id')
+    assert.equal(subs.postSubId3, '1277758961195466', 'sub3 must be the post id tail, not the page id')
+    assert.notEqual(subs.postSubId3, pageId, 'sub3 must never equal the page id')
     assert.equal(subs.postSubId4, '', 'sub4 stays internal (empty)')
 })
 
-test('buildPostingCommentShortlinkSubIds accepts a bare post id for sub2', () => {
+test('buildPostingCommentShortlinkSubIds maps canonicalPostId PAGE_POST + pageId PAGE to sub2=PAGE, sub3=POST', () => {
+    // Direct contract assertion with symbolic ids: page → sub2, post tail → sub3.
+    const subs = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: 'PAGE_POST',
+        pageId: 'PAGE',
+        logPrefix: 'TEST',
+    })
+    assert.equal(subs.postSubId2, 'PAGE')
+    assert.equal(subs.postSubId3, 'POST')
+})
+
+test('buildPostingCommentShortlinkSubIds accepts a bare post id for sub3', () => {
     const subs = buildPostingCommentShortlinkSubIds({
         canonicalPostId: '1277758961195466',
         pageId: '1008898512617594',
         logPrefix: 'TEST',
     })
-    assert.equal(subs.postSubId2, '1277758961195466')
-    assert.equal(subs.postSubId3, '1008898512617594')
+    assert.equal(subs.postSubId2, '1008898512617594')
+    assert.equal(subs.postSubId3, '1277758961195466')
 })
 
 test('cron CloakBridge re-mint produces the expected utm_content tail shape (CHEARB live bug)', () => {
@@ -191,8 +201,8 @@ test('cron CloakBridge re-mint produces the expected utm_content tail shape (CHE
     // the pre-publish shortlink, whose request carried blank sub2/sub3, resolving to
     // utm_content=16JUN26FBSPCAD---- (no post/page tail). After the fix the branch first
     // re-mints with buildPostingCommentShortlinkSubIds(confirmedCanonicalPostId, pageId),
-    // so the minted request carries sub2=post id / sub3=page id and the resolved
-    // utm_content becomes <prefix>-<postId>-<pageId>--.
+    // so the minted request carries sub2=page id / sub3=post id and the resolved
+    // utm_content becomes <prefix>-<pageId>-<postId>--.
     const pageId = '1008898512617594'
     const fbPostId = '1305950258376336'
     const storyId = `${pageId}_${fbPostId}`
@@ -212,27 +222,27 @@ test('cron CloakBridge re-mint produces the expected utm_content tail shape (CHE
         sub4: subs.postSubId4,
         sub5: '',
     })
-    assert.match(mintRequest, new RegExp(`sub2=${fbPostId}(&|$)`), 'minted request must carry the post id as sub2')
-    assert.match(mintRequest, new RegExp(`sub3=${pageId}(&|$)`), 'minted request must carry the page id as sub3')
+    assert.match(mintRequest, new RegExp(`sub2=${pageId}(&|$)`), 'minted request must carry the page id as sub2')
+    assert.match(mintRequest, new RegExp(`sub3=${fbPostId}(&|$)`), 'minted request must carry the post id as sub3')
     assert.doesNotMatch(mintRequest, /sub2=&/, 'sub2 must not be blank after re-mint')
     assert.doesNotMatch(mintRequest, /sub3=&/, 'sub3 must not be blank after re-mint')
 
     // The customlink resolver concatenates the populated subs into the expected
-    // utm_content tail: <prefix>-<postId>-<pageId>-- (sub4 empty → trailing --).
+    // utm_content tail: <prefix>-<pageId>-<postId>-- (sub4 empty → trailing --).
     const expectedUtmContent = `${campaignPrefix}-${subs.postSubId2}-${subs.postSubId3}--`
-    assert.equal(expectedUtmContent, `${campaignPrefix}-${fbPostId}-${pageId}--`)
+    assert.equal(expectedUtmContent, `${campaignPrefix}-${pageId}-${fbPostId}--`)
     // And it must NOT collapse to the blank-tail shape seen on the broken live links.
     assert.notEqual(expectedUtmContent, `${campaignPrefix}----`)
 })
 
-test('buildPostingCommentShortlinkSubIds leaves sub2 empty when no post id is known', () => {
-    // When story_id is missing the caller must fall back (no fake sub2). The OneCard
-    // re-mint helper treats an empty sub2 as "do not re-mint" and keeps the original link.
+test('buildPostingCommentShortlinkSubIds leaves sub3 empty when no post id is known', () => {
+    // When story_id is missing the caller must fall back (no fake post id). The OneCard
+    // re-mint helper treats an empty sub3 (post id) as "do not re-mint" and keeps the original link.
     const subs = buildPostingCommentShortlinkSubIds({
         canonicalPostId: '',
         pageId: '1008898512617594',
         logPrefix: 'TEST',
     })
-    assert.equal(subs.postSubId2, '')
-    assert.equal(subs.postSubId3, '1008898512617594')
+    assert.equal(subs.postSubId2, '1008898512617594')
+    assert.equal(subs.postSubId3, '')
 })
