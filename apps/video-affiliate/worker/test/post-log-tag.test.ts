@@ -69,21 +69,31 @@ test('isValidPostLogCode / normalizePostLogCode', () => {
 
 const THAI_CAPTION = 'สินค้าดีมาก คุ้มสุด ๆ\n#shopee #ของมันต้องมี'
 
-test('resolveCaptionWithPostLogTag appends the tag as a lone final line exactly once', () => {
+test('resolveCaptionWithPostLogTag appends the tag inline on the final caption line exactly once', () => {
     const r = resolveCaptionWithPostLogTag({ caption: THAI_CAPTION, code: 'f2skgi' })
     assert.equal(r.appended, true)
     assert.equal(r.alreadyPresent, false)
     assert.equal(r.code, 'f2skgi')
     assert.equal(r.hashtag, '#f2skgi')
-    assert.equal(r.caption, `${THAI_CAPTION}\n#f2skgi`)
-    // Existing Thai hashtags are preserved verbatim.
-    assert.ok(r.caption.includes('#shopee #ของมันต้องมี'))
+    assert.equal(r.caption, 'สินค้าดีมาก คุ้มสุด ๆ\n#f2skgi #shopee #ของมันต้องมี')
+    // Existing Thai hashtags are preserved verbatim and the log tag stays inline.
+    assert.ok(r.caption.includes('#f2skgi #shopee #ของมันต้องมี'))
 })
 
 test('resolveCaptionWithPostLogTag on empty caption returns just the tag', () => {
     const r = resolveCaptionWithPostLogTag({ caption: '', code: 'abc123' })
     assert.equal(r.caption, '#abc123')
     assert.equal(r.appended, true)
+})
+
+test('resolveCaptionWithPostLogTag trims trailing spaces before inline tag append', () => {
+    const r = resolveCaptionWithPostLogTag({ caption: 'ข้อความสินค้า   ', code: 'z0lqfm' })
+    assert.equal(r.caption, 'ข้อความสินค้า #z0lqfm')
+})
+
+test('resolveCaptionWithPostLogTag puts the log tag first on an existing hashtag line', () => {
+    const r = resolveCaptionWithPostLogTag({ caption: 'ข้อความสินค้า\n   #shopee #ของมันต้องมี', code: 'zolqfm' })
+    assert.equal(r.caption, 'ข้อความสินค้า\n   #zolqfm #shopee #ของมันต้องมี')
 })
 
 test('resolveCaptionWithPostLogTag is idempotent — never doubles the tag', () => {
@@ -113,14 +123,15 @@ test('inline 6-letter hashtags like #shopee are NOT mistaken for a log tag', () 
     assert.equal(extractExistingPostLogCode(THAI_CAPTION), null)
     const r = resolveCaptionWithPostLogTag({ caption: THAI_CAPTION, code: 'f2skgi' })
     assert.equal(r.appended, true)
-    assert.equal(r.caption, `${THAI_CAPTION}\n#f2skgi`)
+    assert.equal(r.caption, 'สินค้าดีมาก คุ้มสุด ๆ\n#f2skgi #shopee #ของมันต้องมี')
 })
 
-test('extractExistingPostLogCode only matches a lone tag line', () => {
+test('extractExistingPostLogCode matches a lone tag line or final inline log token', () => {
     assert.equal(extractExistingPostLogCode('hello\n#f2skgi'), 'f2skgi')
     assert.equal(extractExistingPostLogCode('#f2skgi'), 'f2skgi')
     assert.equal(extractExistingPostLogCode('  #f2skgi  '), 'f2skgi')
-    assert.equal(extractExistingPostLogCode('#shopee #sale12'), null)
+    assert.equal(extractExistingPostLogCode('hello #f2skgi'), 'f2skgi')
+    assert.equal(extractExistingPostLogCode('#shopee #sale12'), 'sale12')
     assert.equal(extractExistingPostLogCode('text #f2skgi more'), null)
     assert.equal(extractExistingPostLogCode(''), null)
 })

@@ -7,10 +7,9 @@
 //
 // Design invariants (mirrored by the companion test):
 //   - Code is 6 chars of base36 lowercase [a-z0-9]. No secrets, no predictable data.
-//   - We WRITE the tag as its OWN final caption line (`\n#code`). We DETECT an existing
-//     log tag as a *lone* `#[a-z0-9]{6}` line. This keeps normal inline Thai hashtag
-//     clusters (e.g. `#shopee #ของมันต้องมี`) from ever being mistaken for a log tag,
-//     while making the append idempotent across retries.
+//   - We WRITE the tag inline at the end of the last caption line (` … #code`),
+//     not as a new lone line. We still DETECT an existing log tag anywhere in the
+//     caption so retries are idempotent and the tag is never duplicated.
 //   - Snapshot/record building strips anything token/cookie/secret shaped so a log row
 //     can never leak an access token, cookie, fb_dtsg, password, etc.
 
@@ -20,8 +19,14 @@ export const POST_LOG_CODE_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789'
 
 // A log code is exactly 6 base36-lowercase chars. A log HASHTAG is that, `#`-prefixed.
 export const POST_LOG_CODE_RE = /^[a-z0-9]{6}$/
-// A caption line that is ONLY a log hashtag (surrounding whitespace tolerated).
+// Existing log hashtag forms we accept for idempotency:
+//   1) legacy lone final line: `#f2skgi`
+//   2) new inline final token: `... #f2skgi`
+// We only read the final hashtag token on a line, so normal inline clusters earlier
+// in the caption (e.g. `#shopee #ของมันต้องมี`) are not treated as log ids.
 const POST_LOG_TAG_LINE_RE = /^\s*#([a-z0-9]{6})\s*$/
+const POST_LOG_TAG_FINAL_TOKEN_RE = new RegExp('(?:^|' + '\\s' + ')#([a-z0-9]{6})' + '\\s' + '*$')
+
 
 // Default randomness source: prefer crypto (uniform, non-predictable) and fall back to
 // Math.random only if crypto is somehow unavailable. Returns a float in [0, 1).
@@ -73,8 +78,10 @@ export function extractExistingPostLogCode(caption: string | null | undefined): 
     const text = String(caption ?? '')
     if (!text) return null
     for (const line of text.split('\n')) {
-        const m = line.match(POST_LOG_TAG_LINE_RE)
-        if (m) return m[1]
+        const lone = line.match(POST_LOG_TAG_LINE_RE)
+        if (lone) return lone[1]
+        const inlineFinal = line.match(POST_LOG_TAG_FINAL_TOKEN_RE)
+        if (inlineFinal) return inlineFinal[1]
     }
     return null
 }
@@ -92,15 +99,24 @@ export type PostLogTagResolution = {
 }
 
 // Resolve the publish caption + log code, appending the tag EXACTLY once.
-//   - If the caption already has a lone log-tag line, reuse that code and leave the
+//   - If the caption already has a log-tag hashtag, reuse that code and leave the
 //     caption untouched (no duplicate).
-//   - Otherwise append `\n#code` (or just `#code` when the caption is empty).
+//   - Otherwise put `#code` at the FRONT of the existing final hashtag line
+//     (e.g. `#code #shopee #ของมันต้องมี`). If there is no hashtag line, append inline
+//     to the last text line; if caption is empty, use just `#code`.
 // `code` is the freshly generated candidate; pass a collision-free code from the caller.
 export function resolveCaptionWithPostLogTag(params: {
     caption: string | null | undefined
     code: string
 }): PostLogTagResolution {
     const original = String(params.caption ?? '')
+    const code = params.code
+    const hashtag = formatPostLogHashtag(code)
+    const escapedHashtag = hashtag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const sameCodeAtStartOfHashtagLine = new RegExp(`(^|\\n)\\s*${escapedHashtag}(?=\\s|$)`).test(original)
+    if (sameCodeAtStartOfHashtagLine) {
+        return { caption: original, code, hashtag, appended: false, alreadyPresent: true }
+    }
     const existing = extractExistingPostLogCode(original)
     if (existing) {
         return {
@@ -111,9 +127,20 @@ export function resolveCaptionWithPostLogTag(params: {
             alreadyPresent: true,
         }
     }
-    const code = params.code
-    const hashtag = formatPostLogHashtag(code)
-    const caption = original ? `${original}\n${hashtag}` : hashtag
+    const trimmedRight = original.replace(/[\t ]+$/g, '')
+    if (!trimmedRight) {
+        return { caption: hashtag, code, hashtag, appended: true, alreadyPresent: false }
+    }
+    const lines = trimmedRight.split('\n')
+    const lastIndex = lines.length - 1
+    const finalLine = lines[lastIndex]
+    if (/^\s*#/.test(finalLine)) {
+        const leadingWhitespace = finalLine.match(/^\s*/)?.[0] ?? ''
+        const withoutLeading = finalLine.slice(leadingWhitespace.length)
+        lines[lastIndex] = `${leadingWhitespace}${hashtag} ${withoutLeading}`
+        return { caption: lines.join('\n'), code, hashtag, appended: true, alreadyPresent: false }
+    }
+    const caption = `${trimmedRight} ${hashtag}`
     return { caption, code, hashtag, appended: true, alreadyPresent: false }
 }
 
