@@ -8,12 +8,10 @@ import {
   Loader2,
   ShoppingBag,
   Sparkles,
-  Trash2,
   Upload,
   X,
 } from 'lucide-react'
 import {
-  deleteAiClip,
   fetchAiClips,
   uploadAiClip,
   type AiClip,
@@ -397,13 +395,9 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 function AiDetailModal({
   item,
   onClose,
-  onDelete,
-  isDeleting,
 }: {
   item: AiClip
   onClose: () => void
-  onDelete: () => void
-  isDeleting: boolean
 }) {
   const originalPlayback = originalPlaybackUrl(item)
   const processedPlayback = processedPlaybackUrl(item)
@@ -446,10 +440,6 @@ function AiDetailModal({
             <p className="truncate text-sm font-semibold">{item.title || item.id}</p>
           </div>
           <div className="flex items-center gap-2">
-            <Button type="button" size="sm" variant="destructive" onClick={onDelete} disabled={isDeleting}>
-              <Trash2 className="mr-1 h-3.5 w-3.5" />
-              {isDeleting ? 'กำลังลบ…' : 'ลบวีดีโอ'}
-            </Button>
             <Button type="button" size="sm" variant="ghost" onClick={onClose}>
               ปิด
             </Button>
@@ -573,18 +563,6 @@ export function AiClipsPage() {
     },
   })
 
-  const remove = useMutation({
-    mutationFn: (id: string) => deleteAiClip(id),
-    onSuccess: async (result) => {
-      setSelected(null)
-      setNotice({ kind: 'ok', text: `ลบคลิป AI สำเร็จ${result.id ? ` (${result.id})` : ''}` })
-      await queryClient.invalidateQueries({ queryKey: ['ai-clips'] })
-    },
-    onError: (error) => {
-      setNotice({ kind: 'error', text: `ลบไม่สำเร็จ: ${error instanceof Error ? error.message : 'unknown error'}` })
-    },
-  })
-
   const items = useMemo(() => {
     const byId = new Map<string, AiClip>()
     for (const clip of [...(processedQuery.data ?? []), ...(unprocessedQuery.data ?? [])]) {
@@ -684,12 +662,6 @@ export function AiClipsPage() {
         <AiDetailModal
           item={selected}
           onClose={() => setSelected(null)}
-          isDeleting={remove.isPending}
-          onDelete={() => {
-            if (!selected.id) return
-            const ok = window.confirm(`ลบวีดีโอ AI นี้หรือไม่?\n${selected.title || selected.id}`)
-            if (ok) remove.mutate(selected.id)
-          }}
         />
       ) : null}
     </div>
