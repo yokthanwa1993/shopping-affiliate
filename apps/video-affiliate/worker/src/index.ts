@@ -146,6 +146,15 @@ import {
 import { extractShopeeAffiliateIdFromLink } from './shopee-affiliate-id'
 import { buildCaptionLinkFirstDescription, resolvePublishCaption } from './caption-link'
 import {
+    type PostLogRecord,
+    generatePostLogCode,
+    normalizePostLogCode,
+    resolveCaptionWithPostLogTag,
+    buildPostLogRecord,
+    sanitizeSnapshot,
+    toSafePostLogOutput,
+} from './post-log-tag'
+import {
     type AdHistoryRecord,
     validateAdOnlyInput,
     resolveAdOnlySchedule,
@@ -44002,6 +44011,227 @@ app.get('/api/generate-titles/pending', async (c) => {
 })
 
 // Force post for a specific page (bypass time check)
+// ==================== FACEBOOK POST LOG HASHTAG ====================
+// Every NEW visible Facebook Page post (force-post + cron page-posting) gets a short
+// unique log hashtag (`#f2skgi`) appended to its caption. The `facebook_post_log_tags`
+// table is the reverse lookup so an operator/CGO/Hermes can pull all token-free details
+// for a post by its tag. This is deliberately SEPARATE from create-ad-only (dark-story
+// ads) — only real visible page posts are logged here. Logging is best-effort and must
+// never block or fail a post. See worker/src/post-log-tag.ts for the pure helpers.
+
+let facebookPostLogTagsTableReady: Promise<void> | null = null
+async function ensureFacebookPostLogTagsTable(db: D1Database): Promise<void> {
+    if (!facebookPostLogTagsTableReady) {
+        facebookPostLogTagsTableReady = (async () => {
+            const statements = [
+                `CREATE TABLE IF NOT EXISTS facebook_post_log_tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    log_code TEXT NOT NULL,
+                    hashtag TEXT NOT NULL DEFAULT '',
+                    bot_id TEXT NOT NULL DEFAULT '',
+                    namespace_id TEXT NOT NULL DEFAULT '',
+                    page_id TEXT NOT NULL DEFAULT '',
+                    page_name TEXT NOT NULL DEFAULT '',
+                    history_id INTEGER,
+                    story_id TEXT NOT NULL DEFAULT '',
+                    fb_post_id TEXT NOT NULL DEFAULT '',
+                    fb_video_id TEXT NOT NULL DEFAULT '',
+                    reel_id TEXT NOT NULL DEFAULT '',
+                    source_video_id TEXT NOT NULL DEFAULT '',
+                    system_video_id TEXT NOT NULL DEFAULT '',
+                    caption_before TEXT NOT NULL DEFAULT '',
+                    caption_after TEXT NOT NULL DEFAULT '',
+                    shopee_link TEXT NOT NULL DEFAULT '',
+                    original_link TEXT NOT NULL DEFAULT '',
+                    shortlink TEXT NOT NULL DEFAULT '',
+                    comment_link TEXT NOT NULL DEFAULT '',
+                    sub_ids TEXT NOT NULL DEFAULT '',
+                    posting_source TEXT NOT NULL DEFAULT '',
+                    comment_source TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    snapshot_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )`,
+                `CREATE UNIQUE INDEX IF NOT EXISTS uq_fb_post_log_tags_code ON facebook_post_log_tags(log_code)`,
+                `CREATE INDEX IF NOT EXISTS idx_fb_post_log_tags_page ON facebook_post_log_tags(page_id)`,
+                `CREATE INDEX IF NOT EXISTS idx_fb_post_log_tags_history ON facebook_post_log_tags(history_id)`,
+                `CREATE INDEX IF NOT EXISTS idx_fb_post_log_tags_namespace ON facebook_post_log_tags(namespace_id)`,
+            ]
+            for (const sql of statements) {
+                await db.prepare(sql).run().catch(() => { })
+            }
+        })()
+    }
+    await facebookPostLogTagsTableReady
+}
+
+// Allocate a collision-free 6-char base36 log code (checks the UNIQUE index). Never throws
+// — returns a fresh code even if the (astronomically unlikely) collision retries are exhausted.
+async function allocateUniquePostLogCode(db: D1Database): Promise<string> {
+    await ensureFacebookPostLogTagsTable(db)
+    for (let attempt = 0; attempt < 12; attempt++) {
+        const code = generatePostLogCode()
+        const existing = await db
+            .prepare('SELECT 1 FROM facebook_post_log_tags WHERE log_code = ?')
+            .bind(code)
+            .first()
+            .catch(() => null)
+        if (!existing) return code
+    }
+    return generatePostLogCode()
+}
+
+// Upsert the initial (status='posting') log row for a freshly stamped post. Keyed on
+// log_code; ON CONFLICT only refreshes metadata (never wipes a finalized story/status),
+// so re-stamping an idempotent caption is safe.
+async function insertInitialPostLogRow(db: D1Database, input: {
+    code: string
+    botId: string
+    pageId: string
+    pageName?: string
+    historyId?: number | null
+    captionBefore?: string
+    captionAfter?: string
+    shopeeLink?: string
+    originalLink?: string
+    sourceVideoId?: string
+    systemVideoId?: string
+    postingSource?: string
+    commentSource?: string
+}): Promise<void> {
+    const code = normalizePostLogCode(input.code)
+    if (!code) return
+    await ensureFacebookPostLogTagsTable(db)
+    const record: PostLogRecord = buildPostLogRecord({
+        log_code: code,
+        bot_id: input.botId,
+        namespace_id: input.botId,
+        page_id: input.pageId,
+        page_name: input.pageName,
+        history_id: input.historyId ?? null,
+        caption_before: input.captionBefore,
+        caption_after: input.captionAfter,
+        shopee_link: input.shopeeLink,
+        original_link: input.originalLink,
+        source_video_id: input.sourceVideoId,
+        system_video_id: input.systemVideoId,
+        posting_source: input.postingSource,
+        comment_source: input.commentSource,
+        status: 'posting',
+    })
+    await db.prepare(
+        `INSERT INTO facebook_post_log_tags
+            (log_code, hashtag, bot_id, namespace_id, page_id, page_name, history_id, story_id,
+             fb_post_id, fb_video_id, reel_id, source_video_id, system_video_id, caption_before,
+             caption_after, shopee_link, original_link, shortlink, comment_link, sub_ids,
+             posting_source, comment_source, status, error, snapshot_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(log_code) DO UPDATE SET
+            hashtag=excluded.hashtag, bot_id=excluded.bot_id, namespace_id=excluded.namespace_id,
+            page_id=excluded.page_id, page_name=excluded.page_name,
+            history_id=COALESCE(excluded.history_id, facebook_post_log_tags.history_id),
+            caption_before=excluded.caption_before, caption_after=excluded.caption_after,
+            shopee_link=excluded.shopee_link, original_link=excluded.original_link,
+            source_video_id=excluded.source_video_id, system_video_id=excluded.system_video_id,
+            posting_source=excluded.posting_source, comment_source=excluded.comment_source,
+            updated_at=datetime('now')`
+    ).bind(
+        record.log_code, record.hashtag, record.bot_id, record.namespace_id, record.page_id,
+        record.page_name, record.history_id, record.story_id, record.fb_post_id, record.fb_video_id,
+        record.reel_id, record.source_video_id, record.system_video_id, record.caption_before,
+        record.caption_after, record.shopee_link, record.original_link, record.shortlink,
+        record.comment_link, record.sub_ids, record.posting_source, record.comment_source,
+        record.status, record.error, record.snapshot_json,
+    ).run().catch(() => { })
+}
+
+// Finalize post-log rows from the authoritative post_history row(s). post_history is the
+// source of truth: every publish branch (organic/onecard/ads/session-bridge) and the failure
+// path update it with the terminal status + story/fb ids + comment + error. This reconciler
+// copies those token-free fields onto the log row so we never have to hook every branch.
+//   - historyId set → finalize exactly that row (used in the force-post finally, immediate).
+//   - else → scan still-'posting' log rows (optionally namespace-scoped) whose linked
+//     post_history reached a terminal state (used as the cron backstop).
+async function reconcilePostLogTagsFromHistory(db: D1Database, opts?: {
+    historyId?: number | null
+    namespaceId?: string
+    limit?: number
+}): Promise<number> {
+    try {
+        await ensureFacebookPostLogTagsTable(db)
+        const limit = Math.max(1, Math.min(500, opts?.limit || 200))
+        let pending: Array<Record<string, unknown>> = []
+        if (opts?.historyId) {
+            const rows = await db.prepare(
+                `SELECT log_code, history_id, page_id, page_name FROM facebook_post_log_tags WHERE history_id = ?`
+            ).bind(opts.historyId).all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+            pending = (rows.results || []) as Array<Record<string, unknown>>
+        } else {
+            const ns = String(opts?.namespaceId || '').trim()
+            const sql = ns
+                ? `SELECT log_code, history_id, page_id, page_name FROM facebook_post_log_tags WHERE status = 'posting' AND history_id IS NOT NULL AND (namespace_id = ? OR bot_id = ?) ORDER BY id DESC LIMIT ?`
+                : `SELECT log_code, history_id, page_id, page_name FROM facebook_post_log_tags WHERE status = 'posting' AND history_id IS NOT NULL ORDER BY id DESC LIMIT ?`
+            const stmt = ns ? db.prepare(sql).bind(ns, ns, limit) : db.prepare(sql).bind(limit)
+            const rows = await stmt.all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+            pending = (rows.results || []) as Array<Record<string, unknown>>
+        }
+        let updated = 0
+        for (const row of pending) {
+            const code = normalizePostLogCode(String(row.log_code || ''))
+            const historyId = Number(row.history_id || 0) || null
+            if (!code || !historyId) continue
+            const h = await db.prepare(
+                `SELECT id, page_id, video_id, status, fb_post_id, fb_reel_url, fb_video_id, shopee_link,
+                        lazada_link, shortlink_utm_source, comment_status, comment_fb_id, comment_error,
+                        comment_token_hint, post_token_hint, error_message, trigger_source, posted_at
+                 FROM post_history WHERE id = ?`
+            ).bind(historyId).first().catch(() => null) as Record<string, unknown> | null
+            if (!h) continue
+            const histStatus = String(h.status || '')
+            // Leave still-in-flight rows for the next pass; only finalize terminal states.
+            if (histStatus !== 'success' && histStatus !== 'failed') continue
+            const storyId = String(h.fb_post_id || '')
+            const commentFbId = String(h.comment_fb_id || '')
+            const commentLink = commentFbId ? `https://www.facebook.com/${commentFbId}` : ''
+            const errorText = histStatus === 'success' ? '' : String(h.error_message || h.comment_error || '')
+            const snapshot = sanitizeSnapshot(h)
+            const snapshotJson = (() => {
+                try { const j = JSON.stringify(snapshot); return j && j.length > 20000 ? j.slice(0, 20000) : (j || '') } catch { return '' }
+            })()
+            await db.prepare(
+                `UPDATE facebook_post_log_tags SET
+                    story_id = CASE WHEN ? <> '' THEN ? ELSE story_id END,
+                    fb_post_id = CASE WHEN ? <> '' THEN ? ELSE fb_post_id END,
+                    fb_video_id = CASE WHEN ? <> '' THEN ? ELSE fb_video_id END,
+                    shopee_link = CASE WHEN ? <> '' THEN ? ELSE shopee_link END,
+                    comment_link = CASE WHEN ? <> '' THEN ? ELSE comment_link END,
+                    status = ?,
+                    error = ?,
+                    snapshot_json = CASE WHEN ? <> '' THEN ? ELSE snapshot_json END,
+                    updated_at = datetime('now')
+                 WHERE log_code = ?`
+            ).bind(
+                storyId, storyId,
+                storyId, storyId,
+                String(h.fb_video_id || ''), String(h.fb_video_id || ''),
+                String(h.shopee_link || ''), String(h.shopee_link || ''),
+                commentLink, commentLink,
+                histStatus,
+                errorText,
+                snapshotJson, snapshotJson,
+                code,
+            ).run().catch(() => { })
+            updated++
+        }
+        return updated
+    } catch (err) {
+        console.error(`[POST-LOG] reconcile failed: ${err instanceof Error ? err.message : String(err)}`)
+        return 0
+    }
+}
+
 app.post('/api/pages/:id/force-post', async (c) => {
     const pageId = c.req.param('id')
     const env = c.env
@@ -44027,6 +44257,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let initialCommentStatus = 'not_configured'
     let initialCommentError: string | null = null
     let forceHistoryId: number | null = null
+    let forcePostLogCode = ''
     let pagePostingLockKey: string | null = null
     let videoPostingLockKey: string | null = null
     let pageOneCardEnabled = false
@@ -44211,7 +44442,19 @@ app.post('/api/pages/:id/force-post', async (c) => {
             return c.json({ error: 'Gemini API key กลางของระบบยังไม่ได้ตั้งค่า' }, 400)
         }
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
-        const caption = await buildPostingCaptionFromMeta(meta, apiKeys, model)
+        let caption = await buildPostingCaptionFromMeta(meta, apiKeys, model)
+        // Stamp a unique log hashtag onto the caption of this visible page post. Applies to
+        // EVERY force-post route (organic Reel, OneCard, and the ads_publish visible one-card
+        // post) because they all derive their published caption from `caption`. Idempotent —
+        // never doubles if the caption already carries a lone log-tag line. Best-effort: a
+        // failure here leaves the caption untagged rather than blocking the post.
+        const captionBeforeLog = caption
+        forcePostLogCode = await allocateUniquePostLogCode(env.DB).catch(() => '')
+        if (forcePostLogCode) {
+            const stamped = resolveCaptionWithPostLogTag({ caption, code: forcePostLogCode })
+            caption = stamped.caption
+            forcePostLogCode = stamped.code
+        }
         selectedCaption = caption
 
         const shortlinkResolution = await resolvePrePostingShortlinksForNamespace({
@@ -44277,6 +44520,25 @@ app.post('/api/pages/:id/force-post', async (c) => {
             selectedSourceFingerprint || null,
         ).run()
         forceHistoryId = Number(inserted.meta?.last_row_id || 0) || null
+
+        // Persist the log-tag row now that the history id is known. Finalized (story/status/
+        // error/snapshot) in the finally via reconcilePostLogTagsFromHistory. Best-effort.
+        if (forcePostLogCode) {
+            await insertInitialPostLogRow(env.DB, {
+                code: forcePostLogCode,
+                botId,
+                pageId: String(page.id || ''),
+                pageName: page.name,
+                historyId: forceHistoryId,
+                captionBefore: captionBeforeLog,
+                captionAfter: caption,
+                shopeeLink: normalizedShopeeLink,
+                originalLink: rawShopeeLink,
+                sourceVideoId: unpostedId,
+                postingSource: pagePostingRoute,
+                commentSource: pageCommentTokenSource,
+            }).catch(() => { })
+        }
 
         if (shortlinkResolution.errorMessage) {
             if (forceHistoryId) {
@@ -45253,9 +45515,106 @@ app.post('/api/pages/:id/force-post', async (c) => {
             details: errorMsg,
         }, 500)
     } finally {
+        // Finalize the post-log row from the authoritative post_history state (best-effort).
+        if (forcePostLogCode && forceHistoryId) {
+            await reconcilePostLogTagsFromHistory(env.DB, { historyId: forceHistoryId }).catch(() => 0)
+        }
         await releasePostingLock(env.DB, videoPostingLockKey)
         await releasePostingLock(env.DB, pagePostingLockKey)
     }
+})
+
+// ==================== POST LOG HASHTAG LOOKUP (dashboard/CGO/Hermes) ====================
+// Given a log hashtag/code (e.g. `#f2skgi`), return the token-free details + related logs
+// for that visible page post. Namespace-scoped: a tenant can only read its own posts.
+// Output is passed through toSafePostLogOutput so no token/cookie/secret can leak.
+
+app.get('/api/dashboard/post-logs', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    const env = c.env
+    const namespaceId = String(c.get('botId') || '').trim()
+    if (!namespaceId || namespaceId === 'default') {
+        return c.json({ error: 'namespace_id_required', logs: [] }, 400)
+    }
+    await ensureFacebookPostLogTagsTable(env.DB)
+    const rawTag = c.req.query('tag') || c.req.query('code') || c.req.query('q') || ''
+    const code = normalizePostLogCode(rawTag)
+    const pageIdFilter = String(c.req.query('page_id') || '').trim()
+    const limit = Math.max(1, Math.min(100, parseInt(c.req.query('limit') || '', 10) || 20))
+    let results: Array<Record<string, unknown>> = []
+    if (code) {
+        const rows = await env.DB.prepare(
+            `SELECT * FROM facebook_post_log_tags WHERE log_code = ? AND (namespace_id = ? OR bot_id = ?) ORDER BY id DESC LIMIT ?`
+        ).bind(code, namespaceId, namespaceId, limit).all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+        results = (rows.results || []) as Array<Record<string, unknown>>
+    } else if (pageIdFilter) {
+        const rows = await env.DB.prepare(
+            `SELECT * FROM facebook_post_log_tags WHERE page_id = ? AND (namespace_id = ? OR bot_id = ?) ORDER BY id DESC LIMIT ?`
+        ).bind(pageIdFilter, namespaceId, namespaceId, limit).all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+        results = (rows.results || []) as Array<Record<string, unknown>>
+    } else {
+        const rows = await env.DB.prepare(
+            `SELECT * FROM facebook_post_log_tags WHERE (namespace_id = ? OR bot_id = ?) ORDER BY id DESC LIMIT ?`
+        ).bind(namespaceId, namespaceId, limit).all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+        results = (rows.results || []) as Array<Record<string, unknown>>
+    }
+    return c.json({
+        ok: true,
+        namespace_id: namespaceId,
+        query: { tag: rawTag || null, code: code || null, page_id: pageIdFilter || null, limit },
+        count: results.length,
+        logs: results.map((r) => toSafePostLogOutput(r)),
+    }, 200, { 'Cache-Control': 'private, no-store' })
+})
+
+app.get('/api/dashboard/post-log/:code', async (c) => {
+    const authCheck = await requireAuthSession(c)
+    if (!authCheck.ok) return authCheck.response
+    const env = c.env
+    const namespaceId = String(c.get('botId') || '').trim()
+    if (!namespaceId || namespaceId === 'default') {
+        return c.json({ error: 'namespace_id_required' }, 400)
+    }
+    const code = normalizePostLogCode(c.req.param('code'))
+    if (!code) return c.json({ error: 'invalid_log_code' }, 400)
+    await ensureFacebookPostLogTagsTable(env.DB)
+    const row = await env.DB.prepare(
+        `SELECT * FROM facebook_post_log_tags WHERE log_code = ? AND (namespace_id = ? OR bot_id = ?)`
+    ).bind(code, namespaceId, namespaceId).first().catch(() => null) as Record<string, unknown> | null
+    if (!row) return c.json({ error: 'not_found', code }, 404)
+    const safeLog = toSafePostLogOutput(row)
+    // Related token-free context: the source post_history row + any ad history sharing the story.
+    const related: Record<string, unknown> = {}
+    const historyId = Number(row.history_id || 0) || null
+    if (historyId) {
+        const hist = await env.DB.prepare(
+            `SELECT id, page_id, video_id, posted_at, status, trigger_source, fb_post_id, fb_reel_url,
+                    fb_video_id, shopee_link, lazada_link, comment_status, comment_fb_id, comment_error,
+                    comment_token_hint, post_token_hint, error_message, shortlink_utm_source,
+                    shortlink_status, shortlink_conversion_status
+             FROM post_history WHERE id = ? AND bot_id = ?`
+        ).bind(historyId, namespaceId).first().catch(() => null)
+        if (hist) related.post_history = sanitizeSnapshot(hist)
+    }
+    const storyId = String(row.story_id || row.fb_post_id || '').trim()
+    if (storyId) {
+        const ad = await env.DB.prepare(
+            `SELECT id, created_at, status, page_id, source_story_id, source_post_id, fb_video_id,
+                    campaign_id, campaign_name, adset_id, ad_id, creative_id, click_link, lane, mode
+             FROM dashboard_ad_history WHERE source_story_id = ? OR source_post_id = ? ORDER BY id DESC LIMIT 5`
+        ).bind(storyId, storyId).all().catch(() => ({ results: [] as Array<Record<string, unknown>> }))
+        const adRows = (ad.results || []) as Array<Record<string, unknown>>
+        if (adRows.length) related.ad_history = adRows.map((r) => sanitizeSnapshot(r))
+    }
+    return c.json({
+        ok: true,
+        namespace_id: namespaceId,
+        code,
+        hashtag: String(row.hashtag || `#${code}`),
+        log: safeLog,
+        related,
+    }, 200, { 'Cache-Control': 'private, no-store' })
 })
 
 // ==================== MANUAL REEL POST (ใส่ Page ID + Token เอง) ====================
@@ -46943,7 +47302,16 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             continue
         }
         const geminiModel = env.GEMINI_MODEL || 'gemini-3-flash-preview'
-        const caption = await buildPostingCaptionFromMeta(meta, apiKeys, geminiModel)
+        let caption = await buildPostingCaptionFromMeta(meta, apiKeys, geminiModel)
+        // Stamp a unique log hashtag onto this visible page post's caption (see force-post
+        // for rationale). Applies to every cron posting route. Best-effort — never blocks.
+        const cronCaptionBeforeLog = caption
+        let cronPostLogCode = await allocateUniquePostLogCode(env.DB).catch(() => '')
+        if (cronPostLogCode) {
+            const stamped = resolveCaptionWithPostLogTag({ caption, code: cronPostLogCode })
+            caption = stamped.caption
+            cronPostLogCode = stamped.code
+        }
 
         // Handle legacy publicUrls without botId or wrong domain
         const realVideoUrl = resolvePostingVideoDownloadUrl(env, sourceNamespaceId, unpostedId, publicUrl)
@@ -47032,6 +47400,25 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             sourceFingerprint || null,
         ).run()
         const cronHistoryId = Number(inserted.meta?.last_row_id || 0) || null
+
+        // Persist the post-log row now the history id is known; finalized after the cron run
+        // by reconcilePostLogTagsFromHistory in the scheduled finally. Best-effort.
+        if (cronPostLogCode) {
+            await insertInitialPostLogRow(env.DB, {
+                code: cronPostLogCode,
+                botId,
+                pageId: String(page.id || ''),
+                pageName: String(page.name || ''),
+                historyId: cronHistoryId,
+                captionBefore: cronCaptionBeforeLog,
+                captionAfter: caption,
+                shopeeLink: normalizedShopeeLink,
+                originalLink: rawShopeeLink,
+                sourceVideoId: unpostedId,
+                postingSource: pagePostingRoute,
+                commentSource: pageCommentTokenSource,
+            }).catch(() => { })
+        }
 
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
@@ -47956,6 +48343,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             pagesFailed: cronStats.pagesFailed,
             lastError: fatalError ? fatalError.message : null,
         }).catch(() => { })
+        // Backstop: finalize any post-log rows whose linked post_history reached a terminal
+        // state this run (story/status/error/snapshot). Best-effort, bounded, never throws.
+        await reconcilePostLogTagsFromHistory(env.DB, { limit: 300 }).catch(() => 0)
         await releasePostingLock(env.DB, scheduledRunLockKey)
     }
 
