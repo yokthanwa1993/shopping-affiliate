@@ -444,7 +444,7 @@ const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
-const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
+const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview'] as const
 const MERGE_CONTAINER_ENGINE_VERSION = '2026-06-29.final-upload-compress.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 
@@ -19178,7 +19178,7 @@ app.get('/api/settings/gemini-key', async (c) => {
             configured: vertexTtsSecretPresent,
             project_id: String(c.env.VERTEX_TTS_PROJECT_ID || '').trim() || null,
             location: String(c.env.VERTEX_TTS_LOCATION || '').trim() || 'global',
-            model: String(c.env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts',
+            model: String(c.env.VERTEX_TTS_MODEL || '').trim() || 'gemini-3.1-flash-tts-preview',
         },
         max_chars: MAX_GEMINI_API_KEY_CHARS,
         max_slots: MAX_GEMINI_API_KEY_SLOTS,

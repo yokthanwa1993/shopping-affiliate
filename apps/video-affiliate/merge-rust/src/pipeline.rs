@@ -59,7 +59,7 @@ const FLIP_PRIMARY_TIMEOUT_SECS: u64 = 150;
 const FLIP_FALLBACK_TIMEOUT_SECS: u64 = 60;
 const VERTEX_TTS_DEFAULT_ENDPOINT: &str = "https://aiplatform.googleapis.com";
 const VERTEX_TTS_DEFAULT_LOCATION: &str = "global";
-const VERTEX_TTS_DEFAULT_MODEL: &str = "gemini-2.5-flash-preview-tts";
+const VERTEX_TTS_DEFAULT_MODEL: &str = "gemini-3.1-flash-tts-preview";
 
 #[derive(Deserialize, Clone)]
 pub struct PipelineRequest {

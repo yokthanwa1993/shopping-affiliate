@@ -1004,7 +1004,7 @@ export async function runPipeline(
     const vertexTtsEndpoint = String(env.VERTEX_TTS_ENDPOINT || '').trim() || 'https://aiplatform.googleapis.com'
     const vertexTtsProjectId = String(env.VERTEX_TTS_PROJECT_ID || '').trim() || undefined
     const vertexTtsLocation = String(env.VERTEX_TTS_LOCATION || '').trim() || 'global'
-    const vertexTtsModel = String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts'
+    const vertexTtsModel = String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-3.1-flash-tts-preview'
     const vertexTtsServiceAccountJson = String((env as Env & { VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string }).VERTEX_TTS_SERVICE_ACCOUNT_JSON || '').trim()
     if (vertexTtsServiceAccountJson.length === 0) {
         throw new Error('ยังไม่ได้ตั้ง Vertex service account สำหรับ Vertex Gemini processing')

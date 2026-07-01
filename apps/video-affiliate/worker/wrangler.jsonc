@@ -81,7 +81,7 @@
         "VERTEX_TTS_ENDPOINT": "https://aiplatform.googleapis.com",
         "VERTEX_TTS_PROJECT_ID": "neezs-489110",
         "VERTEX_TTS_LOCATION": "global",
-        "VERTEX_TTS_MODEL": "gemini-2.5-flash-preview-tts",
+        "VERTEX_TTS_MODEL": "gemini-3.1-flash-tts-preview",
         "WEBAPP_URL": "https://app.pubilo.com",
         "WEBAPP_DESKTOP_URL": "https://app.pubilo.com",
         // Non-Electron Cloak FB posting bridge (apps/facebook-token-cloak — the existing
