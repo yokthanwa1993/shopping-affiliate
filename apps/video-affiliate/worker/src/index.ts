@@ -15592,23 +15592,16 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
         const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
         const sub2Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id2').catch(() => null)
-        const sub3Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id3').catch(() => null)
         const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
         const initialSub1 = String(subRow?.value || 'yok').trim()
-        // The first CTA is baked into Meta's ad creative before the dark story id exists. Never let
-        // it fall back to empty settings (`sub1----`): use the known source signal as sub2 and the
-        // page id as sub3. After the dark story is created, this route remints the final story-specific
-        // link and writes it to the story CTA/comment. This keeps Ads UI/creative clicks trackable even
-        // before/if the story CTA readback is used.
-        const initialSub2 = String(
-            validation.sourceStoryId
-            || validation.sourcePostId
-            || validation.fbVideoId
-            || validation.systemVideoId
-            || sub2Row?.value
-            || ''
-        ).trim()
-        const initialSub3 = String(validation.pageId || sub3Row?.value || '').trim()
+        // The first CTA is baked into Meta's ad creative/caption BEFORE the dark story id exists, so it
+        // uses the TWO-sub click-link contract exactly: sub1 = the page campaign/sub-campaign code, sub2
+        // = the page id, and NO sub3 (no post/story id — the dark story does not exist yet, and the
+        // caption/creative link must never carry a post id). After the dark story is created, this route
+        // remints the final story-specific link (sub1=campaign, sub2=page id, sub3=story tail) and writes
+        // it to the story CTA + Page comment. Never fall back to empty settings (`sub1----`).
+        const initialSub2 = String(validation.pageId || sub2Row?.value || '').trim()
+        const initialSub3 = ''
         const shortlinkUrl = buildAdOnlyShortlinkRequestUrl({
             template: tmpl,
             shopeeLink,
@@ -15745,21 +15738,30 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         logPrefix: `CREATE ADS ${validation.pageId}`,
     })
     bridgeResult.comment_target_story_id = adStoryIdForProof
+    // comment_target_post_id stays the final story/post tail — it names WHICH post is targeted, and is
+    // independent of the shortlink sub order below.
     bridgeResult.comment_target_post_id = commentSubIds.postSubId2
     const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
     const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
     const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
     const finalSub1 = String(subRow?.value || 'yok').trim()
+    // Final CTA/comment shortlink uses the THREE-sub click-link contract exactly: sub1 = the page
+    // campaign/sub-campaign code, sub2 = the page id, sub3 = the final dark story/post tail. This mirrors
+    // the two-sub caption/creative link above with the post tail appended once the story exists.
+    // buildPostingCommentShortlinkSubIds returns postSubId2 = post tail and postSubId3 = page id, so the
+    // page id maps to sub2 and the post tail maps to sub3.
+    const finalCtaSub2 = commentSubIds.postSubId3 // page id
+    const finalCtaSub3 = commentSubIds.postSubId2 // final story/post tail
     bridgeResult.sub1 = finalSub1
     bridgeResult.cta_sub1 = finalSub1
-    bridgeResult.cta_sub2 = commentSubIds.postSubId2
-    bridgeResult.cta_sub3 = commentSubIds.postSubId3
+    bridgeResult.cta_sub2 = finalCtaSub2
+    bridgeResult.cta_sub3 = finalCtaSub3
     const finalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
         template: tmpl,
         shopeeLink,
         sub1: finalSub1,
-        sub2: commentSubIds.postSubId2,
-        sub3: commentSubIds.postSubId3,
+        sub2: finalCtaSub2,
+        sub3: finalCtaSub3,
     })
     let finalLink = ''
     try {

@@ -208,17 +208,22 @@ test('schedule accepts the minor-units daily_budget alias (converted back to who
     assert.equal(s.dailyBudgetMinor, 30000)
 })
 
-test('create-ad-only initial creative shortlink never uses empty settings sub2/sub3', () => {
+// Click-link INITIAL creative/caption shortlink (before the dark story exists) is the TWO-sub contract:
+// sub1 = the page campaign/sub-campaign code, sub2 = the PAGE ID, and NO sub3 (no post/story id in the
+// caption/creative link). This fails on the old order (sub2 = source-signal post id, sub3 = page id).
+test('create-ad-only initial creative shortlink uses sub1=campaign, sub2=page id, blank sub3 (no post id)', () => {
     const route = getCreateAdOnlyRouteSource()
-    assert.match(route, /const initialSub2 = String\(/)
-    assert.match(route, /validation\.sourceStoryId/)
-    assert.match(route, /validation\.sourcePostId/)
-    assert.match(route, /validation\.fbVideoId/)
-    assert.match(route, /validation\.systemVideoId/)
-    assert.match(route, /const initialSub3 = String\(validation\.pageId/)
+    // sub1 is the page campaign/sub-campaign code from the sub_id page setting.
+    assert.match(route, /const initialSub1 = String\(subRow\?\.value \|\| 'yok'\)/)
+    // sub2 is the PAGE ID (never a story/post/video source signal).
+    assert.match(route, /const initialSub2 = String\(validation\.pageId \|\| sub2Row\?\.value \|\| ''\)/)
+    // sub3 is blank before the dark story exists — the caption/creative link never carries a post id.
+    assert.match(route, /const initialSub3 = ''/)
     assert.match(route, /sub2: initialSub2/)
     assert.match(route, /sub3: initialSub3/)
-    assert.doesNotMatch(route, /\.replace\('\{sub_id2\}', encodeURIComponent\(String\(sub2Row\?\.value \|\| ''\)/)
+    // The initial creative link must NOT put a source-signal id (story/post/fb video) into sub2/sub3.
+    assert.doesNotMatch(route, /const initialSub2 = String\(\s*validation\.sourceStoryId/)
+    assert.doesNotMatch(route, /const initialSub3 = String\(validation\.pageId/)
 })
 
 test('ad-history record carries mode + run_hours intent and echoes bridge budget/schedule', () => {
@@ -291,25 +296,31 @@ test('ad-history record for the unsupported path carries status + error, no resu
     assert.equal(rec.ad_id, '')
 })
 
-// Active ad-only finalization: after the bridge returns the dark-post story_id, the worker re-mints
-// the CTA/comment shortlink so it carries sub2 = post id tail and sub3 = page id. These two helpers
-// are the single source of truth for that derivation + request-url build, so assert them together.
-test('active ad-only re-mint derives sub2 = bridge story-id tail and sub3 = page id', () => {
+// Active click-link/ad-only finalization: after the bridge returns the dark-post story_id, the worker
+// re-mints the CTA/comment shortlink to the THREE-sub click-link contract — sub1 = campaign code, sub2 =
+// PAGE ID, sub3 = the final story/post tail. buildPostingCommentShortlinkSubIds returns postSubId2 = post
+// tail and postSubId3 = page id, so the finalization maps postSubId3 → sub2 (page id) and postSubId2 →
+// sub3 (post tail). This test fails on the OLD reversed order (sub2 = post tail, sub3 = page id).
+test('active ad-only re-mint maps sub2 = page id and sub3 = bridge story-id tail (three-sub contract)', () => {
     const bridgeStoryId = '111_222' // bridge effective_object_story_id = PAGEID_POSTID
     const pageId = '111'
     const subs = buildPostingCommentShortlinkSubIds({ canonicalPostId: bridgeStoryId, pageId, logPrefix: 'AD-ONLY ACTIVE' })
-    assert.equal(subs.postSubId2, '222') // post id tail, NEVER the page id
+    assert.equal(subs.postSubId2, '222') // post id tail
     assert.equal(subs.postSubId3, '111') // page id
 
+    // The finalization maps page id → sub2 and post tail → sub3.
+    const finalSub2 = subs.postSubId3 // page id
+    const finalSub3 = subs.postSubId2 // final story/post tail
     const url = buildAdOnlyShortlinkRequestUrl({
         template: 'https://short.wwoom.com/?id=X&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}',
         shopeeLink: 'https://shopee.co.th/product',
         sub1: 'yok',
-        sub2: subs.postSubId2,
-        sub3: subs.postSubId3,
+        sub2: finalSub2,
+        sub3: finalSub3,
     })
-    assert.ok(url.includes('sub2=222'), url)
-    assert.ok(url.includes('sub3=111'), url)
+    assert.ok(url.includes('sub2=111'), url) // page id in sub2
+    assert.ok(url.includes('sub3=222'), url) // final story/post tail in sub3
+    assert.ok(!url.includes('sub2=222'), 'sub2 must be the page id, never the post tail')
     assert.ok(url.includes('sub1=yok'), url)
     assert.ok(url.includes(`url=${encodeURIComponent('https://shopee.co.th/product')}`), url)
 })
@@ -419,8 +430,16 @@ test('create-ad-only records ad-story proof separately from old source signal id
     assert.match(routeSource, /bridgeResult\.final_shortlink = finalLink/)
     assert.match(routeSource, /bridgeResult\.sub1 = finalSub1/)
     assert.match(routeSource, /bridgeResult\.cta_sub1 = finalSub1/)
-    assert.match(routeSource, /bridgeResult\.cta_sub2 = commentSubIds\.postSubId2/)
-    assert.match(routeSource, /bridgeResult\.cta_sub3 = commentSubIds\.postSubId3/)
+    // Three-sub click-link contract: cta_sub2 = page id (postSubId3), cta_sub3 = post tail (postSubId2).
+    assert.match(routeSource, /const finalCtaSub2 = commentSubIds\.postSubId3/)
+    assert.match(routeSource, /const finalCtaSub3 = commentSubIds\.postSubId2/)
+    assert.match(routeSource, /bridgeResult\.cta_sub2 = finalCtaSub2/)
+    assert.match(routeSource, /bridgeResult\.cta_sub3 = finalCtaSub3/)
+    assert.match(routeSource, /sub2: finalCtaSub2/)
+    assert.match(routeSource, /sub3: finalCtaSub3/)
+    // Must NOT keep the old reversed mapping (cta_sub2 = post tail, cta_sub3 = page id).
+    assert.doesNotMatch(routeSource, /bridgeResult\.cta_sub2 = commentSubIds\.postSubId2/)
+    assert.doesNotMatch(routeSource, /bridgeResult\.cta_sub3 = commentSubIds\.postSubId3/)
     assert.doesNotMatch(routeSource, /sourceCommentTargetRaw/)
     assert.doesNotMatch(routeSource, /source_comment_target_story_id = sourceCommentTargetStoryId/)
 })
