@@ -316,9 +316,10 @@ test('buildAiClipProcessingQueueJob produces a legacy _queue-compatible job', ()
     assert.equal(job.status, 'queued')
     assert.equal(job.createdAt, '2026-06-29T02:00:00.000Z')
     assert.equal(job.sourceType, AI_CLIP_SOURCE_TYPE)
-    // AI/manual Media clips process WITHOUT burned subtitles — the flag rides the durable
-    // queue job so processNextInQueue forwards it to the merge /pipeline payload.
-    assert.equal(job.skipSubtitles, true)
+    // AI/manual Media clips use the normal subtitle-burn flow — the durable queue job carries
+    // NO skipSubtitles flag, so processNextInQueue defaults it to false and centered subtitles
+    // are burned in (matching legacy inbox/cadence jobs).
+    assert.equal('skipSubtitles' in job, false)
 })
 
 // ── One-at-a-time selection (never bulk-enqueue the source library) ──────────────────────
