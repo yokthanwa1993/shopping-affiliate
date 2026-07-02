@@ -84,6 +84,9 @@ export function createApp({ cfg = config, discord, db } = {}) {
       mediaRoot: cfg.mediaRoot,
       dbPath: cfg.dbPath,
       maxUploadBytes: cfg.maxUploadBytes,
+      counts: {
+        mediaItems: index.count(cfg.namespaceId),
+      },
     });
   });
 

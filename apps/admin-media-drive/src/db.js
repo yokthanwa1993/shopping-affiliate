@@ -67,6 +67,10 @@ export function openDb(dbPath) {
   const getByAttachmentStmt = db.prepare(
     'SELECT * FROM media_items WHERE namespace_id = ? AND attachment_id = ?',
   );
+  const countAllStmt = db.prepare('SELECT COUNT(*) AS n FROM media_items');
+  const countByNamespaceStmt = db.prepare(
+    'SELECT COUNT(*) AS n FROM media_items WHERE namespace_id = ?',
+  );
 
   function nowIso() {
     return new Date().toISOString();
@@ -100,6 +104,15 @@ export function openDb(dbPath) {
 
     getByAttachment(namespaceId, attachmentId) {
       return getByAttachmentStmt.get(namespaceId, attachmentId);
+    },
+
+    // Total indexed media rows. Pass a namespaceId to scope the count.
+    // Safe on a freshly-initialised (empty) DB: returns 0.
+    count(namespaceId) {
+      const row = namespaceId
+        ? countByNamespaceStmt.get(namespaceId)
+        : countAllStmt.get();
+      return row?.n ?? 0;
     },
 
     list({ namespaceId, channelId, status, limit = 100, offset = 0 } = {}) {

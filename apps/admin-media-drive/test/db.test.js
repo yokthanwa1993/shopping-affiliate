@@ -49,6 +49,31 @@ test('upsert inserts then updates by (namespace, attachment)', () => {
   db.close();
 });
 
+test('count is 0 on empty db and tallies rows per namespace', () => {
+  const db = openDb(tempDb());
+  assert.equal(db.count(), 0, 'empty db counts zero');
+  assert.equal(db.count('admin'), 0, 'empty namespace counts zero');
+
+  db.upsert({
+    namespace_id: 'admin', channel_id: 'c1', message_id: 'm1', attachment_id: 'a1',
+    filename: 'one.png', status: 'indexed',
+  });
+  db.upsert({
+    namespace_id: 'admin', channel_id: 'c1', message_id: 'm2', attachment_id: 'a2',
+    filename: 'two.png', status: 'indexed',
+  });
+  db.upsert({
+    namespace_id: 'other', channel_id: 'c1', message_id: 'm3', attachment_id: 'a3',
+    filename: 'three.png', status: 'indexed',
+  });
+
+  assert.equal(db.count(), 3, 'counts all rows');
+  assert.equal(db.count('admin'), 2, 'scopes to namespace');
+  assert.equal(db.count('other'), 1);
+
+  db.close();
+});
+
 test('list filters by namespace and channel, newest first', () => {
   const db = openDb(tempDb());
   db.upsert({
