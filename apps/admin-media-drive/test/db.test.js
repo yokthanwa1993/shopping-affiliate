@@ -49,6 +49,31 @@ test('upsert inserts then updates by (namespace, attachment)', () => {
   db.close();
 });
 
+test('discord-mode row: null local_path with discord_indexed status round-trips', () => {
+  const db = openDb(tempDb());
+  const row = db.upsert({
+    namespace_id: 'admin',
+    channel_id: 'c1',
+    message_id: 'm1',
+    attachment_id: 'a1',
+    filename: 'clip.mp4',
+    content_type: 'video/mp4',
+    size: 1234,
+    local_path: null, // Discord holds the file; nothing stored locally
+    discord_url: 'https://cdn/clip',
+    jump_url: 'https://discord/clip',
+    status: 'discord_indexed',
+  });
+  assert.equal(row.local_path, null, 'local_path stays null');
+  assert.equal(row.status, 'discord_indexed');
+
+  const again = db.getByAttachment('admin', 'a1');
+  assert.equal(again.local_path, null);
+  assert.equal(again.status, 'discord_indexed');
+
+  db.close();
+});
+
 test('count is 0 on empty db and tallies rows per namespace', () => {
   const db = openDb(tempDb());
   assert.equal(db.count(), 0, 'empty db counts zero');

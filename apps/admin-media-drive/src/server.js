@@ -6,7 +6,7 @@ import express from 'express';
 import helmet from 'helmet';
 import multer from 'multer';
 
-import config from './config.js';
+import config, { defaultIndexStatus } from './config.js';
 import { openDb } from './db.js';
 import { DiscordService, isMediaUpload } from './discord.js';
 import {
@@ -33,6 +33,10 @@ export function createApp({ cfg = config, discord, db } = {}) {
   const svc = discord || new DiscordService(cfg.discord);
   const index = db || openDb(cfg.dbPath);
 
+  // Discord-backed storage is the default: Discord holds 100% of the media,
+  // the Mac mini only indexes metadata. `mirror` is the legacy local-copy mode.
+  const mirrorMode = cfg.storageMode === 'mirror';
+
   function requireBot(res) {
     if (!svc.configured) {
       res.status(503).json({ error: 'Discord bot is not configured', configured: false });
@@ -51,7 +55,7 @@ export function createApp({ cfg = config, discord, db } = {}) {
 
   // Map a Discord attachment description into a media_items row and index it,
   // optionally recording a local mirror path.
-  function indexAttachment(item, { localPath = null, status = 'indexed' } = {}) {
+  function indexAttachment(item, { localPath = null, status = defaultIndexStatus(cfg.storageMode) } = {}) {
     return index.upsert({
       namespace_id: cfg.namespaceId,
       channel_id: item.channelId,
@@ -79,10 +83,14 @@ export function createApp({ cfg = config, discord, db } = {}) {
       ok: true,
       service: 'admin-media-drive',
       namespaceId: cfg.namespaceId,
+      storageMode: cfg.storageMode,
       configured: svc.configured,
       ready: svc.ready,
+      // In discord mode mediaRoot is only a transient temp/cache dir.
       mediaRoot: cfg.mediaRoot,
       dbPath: cfg.dbPath,
+      sourceChannelId: cfg.discord.sourceChannelId,
+      processedChannelId: cfg.discord.processedChannelId,
       maxUploadBytes: cfg.maxUploadBytes,
       counts: {
         mediaItems: index.count(cfg.namespaceId),
@@ -112,6 +120,9 @@ export function createApp({ cfg = config, discord, db } = {}) {
       } : null,
       guildId: cfg.discord.guildId,
       defaultChannelId: cfg.discord.defaultChannelId,
+      sourceChannelId: cfg.discord.sourceChannelId,
+      processedChannelId: cfg.discord.processedChannelId,
+      storageMode: cfg.storageMode,
       maxUploadBytes: cfg.maxUploadBytes,
       namespaceId: cfg.namespaceId,
       channels,
@@ -169,7 +180,10 @@ export function createApp({ cfg = config, discord, db } = {}) {
     }
   });
 
-  // --- Sync a channel: index recent media + download missing mirrors ------
+  // --- Sync a channel ------------------------------------------------------
+  // discord mode (default): index recent-message metadata only. No attachment
+  //   bodies are downloaded. Reports indexed / skipped / failed.
+  // mirror mode (legacy): also downloads missing local mirrors.
   app.post('/api/sync-channel', async (req, res) => {
     if (!requireBot(res)) return;
     const channelId = String(req.body?.channelId || cfg.discord.defaultChannelId || '').trim();
@@ -179,10 +193,36 @@ export function createApp({ cfg = config, discord, db } = {}) {
     }
     try {
       const items = await svc.fetchMediaItems(channelId, limit);
+
+      if (!mirrorMode) {
+        // Discord-backed: metadata only, never fetch the file body.
+        let indexed = 0;
+        let skipped = 0;
+        let failed = 0;
+        for (const item of items) {
+          try {
+            const existed = index.getByAttachment(cfg.namespaceId, item.id);
+            indexAttachment(item, { localPath: null, status: 'discord_indexed' });
+            if (existed) skipped += 1; else indexed += 1;
+          } catch {
+            failed += 1;
+          }
+        }
+        return res.json({
+          mode: 'discord',
+          channelId,
+          total: items.length,
+          indexed,
+          skipped,
+          failed,
+          downloaded: 0,
+        });
+      }
+
+      // Legacy mirror mode: download missing local copies.
       let downloaded = 0;
       let skipped = 0;
       let failed = 0;
-
       for (const item of items) {
         const target = localPathFor(cfg.mediaRoot, item.id, item.filename, item.createdAt);
         let localPath = null;
@@ -201,6 +241,7 @@ export function createApp({ cfg = config, discord, db } = {}) {
       }
 
       res.json({
+        mode: 'mirror',
         channelId,
         total: items.length,
         downloaded,
@@ -212,10 +253,29 @@ export function createApp({ cfg = config, discord, db } = {}) {
     }
   });
 
-  // --- Serve a locally-mirrored file with HTTP Range support --------------
-  app.get('/api/local-media/:id/file', (req, res) => {
+  // --- File access for an indexed item ------------------------------------
+  // discord mode (default): redirect to a FRESH Discord CDN url resolved from
+  //   the DB row (no local file is kept). mirror mode: serve the local mirror
+  //   with HTTP Range support.
+  app.get('/api/local-media/:id/file', async (req, res) => {
     const row = index.getById(req.params.id);
-    if (!row || !row.local_path) {
+    if (!row) {
+      return res.status(404).json({ error: 'Unknown media item' });
+    }
+
+    if (!mirrorMode) {
+      // Discord-backed: no local bytes — hand back a fresh CDN url.
+      if (!requireBot(res)) return;
+      try {
+        const url = await svc.resolveFreshUrl(row.channel_id, row.message_id, row.attachment_id);
+        return res.redirect(302, url);
+      } catch (error) {
+        return res.status(error?.status || 500)
+          .json({ error: error?.message || 'Failed to resolve fresh Discord URL' });
+      }
+    }
+
+    if (!row.local_path) {
       return res.status(404).json({ error: 'No local mirror for this item' });
     }
     // Confirm the stored path is still under MEDIA_ROOT before serving.
@@ -302,24 +362,33 @@ export function createApp({ cfg = config, discord, db } = {}) {
         caption: req.body.caption,
       });
 
-      // Write the local mirror using the deterministic path scheme.
+      // discord mode (default): Discord keeps the only copy — index metadata
+      // only, never write a permanent local file. mirror mode: also mirror it.
       let localPath = null;
-      let status = 'indexed';
-      try {
-        const target = localPathFor(cfg.mediaRoot, item.id, item.filename, item.createdAt);
-        await writeBuffer(target, file.buffer);
-        localPath = target;
-        status = 'mirrored';
-      } catch {
-        status = 'index_only';
+      let status = 'discord_indexed';
+      if (mirrorMode) {
+        status = 'indexed';
+        try {
+          const target = localPathFor(cfg.mediaRoot, item.id, item.filename, item.createdAt);
+          await writeBuffer(target, file.buffer);
+          localPath = target;
+          status = 'mirrored';
+        } catch {
+          status = 'index_only';
+        }
       }
 
       const row = indexAttachment(item, { localPath, status });
+      // In discord mode this url 302-redirects to a fresh CDN link; in mirror
+      // mode it streams the local file. Same route, mode-aware behaviour.
+      const fileUrl = row?.id ? `/api/local-media/${row.id}/file` : null;
       res.status(201).json({
         ...item,
         dbId: row?.id,
+        storageMode: cfg.storageMode,
         localPath,
-        localFileUrl: row?.id ? `/api/local-media/${row.id}/file` : null,
+        fileUrl,
+        localFileUrl: fileUrl,
         status,
       });
     } catch (error) {

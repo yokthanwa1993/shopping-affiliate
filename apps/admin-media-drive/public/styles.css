@@ -68,6 +68,11 @@ h2 {
   color: var(--muted);
 }
 
+.subtle {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
 .hint {
   font-size: 13px;
   margin-bottom: 12px;

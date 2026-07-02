@@ -12,6 +12,7 @@
         <div>
           <h1>Admin Media Drive</h1>
           <p id="statusText">Connecting to Discord</p>
+          <p class="subtle" id="storageModeText">Discord storage</p>
         </div>
         <div class="bot-badge" id="botBadge">Offline</div>
       </header>
@@ -50,7 +51,7 @@
         <section class="panel result-panel" id="resultPanel" hidden>
           <div class="panel-head">
             <h2>Latest Upload</h2>
-            <span class="success">Uploaded &amp; mirrored</span>
+            <span class="success">Uploaded to Discord</span>
           </div>
           <div id="resultBody"></div>
         </section>
@@ -58,9 +59,9 @@
 
       <section class="panel gallery-panel">
         <div class="panel-head">
-          <h2>Indexed Local Media</h2>
+          <h2>Discord Media (indexed)</h2>
           <div class="head-actions">
-            <button class="icon-button" type="button" id="syncButton" title="Sync channel to local mirror">Sync channel</button>
+            <button class="icon-button" type="button" id="syncButton" title="Index channel metadata from Discord">Sync channel</button>
             <button class="icon-button" type="button" id="reloadIndexButton" title="Reload index">Reload</button>
           </div>
         </div>

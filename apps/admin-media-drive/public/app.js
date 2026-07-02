@@ -2,10 +2,12 @@ const state = {
   status: null,
   selectedFile: null,
   maxUploadBytes: 10 * 1024 * 1024,
+  storageMode: 'discord',
 };
 
 const els = {
   statusText: document.querySelector('#statusText'),
+  storageModeText: document.querySelector('#storageModeText'),
   botBadge: document.querySelector('#botBadge'),
   channelSelect: document.querySelector('#channelSelect'),
   captionInput: document.querySelector('#captionInput'),
@@ -52,7 +54,13 @@ function setUploadEnabled() {
 function renderStatus(status) {
   state.status = status;
   state.maxUploadBytes = status.maxUploadBytes || state.maxUploadBytes;
+  state.storageMode = status.storageMode || state.storageMode;
   els.limitText.textContent = `Max single attachment: ${formatBytes(state.maxUploadBytes)}`;
+  if (els.storageModeText) {
+    els.storageModeText.textContent = state.storageMode === 'mirror'
+      ? 'Local mirror mode (legacy)'
+      : 'Discord storage — Discord holds the files, this indexes metadata only';
+  }
 
   if (!status.configured) {
     els.statusText.textContent = 'Missing Discord bot config';
@@ -121,9 +129,11 @@ async function loadIndex() {
     const isVideo = String(item.content_type || '').startsWith('video/')
       || /\.(mp4|mov|m4v|webm)$/i.test(item.filename || '');
     const hasLocal = Boolean(item.local_path);
-    const localUrl = `/api/local-media/${item.id}/file`;
+    // In discord mode this route 302-redirects to a fresh Discord CDN url; in
+    // mirror mode it streams the local mirror.
+    const fileUrl = `/api/local-media/${item.id}/file`;
     const freshUrl = `/api/media/${item.channel_id}/${item.message_id}/${item.attachment_id}`;
-    const previewSrc = hasLocal ? localUrl : freshUrl;
+    const previewSrc = hasLocal ? fileUrl : freshUrl;
     const media = isVideo
       ? `<video class="media-thumb" src="${previewSrc}" controls muted preload="metadata"></video>`
       : `<img class="media-thumb" src="${previewSrc}" alt="" loading="lazy">`;
@@ -133,9 +143,9 @@ async function loadIndex() {
         ${media}
         <div class="media-caption">
           <strong title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</strong>
-          <span class="meta">${formatBytes(item.size)} · ${escapeHtml(item.status || 'indexed')}</span>
+          <span class="meta">${formatBytes(item.size)} · ${escapeHtml(item.status || 'discord_indexed')}</span>
           <div class="links">
-            ${hasLocal ? `<a href="${localUrl}" target="_blank" rel="noreferrer">Local file</a>` : '<span class="meta">no mirror</span>'}
+            <a href="${fileUrl}" target="_blank" rel="noreferrer">${hasLocal ? 'Local file' : 'Open file'}</a>
             <a href="${freshUrl}" target="_blank" rel="noreferrer">Fresh URL</a>
           </div>
         </div>
@@ -160,8 +170,9 @@ async function syncChannel() {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Sync failed');
-    els.indexHint.textContent =
-      `Synced ${data.total}: ${data.downloaded} downloaded, ${data.skipped} already local, ${data.failed} index-only`;
+    els.indexHint.textContent = data.mode === 'mirror'
+      ? `Synced ${data.total}: ${data.downloaded} downloaded, ${data.skipped} already local, ${data.failed} index-only`
+      : `Indexed ${data.total} from Discord: ${data.indexed} new, ${data.skipped} already indexed, ${data.failed} failed (no files downloaded)`;
     await loadIndex();
   } catch (error) {
     alert(error.message);
@@ -186,16 +197,17 @@ function renderFileMeta(file) {
 function renderResult(result) {
   els.resultPanel.hidden = false;
   els.resultBody.className = 'result-body';
-  const localFileUrl = result.localFileUrl;
+  const fileUrl = result.fileUrl || result.localFileUrl;
+  const fileLabel = result.localPath ? 'Local file' : 'Open file';
   els.resultBody.innerHTML = `
     <div>
       <strong>${escapeHtml(result.filename)}</strong>
-      <div class="meta">${formatBytes(result.size)} · ${escapeHtml(result.contentType || 'media')} · ${escapeHtml(result.status || 'indexed')}</div>
+      <div class="meta">${formatBytes(result.size)} · ${escapeHtml(result.contentType || 'media')} · ${escapeHtml(result.status || 'discord_indexed')}</div>
     </div>
     <div class="result-actions">
       <a href="${result.jumpUrl}" target="_blank" rel="noreferrer">Open Message</a>
       <a href="${result.proxyUrl}" target="_blank" rel="noreferrer">Fresh URL</a>
-      ${localFileUrl ? `<a href="${localFileUrl}" target="_blank" rel="noreferrer">Local file</a>` : ''}
+      ${fileUrl ? `<a href="${fileUrl}" target="_blank" rel="noreferrer">${fileLabel}</a>` : ''}
     </div>
   `;
 }
