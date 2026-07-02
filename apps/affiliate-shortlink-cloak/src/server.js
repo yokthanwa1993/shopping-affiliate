@@ -679,6 +679,35 @@ function reportReauthDeps() {
   };
 }
 
+// Resolve the effective account for a shorten query the same way handleShorten's
+// happy path does, but WITHOUT throwing. The legacy public shortlink shape is
+//   /?id=15130770000&url=https://shopee.co.th/...&sub1
+// which carries no `account` param — the mapped Shopee affiliate id is the only
+// account signal. handleShorten already honours that, but the manual-login
+// payload must not fall back to sanitizeAccount(query.account) === DEFAULT_ACCOUNT
+// and mislabel a CHEARB/NEEZS session as `default`. Shared so both report the
+// same id-mapped account. Bare `&sub1` (empty value) never affects resolution.
+function resolveShortenAccountInfo(query = {}) {
+  const rawUrl = String(query.url || '').trim();
+  const platform = sanitizePlatform(query.platform) || detectPlatform(rawUrl) || '';
+  const rawAccount = String(query.account || '').trim();
+  const explicitId = normalizeShopeeAffiliateId(String(query.id == null ? '' : query.id).trim());
+  if (platform === 'shopee' && explicitId) {
+    const meta = resolveShopeeAccountMetadataFromId(explicitId);
+    if (meta && meta.account) {
+      const account = sanitizeAccount(meta.account);
+      return {
+        platform,
+        account,
+        responseAccount: String(meta.displayAccount || account).trim() || account,
+        explicitId,
+      };
+    }
+  }
+  const account = sanitizeAccount(rawAccount);
+  return { platform, account, responseAccount: account, explicitId };
+}
+
 async function handleShorten(query, opts = {}) {
   const rawUrl = String(query.url || '').trim();
   if (!rawUrl) throw new Error('Missing required parameter: url');
@@ -1571,8 +1600,12 @@ function accountListsForHtml() {
 }
 
 function buildManualLoginRequiredPayload(query = {}, err = {}) {
-  const platform = sanitizePlatform(query.platform) || detectPlatform(String(query.url || ''));
-  const account = sanitizeAccount(query.account);
+  // Resolve id-mapped account (e.g. id=15130770000 -> affiliate_chearb.com) so the
+  // legacy `/?id=...&url=...&sub1` shape never mislabels the blocked session as
+  // `default` when no explicit `account` param is present.
+  const resolved = resolveShortenAccountInfo(query);
+  const platform = resolved.platform || sanitizePlatform(query.platform) || detectPlatform(String(query.url || ''));
+  const account = resolved.account;
   const payload = {
     status: 'manual_login_required',
     error: 'manual_login_required',
@@ -2164,6 +2197,7 @@ module.exports = {
   createServer,
   start,
   handleShorten,
+  resolveShortenAccountInfo,
   handleClickReport: clickReport.handleClickReport,
   isClickReportHost: clickReport.isClickReportHost,
   handleConversionReport: conversionReport.handleConversionReport,

@@ -1931,6 +1931,44 @@ test('buildManualLoginRequiredPayload preserves manual-login JSON contract with 
   assert.equal(/password|secret|cookie|token/i.test(JSON.stringify(payload.diagnostic)), false);
 });
 
+test('resolveShortenAccountInfo maps legacy id=15130770000 to CHEARB when account is absent', () => {
+  const info = server.resolveShortenAccountInfo({
+    id: '15130770000',
+    url: 'https://shopee.co.th/i-i.868401466.23383899202',
+    sub1: '',
+  });
+  assert.equal(info.platform, 'shopee');
+  assert.equal(info.account, 'affiliate_chearb.com');
+  assert.equal(info.responseAccount, 'affiliate@chearb.com');
+  assert.equal(info.explicitId, '15130770000');
+});
+
+test('resolveShortenAccountInfo maps known id=15142270000 to NEEZS when account is absent', () => {
+  const info = server.resolveShortenAccountInfo({
+    id: '15142270000',
+    url: 'https://shopee.co.th/-i.111.222',
+  });
+  assert.equal(info.account, 'affiliate_neezs.com');
+  assert.equal(info.responseAccount, 'affiliate@neezs.com');
+});
+
+test('buildManualLoginRequiredPayload reports id-mapped CHEARB account for legacy ?id= shape (no account param, bare &sub1)', () => {
+  const err = new Error('MANUAL_LOGIN_REQUIRED');
+  err.reason = 'captcha_or_otp_detected';
+  // Exact legacy public shortlink query shape: id + url + bare &sub1, no account.
+  const payload = server.buildManualLoginRequiredPayload({
+    id: '15130770000',
+    url: 'https://shopee.co.th/i-i.868401466.23383899202',
+    sub1: '',
+  }, err);
+  assert.equal(payload.status, 'manual_login_required');
+  assert.equal(payload.reason, 'captcha_or_otp_detected');
+  assert.equal(payload.platform, 'shopee');
+  // The bug this guards: account must be CHEARB, never `default`.
+  assert.equal(payload.account, 'affiliate_chearb.com');
+  assert.notEqual(payload.account, 'default');
+});
+
 test('handleDebug exposes only sanitized recent login diagnostics', () => {
   const err = new Error('MANUAL_LOGIN_REQUIRED');
   err.reason = 'username_field_not_found';
@@ -2334,6 +2372,44 @@ test('GET /?url=...&account=blank returns manual_login_required payload (no brow
   assert.ok(parsed.keychainCredential, 'manual_login_required payload must surface keychainCredential metadata');
   assert.equal(parsed.keychainCredential.present, false);
   assert.ok(Array.isArray(parsed.readyAccounts), 'payload must include readyAccounts list (metadata only)');
+  assert.equal(getPageCalls.length, 0, 'no browser call should have been made');
+});
+
+test('GET exact legacy /?id=15130770000&url=...&sub1 routes to CHEARB account (not default), no browser opened', async (t) => {
+  server._resetSessionStateCacheForTest();
+  t.after(() => server._resetSessionStateCacheForTest());
+
+  const originalGetPage = browser.getPage;
+  const getPageCalls = [];
+  browser.getPage = async (...args) => {
+    getPageCalls.push(args);
+    throw new Error('browser.getPage must NOT be called for the legacy id route in this test');
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  stubKeychain(t, {
+    isSupported: () => true,
+    findCredential: async () => null,
+    hasCredential: async () => null,
+    listCredentials: async () => [],
+  });
+
+  const instance = await startTestServer();
+  t.after(() => stopTestServer(instance));
+
+  // Exact legacy public shortlink query shape, sent RAW (no account param, bare &sub1).
+  const res = await httpRequest(instance, {
+    method: 'GET',
+    path: '/?id=15130770000&url=https://shopee.co.th/i-i.868401466.23383899202&sub1',
+  });
+  assert.equal(res.statusCode, 200);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.status, 'manual_login_required');
+  assert.equal(parsed.manualLoginRequired, true);
+  assert.equal(parsed.platform, 'shopee');
+  // Core assertion: id=15130770000 resolves to CHEARB even though `account` is absent.
+  assert.equal(parsed.account, 'affiliate_chearb.com');
+  assert.notEqual(parsed.account, 'default');
   assert.equal(getPageCalls.length, 0, 'no browser call should have been made');
 });
 
