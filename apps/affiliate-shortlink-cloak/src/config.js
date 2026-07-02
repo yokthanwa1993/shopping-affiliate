@@ -33,6 +33,23 @@ const BETWEEN_ATTEMPT_DELAY_MS = [0, 1500, 3500];
 // Override with env AFFILIATE_CLOAK_BROWSER_IDLE_MS; set it to 0 to disable.
 const DEFAULT_BROWSER_IDLE_MS = 30000;
 
+// Keep-warm mode: keep the headless shortlink context resident and reuse it
+// across shortlink calls instead of idle-closing + relaunching. Relaunching is
+// what produces a transient macOS Dock bounce on every call in the hot path, so
+// keeping the context warm avoids the bounce entirely. Only headless contexts
+// are kept warm; headed/manual (forceVisible) login windows are never touched by
+// this and stay open for the operator. Warm contexts are released on explicit
+// shutdown (closeAll) or when a launch-mode change forces a relaunch.
+//
+// Resolution (env AFFILIATE_CLOAK_BROWSER_KEEP_WARM):
+//   - explicit 1/true/yes/on  -> keep warm (never idle-close headless)
+//   - explicit 0/false/no/off -> disabled (honor idle-close)
+//   - unset: keep warm UNLESS the operator opted into idle-close by setting an
+//     explicit AFFILIATE_CLOAK_BROWSER_IDLE_MS, in which case idle-close wins.
+// Keep-warm takes precedence over AFFILIATE_CLOAK_BROWSER_IDLE_MS when enabled.
+const KEEP_WARM_ENV = 'AFFILIATE_CLOAK_BROWSER_KEEP_WARM';
+const IDLE_MS_ENV = 'AFFILIATE_CLOAK_BROWSER_IDLE_MS';
+
 module.exports = {
   DEFAULT_PORT,
   DEFAULT_HOST,
@@ -50,4 +67,6 @@ module.exports = {
   MAX_SHORTEN_ATTEMPTS,
   BETWEEN_ATTEMPT_DELAY_MS,
   DEFAULT_BROWSER_IDLE_MS,
+  KEEP_WARM_ENV,
+  IDLE_MS_ENV,
 };

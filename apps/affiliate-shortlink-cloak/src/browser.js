@@ -1,7 +1,14 @@
 'use strict';
 
 const { ensureProfileDir, sanitizeAccount, sanitizePlatform } = require('./accounts');
-const { CHROME_UA, SHOPEE_URL, LAZADA_URL, DEFAULT_BROWSER_IDLE_MS } = require('./config');
+const {
+  CHROME_UA,
+  SHOPEE_URL,
+  LAZADA_URL,
+  DEFAULT_BROWSER_IDLE_MS,
+  KEEP_WARM_ENV,
+  IDLE_MS_ENV,
+} = require('./config');
 
 let chromiumImpl = null;
 let chromiumSource = '';
@@ -47,11 +54,36 @@ function contextKey(platform, account) {
 // Resolve the idle-close window fresh on every schedule so env changes (and
 // tests) take effect without a restart. Unset/blank -> default; 0 disables.
 function resolveIdleMs() {
-  const raw = process.env.AFFILIATE_CLOAK_BROWSER_IDLE_MS;
+  const raw = process.env[IDLE_MS_ENV];
   if (raw === undefined || raw === '') return DEFAULT_BROWSER_IDLE_MS;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return DEFAULT_BROWSER_IDLE_MS;
   return Math.floor(n);
+}
+
+const KEEP_WARM_TRUE = new Set(['1', 'true', 'yes', 'on']);
+const KEEP_WARM_FALSE = new Set(['0', 'false', 'no', 'off']);
+
+// Decide whether headless shortlink contexts should be kept warm (resident and
+// reused) instead of idle-closed + relaunched. Relaunching is what causes the
+// per-call macOS Dock bounce in the hot path, so warm reuse avoids it. Resolved
+// fresh on every schedule so env changes (and tests) take effect immediately.
+//
+// Explicit AFFILIATE_CLOAK_BROWSER_KEEP_WARM wins. When unset, we keep warm by
+// default UNLESS the operator explicitly opted into idle-close by setting an
+// AFFILIATE_CLOAK_BROWSER_IDLE_MS value (any value, including 0) — in that case
+// we defer to the idle-close configuration instead of overriding their intent.
+function resolveKeepWarm() {
+  const raw = process.env[KEEP_WARM_ENV];
+  if (raw !== undefined && raw !== '') {
+    const v = String(raw).trim().toLowerCase();
+    if (KEEP_WARM_TRUE.has(v)) return true;
+    if (KEEP_WARM_FALSE.has(v)) return false;
+    // Unknown value: fall through to the default resolution below.
+  }
+  const idleRaw = process.env[IDLE_MS_ENV];
+  const idleExplicit = idleRaw !== undefined && idleRaw !== '';
+  return !idleExplicit;
 }
 
 function clearIdleTimer(record) {
@@ -64,10 +96,13 @@ function clearIdleTimer(record) {
 // Reset the idle-close timer for a context on each use. Only headless contexts
 // are auto-closed by default: headed/manual (forceVisible) contexts are left
 // alone so a user can complete a login without the window vanishing under them.
+// In keep-warm mode headless contexts are also left resident so the shortlink
+// hot path reuses them instead of relaunching (which is what bounces the Dock).
 function scheduleIdleClose(record) {
   if (!record) return;
   clearIdleTimer(record);
   if (!record.headless) return; // keep headed/manual contexts as-is
+  if (resolveKeepWarm()) return; // keep-warm: reuse headless context, no relaunch
   const idleMs = resolveIdleMs();
   if (!idleMs || idleMs <= 0) return; // 0 disables auto-close
   const timer = setTimeout(() => {
@@ -159,6 +194,7 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
     context,
     headless: effectiveHeadless,
     launchMode: effectiveHeadless ? 'headless' : 'headed',
+    keepWarm: effectiveHeadless ? resolveKeepWarm() : false,
     lastUsedAt: Date.now(),
     createdAt: Date.now(),
     idleTimer: null,
@@ -240,6 +276,7 @@ function listLoadedContexts() {
     profileDir: r.profileDir,
     headless: r.headless,
     launchMode: r.launchMode,
+    keepWarm: !!r.keepWarm,
     createdAt: r.createdAt,
     lastUsedAt: r.lastUsedAt,
     pages: (() => {
@@ -264,6 +301,7 @@ function __setChromiumForTest(source, impl) {
 module.exports = {
   loadChromium,
   backendInfo,
+  resolveKeepWarm,
   getContext,
   getPage,
   ensureOnPlatformPage,
