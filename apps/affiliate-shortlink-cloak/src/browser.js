@@ -1,7 +1,7 @@
 'use strict';
 
 const { ensureProfileDir, sanitizeAccount, sanitizePlatform } = require('./accounts');
-const { CHROME_UA, SHOPEE_URL, LAZADA_URL } = require('./config');
+const { CHROME_UA, SHOPEE_URL, LAZADA_URL, DEFAULT_BROWSER_IDLE_MS } = require('./config');
 
 let chromiumImpl = null;
 let chromiumSource = '';
@@ -44,6 +44,47 @@ function contextKey(platform, account) {
   return `${platform}::${account}`;
 }
 
+// Resolve the idle-close window fresh on every schedule so env changes (and
+// tests) take effect without a restart. Unset/blank -> default; 0 disables.
+function resolveIdleMs() {
+  const raw = process.env.AFFILIATE_CLOAK_BROWSER_IDLE_MS;
+  if (raw === undefined || raw === '') return DEFAULT_BROWSER_IDLE_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_BROWSER_IDLE_MS;
+  return Math.floor(n);
+}
+
+function clearIdleTimer(record) {
+  if (record && record.idleTimer) {
+    clearTimeout(record.idleTimer);
+    record.idleTimer = null;
+  }
+}
+
+// Reset the idle-close timer for a context on each use. Only headless contexts
+// are auto-closed by default: headed/manual (forceVisible) contexts are left
+// alone so a user can complete a login without the window vanishing under them.
+function scheduleIdleClose(record) {
+  if (!record) return;
+  clearIdleTimer(record);
+  if (!record.headless) return; // keep headed/manual contexts as-is
+  const idleMs = resolveIdleMs();
+  if (!idleMs || idleMs <= 0) return; // 0 disables auto-close
+  const timer = setTimeout(() => {
+    const key = contextKey(record.platform, record.account);
+    const cur = contexts.get(key);
+    if (cur !== record) return; // superseded/relaunched; nothing to close
+    record.idleTimer = null;
+    contexts.delete(key);
+    if (record.context.__closed) return;
+    Promise.resolve()
+      .then(() => record.context.close())
+      .catch(() => {});
+  }, idleMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  record.idleTimer = timer;
+}
+
 function defaultUrlFor(platform) {
   if (platform === 'shopee') return SHOPEE_URL;
   if (platform === 'lazada') return LAZADA_URL;
@@ -74,11 +115,17 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
     const existing = contexts.get(key);
     if (!existing.context.__closed) {
       const launchModeMismatch = existing.headless !== effectiveHeadless;
-      if (!forceNew && !launchModeMismatch) return existing;
+      if (!forceNew && !launchModeMismatch) {
+        existing.lastUsedAt = Date.now();
+        scheduleIdleClose(existing);
+        return existing;
+      }
+      clearIdleTimer(existing);
       contexts.delete(key);
       try { await existing.context.close(); } catch {}
       existing.context.__closed = true;
     } else {
+      clearIdleTimer(existing);
       contexts.delete(key);
     }
   }
@@ -99,7 +146,10 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
   context.on('close', () => {
     context.__closed = true;
     const cur = contexts.get(key);
-    if (cur && cur.context === context) contexts.delete(key);
+    if (cur && cur.context === context) {
+      clearIdleTimer(cur);
+      contexts.delete(key);
+    }
   });
 
   const record = {
@@ -111,8 +161,10 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
     launchMode: effectiveHeadless ? 'headless' : 'headed',
     lastUsedAt: Date.now(),
     createdAt: Date.now(),
+    idleTimer: null,
   };
   contexts.set(key, record);
+  scheduleIdleClose(record);
   return record;
 }
 
@@ -140,6 +192,7 @@ async function getPage(platform, account, opts) {
     try { await other.close(); } catch {}
   }
   record.lastUsedAt = Date.now();
+  scheduleIdleClose(record);
   return { record, page };
 }
 
@@ -173,6 +226,7 @@ async function closeAll() {
   const records = Array.from(contexts.values());
   contexts.clear();
   for (const record of records) {
+    clearIdleTimer(record);
     try {
       await record.context.close();
     } catch {}

@@ -27,6 +27,12 @@ const SHORTEN_TIMEOUT_MS = 25000;
 const MAX_SHORTEN_ATTEMPTS = 3;
 const BETWEEN_ATTEMPT_DELAY_MS = [0, 1500, 3500];
 
+// Auto-close idle browser contexts so the CloakBrowser Chromium process (and its
+// macOS Dock icon) doesn't linger between shortlink calls. Sessions persist via
+// the persistent userDataDir cookies, so reopening on the next call is cheap.
+// Override with env AFFILIATE_CLOAK_BROWSER_IDLE_MS; set it to 0 to disable.
+const DEFAULT_BROWSER_IDLE_MS = 30000;
+
 module.exports = {
   DEFAULT_PORT,
   DEFAULT_HOST,
@@ -43,4 +49,5 @@ module.exports = {
   SHORTEN_TIMEOUT_MS,
   MAX_SHORTEN_ATTEMPTS,
   BETWEEN_ATTEMPT_DELAY_MS,
+  DEFAULT_BROWSER_IDLE_MS,
 };
