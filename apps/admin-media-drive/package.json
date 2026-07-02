@@ -1,0 +1,24 @@
+{
+  "name": "admin-media-drive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Admin/personal media drive: upload images/videos to Discord attachments with a local filesystem mirror and SQLite index. Runs on the Mac mini, bound to 127.0.0.1.",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "cors": "^2.8.5",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "multer": "^2.2.0"
+  },
+  "overrides": {
+    "undici": "6.27.0"
+  }
+}

@@ -1,0 +1,17 @@
+# secrets & local runtime state — never commit
+.env
+.env.*
+!.env.example
+
+# dependencies
+node_modules/
+
+# local media mirror / sqlite (in case someone points MEDIA_ROOT/DB_PATH inside the app dir)
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# os noise
+.DS_Store

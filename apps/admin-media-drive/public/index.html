@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Admin Media Drive</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Admin Media Drive</h1>
+          <p id="statusText">Connecting to Discord</p>
+        </div>
+        <div class="bot-badge" id="botBadge">Offline</div>
+      </header>
+
+      <section class="workspace">
+        <form id="uploadForm" class="panel upload-panel">
+          <div class="panel-head">
+            <h2>Upload</h2>
+            <button class="icon-button" type="button" id="refreshButton" title="Refresh">Refresh</button>
+          </div>
+
+          <label class="field">
+            <span>Channel</span>
+            <select id="channelSelect" required></select>
+          </label>
+
+          <label class="field">
+            <span>Caption</span>
+            <textarea id="captionInput" rows="3" maxlength="1900" placeholder="Optional"></textarea>
+          </label>
+
+          <div class="file-row">
+            <input id="fileInput" type="file" accept="image/*,video/*" hidden>
+            <button type="button" id="chooseButton">Choose Media</button>
+            <div id="fileMeta" class="file-meta">No file selected</div>
+          </div>
+
+          <div class="progress-wrap" aria-hidden="true">
+            <div id="progressBar" class="progress"></div>
+          </div>
+
+          <button class="primary" id="uploadButton" type="submit" disabled>Upload to Discord</button>
+          <p class="limit" id="limitText"></p>
+        </form>
+
+        <section class="panel result-panel" id="resultPanel" hidden>
+          <div class="panel-head">
+            <h2>Latest Upload</h2>
+            <span class="success">Uploaded &amp; mirrored</span>
+          </div>
+          <div id="resultBody"></div>
+        </section>
+      </section>
+
+      <section class="panel gallery-panel">
+        <div class="panel-head">
+          <h2>Indexed Local Media</h2>
+          <div class="head-actions">
+            <button class="icon-button" type="button" id="syncButton" title="Sync channel to local mirror">Sync channel</button>
+            <button class="icon-button" type="button" id="reloadIndexButton" title="Reload index">Reload</button>
+          </div>
+        </div>
+        <p class="hint" id="indexHint"></p>
+        <div id="indexGrid" class="media-grid"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
