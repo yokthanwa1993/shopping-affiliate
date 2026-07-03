@@ -8,9 +8,10 @@ cloudflared tunnel, no auto-start, and no production wiring. It binds
 `~/.affiliate-shortlink-cloak-python/profiles`, and does not touch the active
 Node service on port `8810`.
 
-Real shortening is not implemented. `/shorten` validates the request, opens the
-headed persistent CloakBrowser context, and returns the placeholder status
-`not_implemented_after_login`. No Shopee GraphQL calls are made.
+`/shorten` validates the request, opens the headed persistent CloakBrowser
+context, and attempts a real Shopee Affiliate `batchCustomLink` GraphQL call
+from the logged-in browser session. This remains a test-only sidecar: no
+LaunchAgent, no cloudflared tunnel, no auto-start, and no production wiring.
 
 The HTTP server uses only the Python standard library. The optional
 `cloakbrowser` import is lazy and happens only when `/login` or `/shorten`
@@ -45,7 +46,17 @@ Environment overrides:
 | `GET` | `/health` | Liveness and non-secret config summary |
 | `GET` | `/accounts` | Known Shopee account aliases |
 | `GET` | `/login?platform=shopee&account=affiliate_chearb.com` | Open headed CloakBrowser at `https://affiliate.shopee.co.th/offer/custom_link` |
-| `GET` | `/shorten?id=15130770000&url=https://...` | Validate and return `not_implemented_after_login` after opening the context |
+| `GET` | `/shorten?id=15130770000&url=https://...&sub1=...` | Attempt real Shopee `batchCustomLink` shortening from the opened browser session |
+
+`/shorten` supports optional `sub1` through `sub5` query params. Each value is
+sanitized to alphanumeric characters and capped at 64 characters before it is
+sent as `advancedLinkParams.subId1` through `subId5`.
+
+On success, `/shorten` returns `status: "ok"` with `shortLink`, `longLink`,
+`originalLink`, `account`, `id`, `utm_source`, `profileDir`, and safe browser
+URL metadata. If Shopee login/session/captcha blocks the call, it fails closed
+with `manualLoginRequired`, `needsManual`, `reason`, `currentUrl`, `account`,
+and `profileDir`. Cookies, CSRF values, and tokens are never returned.
 
 ## Known Shopee Aliases
 
@@ -58,7 +69,7 @@ Environment overrides:
 
 ```bash
 ./scripts/smoke_local.sh
-python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 Tests use `unittest` and never launch a browser.

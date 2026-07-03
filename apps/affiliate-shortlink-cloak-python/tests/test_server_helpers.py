@@ -4,11 +4,14 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from affiliate_shortlink_cloak_python import server
+from affiliate_shortlink_cloak_python.browser import BrowserLaunchError
+from affiliate_shortlink_cloak_python.shopee import ShopeeShortenError
 
 
 class ServerHelperTests(unittest.TestCase):
@@ -66,6 +69,8 @@ class ServerHelperTests(unittest.TestCase):
             {
                 "id": ["an_15130770000"],
                 "url": ["https://shopee.co.th/product/1/2"],
+                "sub1": ["A-1"],
+                "sub2": ["post_2"],
             },
             self.config,
         )
@@ -75,6 +80,7 @@ class ServerHelperTests(unittest.TestCase):
             "/tmp/affiliate-shortlink-cloak-python/profiles/shopee/affiliate_chearb.com",
             payload["profileDir"],
         )
+        self.assertEqual(["A1", "post2", "", "", ""], payload["subIds"])
 
     def test_validate_shorten_rejects_invalid_url(self) -> None:
         status, payload = server.validate_shorten_query(
@@ -83,6 +89,132 @@ class ServerHelperTests(unittest.TestCase):
         )
         self.assertEqual(400, status)
         self.assertEqual("invalid_url", payload["error"])
+
+    def test_root_route_is_legacy_shorten_alias(self) -> None:
+        class FakeHandler:
+            path = "/?id=15130770000&url=https://shopee.co.th/product/1/2&sub1"
+            server = type("FakeServer", (), {"config": self.config})()
+
+            def __init__(self) -> None:
+                self.status = None
+                self.payload = None
+
+            def _write_json(self, status, payload):
+                self.status = status
+                self.payload = payload
+
+        handler = FakeHandler()
+        with mock.patch.object(server, "handle_shorten", return_value=(200, {"status": "ok"})) as mocked:
+            server.RequestHandler.do_GET(handler)
+        self.assertEqual(200, handler.status)
+        self.assertEqual({"status": "ok"}, handler.payload)
+        args, _kwargs = mocked.call_args
+        self.assertIn("id", args[0])
+        self.assertIn("url", args[0])
+        self.assertIn("sub1", args[0])
+
+    @mock.patch("affiliate_shortlink_cloak_python.browser.shorten_shopee_link")
+    def test_handle_shorten_returns_real_shortlink(
+        self,
+        shorten_mock: mock.Mock,
+    ) -> None:
+        shorten_mock.return_value = {
+            "profileDir": (
+                "/tmp/affiliate-shortlink-cloak-python/profiles/"
+                "shopee/affiliate_chearb.com"
+            ),
+            "targetUrl": "https://affiliate.shopee.co.th/offer/custom_link",
+            "currentUrl": "https://affiliate.shopee.co.th/offer/custom_link",
+            "shortLink": "https://s.shopee.co.th/abc",
+            "longLink": "https://shopee.co.th/product/1/2?utm=1",
+            "originalLink": "https://shopee.co.th/product/1/2",
+        }
+
+        status, payload = server.handle_shorten(
+            {
+                "id": ["15130770000"],
+                "url": ["https://shopee.co.th/product/1/2"],
+                "sub1": ["A-1"],
+            },
+            self.config,
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("https://s.shopee.co.th/abc", payload["shortLink"])
+        self.assertEqual("https://s.shopee.co.th/abc", payload["link"])
+        self.assertEqual("affiliate_chearb.com", payload["account"])
+        self.assertEqual("15130770000", payload["id"])
+        self.assertEqual("an_15130770000", payload["utm_source"])
+        self.assertEqual(
+            "https://affiliate.shopee.co.th/offer/custom_link",
+            payload["browser"]["currentUrl"],
+        )
+        shorten_mock.assert_called_once_with(
+            (
+                "/tmp/affiliate-shortlink-cloak-python/profiles/"
+                "shopee/affiliate_chearb.com"
+            ),
+            "https://shopee.co.th/product/1/2",
+            ["A1", "", "", "", ""],
+        )
+
+    @mock.patch("affiliate_shortlink_cloak_python.browser.shorten_shopee_link")
+    def test_handle_shorten_fail_closes_browser_error_safely(
+        self,
+        shorten_mock: mock.Mock,
+    ) -> None:
+        shorten_mock.side_effect = BrowserLaunchError(
+            "cloakbrowser_launch_failed cookie: csrftoken=secret; "
+            "csrf-token: verysecret"
+        )
+
+        status, payload = server.handle_shorten(
+            {
+                "id": ["15130770000"],
+                "url": ["https://shopee.co.th/product/1/2"],
+            },
+            self.config,
+        )
+
+        self.assertEqual(503, status)
+        self.assertEqual("error", payload["status"])
+        self.assertFalse(payload["manualLoginRequired"])
+        self.assertFalse(payload["needsManual"])
+        self.assertEqual("affiliate_chearb.com", payload["account"])
+        self.assertIn("[REDACTED]", payload["reason"])
+        self.assertNotIn("secret", payload["reason"])
+        self.assertNotIn("verysecret", payload["reason"])
+
+    @mock.patch("affiliate_shortlink_cloak_python.browser.shorten_shopee_link")
+    def test_handle_shorten_fail_closes_session_error(
+        self,
+        shorten_mock: mock.Mock,
+    ) -> None:
+        shorten_mock.side_effect = ShopeeShortenError(
+            "shopee_session_html",
+            "cookie: csrftoken=secret; csrf-token: verysecret",
+            current_url="https://affiliate.shopee.co.th/buyer/login",
+            manual_login_required=True,
+        )
+
+        status, payload = server.handle_shorten(
+            {
+                "id": ["15130770000"],
+                "url": ["https://shopee.co.th/product/1/2"],
+            },
+            self.config,
+        )
+
+        self.assertEqual(503, status)
+        self.assertEqual("manual_login_required", payload["status"])
+        self.assertTrue(payload["manualLoginRequired"])
+        self.assertTrue(payload["needsManual"])
+        self.assertEqual("shopee_session_html", payload["reason"])
+        self.assertEqual(
+            "https://affiliate.shopee.co.th/buyer/login",
+            payload["currentUrl"],
+        )
 
 
 if __name__ == "__main__":

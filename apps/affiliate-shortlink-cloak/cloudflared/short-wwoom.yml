@@ -35,6 +35,9 @@ ingress:
     path: /pause-ad-only*
     service: http://127.0.0.1:8820
   - hostname: short.wwoom.com
+    path: /archive-ad-only*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
     path: /publish-story*
     service: http://127.0.0.1:8820
   # Cloud Browser (remote browser) — live JPEG viewport + input relay for the dashboard Accounts page.

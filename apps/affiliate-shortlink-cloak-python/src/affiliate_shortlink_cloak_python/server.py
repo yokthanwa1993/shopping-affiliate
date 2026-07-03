@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -20,6 +21,11 @@ from . import (
     __version__,
 )
 from .accounts import list_accounts, profile_dir_for, resolve_account
+from .shopee import (
+    ShopeeShortenError,
+    sanitize_error_message,
+    sub_ids_from_query,
+)
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,7 @@ def validate_shorten_query(
 
     payload = dict(payload)
     payload["url"] = raw_url
+    payload["subIds"] = sub_ids_from_query(query)
     return 200, payload
 
 
@@ -177,38 +184,100 @@ def handle_shorten(query: Mapping[str, object],
     if status != 200:
         return status, payload
 
-    from .browser import BrowserLaunchError, open_shopee_custom_link
-
-    try:
-        browser_info = open_shopee_custom_link(str(payload["profileDir"]))
-    except BrowserLaunchError as exc:
-        return 503, error_payload("browser_launch_failed", reason=str(exc))
+    from .browser import BrowserLaunchError, shorten_shopee_link
 
     record = payload["record"]
     assert isinstance(record, dict)
     url = str(payload["url"])
+    profile_dir = str(payload["profileDir"])
+    try:
+        shorten_info = shorten_shopee_link(
+            profile_dir,
+            url,
+            payload.get("subIds") or [],
+        )
+    except BrowserLaunchError as exc:
+        return 503, shorten_fail_closed_payload(
+            record,
+            profile_dir,
+            reason=sanitize_error_message(exc),
+            manual_login_required=False,
+        )
+    except ShopeeShortenError as exc:
+        return (503 if exc.manual_login_required else 502), (
+            shorten_fail_closed_payload(
+                record,
+                profile_dir,
+                reason=exc.reason,
+                current_url=exc.current_url,
+                manual_login_required=exc.manual_login_required,
+                diagnostic=sanitize_error_message(exc),
+            )
+        )
+
+    browser_info = {
+        "profileDir": profile_dir,
+        "targetUrl": shorten_info.get("targetUrl"),
+        "currentUrl": shorten_info.get("currentUrl"),
+    }
     return 200, {
-        "status": "not_implemented_after_login",
-        "error": "not_implemented_after_login",
-        "link": url,
+        "status": "ok",
+        "link": shorten_info.get("shortLink"),
         "originalLink": url,
-        "longLink": url,
-        "shortLink": None,
+        "longLink": shorten_info.get("longLink") or "",
+        "shortLink": shorten_info.get("shortLink"),
         "id": record["id"],
         "account": record["account"],
         "display": record["display"],
         "utm_source": record["utm_source"],
-        "profileDir": payload["profileDir"],
+        "profileDir": profile_dir,
         "browser": browser_info,
     }
 
 
-class PrototypeHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
+def shorten_fail_closed_payload(
+    record: Mapping[str, object],
+    profile_dir: str,
+    reason: object,
+    current_url: Optional[str] = None,
+    manual_login_required: bool = True,
+    diagnostic: object = None,
+) -> Dict[str, object]:
+    safe_reason = sanitize_error_message(reason) or "shorten_failed"
+    payload = {
+        "status": (
+            "manual_login_required" if manual_login_required else "error"
+        ),
+        "error": safe_reason,
+        "manualLoginRequired": bool(manual_login_required),
+        "needsManual": bool(manual_login_required),
+        "reason": safe_reason,
+        "currentUrl": current_url,
+        "id": record["id"],
+        "account": record["account"],
+        "display": record["display"],
+        "utm_source": record["utm_source"],
+        "profileDir": profile_dir,
+        "browser": {
+            "profileDir": profile_dir,
+            "targetUrl": SHOPEE_CUSTOM_LINK_URL,
+            "currentUrl": current_url,
+        },
+    }
+    if diagnostic:
+        payload["diagnostic"] = sanitize_error_message(diagnostic)
+    return payload
+
+
+class PrototypeHTTPServer(HTTPServer):
 
     def __init__(self, server_address, handler_class, config: ServerConfig):
         super().__init__(server_address, handler_class)
         self.config = config
+
+
+class IPv6PrototypeHTTPServer(PrototypeHTTPServer):
+    address_family = socket.AF_INET6
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -219,7 +288,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
         config = self.server.config
 
-        if parsed.path in {"", "/"}:
+        if parsed.path in {"", "/"} and ("url" in query or "id" in query):
+            status, payload = handle_shorten(query, config)
+        elif parsed.path in {"", "/"}:
             status, payload = 200, health_payload(config)
         elif parsed.path == "/health":
             status, payload = 200, health_payload(config)
@@ -249,7 +320,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(config: ServerConfig) -> PrototypeHTTPServer:
-    return PrototypeHTTPServer((config.host, config.port), RequestHandler, config)
+    server_class = IPv6PrototypeHTTPServer if ":" in config.host else PrototypeHTTPServer
+    return server_class((config.host, config.port), RequestHandler, config)
 
 
 def main() -> None:
