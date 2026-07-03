@@ -150,6 +150,7 @@ import {
     generatePostLogCode,
     normalizePostLogCode,
     resolveCaptionWithPostLogTag,
+    isPostLogTagStampingEnabledForNamespace,
     buildPostLogRecord,
     sanitizeSnapshot,
     toSafePostLogOutput,
@@ -26058,6 +26059,28 @@ async function resolvePrimaryAdminNamespaceId(db: D1Database): Promise<string> {
     return String(row?.namespace_id || '').trim()
 }
 
+// Optional env allowlist (comma/space-separated namespace ids, or `*`/`all`) that widens
+// visible post-log-tag stamping beyond the admin namespace without a code change. Read
+// defensively — the field is not part of the typed Env, so absence just means admin-only.
+function readPostLogTagNamespaceAllowlist(env: Env): string {
+    const bag = env as unknown as Record<string, unknown>
+    const raw = bag.POST_LOG_TAG_NAMESPACES ?? bag.POST_LOG_TAG_ENABLED_NAMESPACES
+    return typeof raw === 'string' ? raw : ''
+}
+
+// Whether this namespace should get the visible `#code` debug hashtag + a new
+// facebook_post_log_tags row on a fresh post. Admin-only by default; see
+// isPostLogTagStampingEnabledForNamespace. Best-effort — resolution failure disables it
+// (fail closed to a clean caption) rather than blocking the post.
+async function isVisiblePostLogTagEnabledForNamespace(env: Env, namespaceId: string): Promise<boolean> {
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+    return isPostLogTagStampingEnabledForNamespace({
+        namespaceId,
+        adminNamespaceId,
+        enabledNamespaces: readPostLogTagNamespaceAllowlist(env),
+    })
+}
+
 async function syncImportedOriginalIntoNamespace(params: {
     env: Env
     targetNamespaceId: string
@@ -44447,12 +44470,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // post) because they all derive their published caption from `caption`. Idempotent —
         // never doubles if the caption already carries a lone log-tag line. Best-effort: a
         // failure here leaves the caption untagged rather than blocking the post.
+        // Admin-only affordance: only the primary admin namespace gets the visible `#code`
+        // hashtag (and a facebook_post_log_tags row). Member/tenant pages publish clean.
         const captionBeforeLog = caption
-        forcePostLogCode = await allocateUniquePostLogCode(env.DB).catch(() => '')
-        if (forcePostLogCode) {
-            const stamped = resolveCaptionWithPostLogTag({ caption, code: forcePostLogCode })
-            caption = stamped.caption
-            forcePostLogCode = stamped.code
+        const postLogTagEnabled = await isVisiblePostLogTagEnabledForNamespace(env, botId)
+        if (postLogTagEnabled) {
+            forcePostLogCode = await allocateUniquePostLogCode(env.DB).catch(() => '')
+            if (forcePostLogCode) {
+                const stamped = resolveCaptionWithPostLogTag({ caption, code: forcePostLogCode })
+                caption = stamped.caption
+                forcePostLogCode = stamped.code
+            }
         }
         selectedCaption = caption
 
@@ -46850,6 +46878,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const shortlinkEnabledByNamespace = new Map<string, boolean>()
     const galleryVideosByNamespace = new Map<string, Array<Record<string, unknown>>>()
     const reconciledNamespaces = new Set<string>()
+    // Visible post-log `#code` hashtag is admin-only. Resolve the primary admin namespace +
+    // optional env allowlist ONCE for the whole cron run; decide per page below.
+    const cronAdminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+    const cronPostLogTagAllowlist = readPostLogTagNamespaceAllowlist(env)
     let fatalError: Error | null = null
     await updateCronRuntimeState(env.DB, {
         runId,
@@ -47305,7 +47337,16 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         // Stamp a unique log hashtag onto this visible page post's caption (see force-post
         // for rationale). Applies to every cron posting route. Best-effort — never blocks.
         const cronCaptionBeforeLog = caption
-        let cronPostLogCode = await allocateUniquePostLogCode(env.DB).catch(() => '')
+        // Admin-only affordance: only the primary admin namespace gets the visible `#code`
+        // hashtag (and a facebook_post_log_tags row). Member/tenant pages publish clean.
+        const cronPostLogTagEnabled = isPostLogTagStampingEnabledForNamespace({
+            namespaceId: botId,
+            adminNamespaceId: cronAdminNamespaceId,
+            enabledNamespaces: cronPostLogTagAllowlist,
+        })
+        let cronPostLogCode = cronPostLogTagEnabled
+            ? await allocateUniquePostLogCode(env.DB).catch(() => '')
+            : ''
         if (cronPostLogCode) {
             const stamped = resolveCaptionWithPostLogTag({ caption, code: cronPostLogCode })
             caption = stamped.caption

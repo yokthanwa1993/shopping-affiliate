@@ -71,6 +71,41 @@ export function formatPostLogHashtag(code: string): string {
     return `#${code}`
 }
 
+// ---------------------------------------------------------------------------------------
+// Namespace gating — the visible `#code` debug hashtag is an ADMIN-ONLY affordance.
+// ---------------------------------------------------------------------------------------
+//
+// The log hashtag is an operator/admin lookup key, not something tenant pages should carry
+// in their public captions. So visible stamping (and inserting a new facebook_post_log_tags
+// row) is enabled ONLY for the primary admin namespace by default. A member/tenant namespace
+// publishes a clean caption with no `#xxxxxx` token and gets no new log row.
+//
+// Pure + injectable so it unit-tests without a DB: the caller resolves the primary admin
+// namespace (resolvePrimaryAdminNamespaceId) and, optionally, an env allowlist string to
+// widen the set without a code change. Default (no allowlist) = admin namespace only.
+// `enabledNamespaces` accepts a comma/space-separated list of namespace ids; `*` or `all`
+// enables every namespace (explicit opt-in only — never the default).
+export function isPostLogTagStampingEnabledForNamespace(params: {
+    namespaceId: string | number | null | undefined
+    adminNamespaceId: string | number | null | undefined
+    enabledNamespaces?: string | null | undefined
+}): boolean {
+    const ns = String(params.namespaceId ?? '').trim()
+    if (!ns || ns === 'default') return false
+
+    const raw = String(params.enabledNamespaces ?? '').trim()
+    if (raw) {
+        const tokens = raw.split(/[\s,]+/).map((t) => t.trim().toLowerCase()).filter(Boolean)
+        if (tokens.includes('*') || tokens.includes('all')) return true
+        if (tokens.includes(ns.toLowerCase())) return true
+        // An allowlist that doesn't name this ns still falls through to the admin check
+        // below, so the admin namespace never silently loses its own tag.
+    }
+
+    const admin = String(params.adminNamespaceId ?? '').trim()
+    return !!admin && ns === admin
+}
+
 // Return the code of the FIRST lone `#code` line in the caption, or null. This is the
 // exact shape we write, so it is what we detect for idempotency. Inline hashtags among
 // other text/tags on the same line are intentionally NOT matched.
