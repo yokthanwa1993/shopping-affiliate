@@ -87,6 +87,14 @@ const MAX_DIAGNOSTIC_INPUTS_PER_FRAME = 24;
 const MAX_DIAGNOSTIC_SNIPPETS_PER_FRAME = 8;
 const MAX_DIAGNOSTIC_TEXT_CHARS = 180;
 
+function isAuthenticatedShopeeAffiliatePage(page, platform) {
+  if (platform !== 'shopee') return false;
+  const url = currentPageUrl(page);
+  if (!url || isShopeeRouteNotFoundUrl(url)) return false;
+  if (/shopee\.co\.th\/buyer\/login|affiliate\.shopee\.co\.th\/login/i.test(url)) return false;
+  return /^https:\/\/affiliate\.shopee\.co\.th(\/|$)/i.test(url);
+}
+
 function usernameSelectorsFor(platform) {
   if (platform === 'shopee') return SHOPEE_USERNAME_SELECTORS;
   if (platform === 'lazada') return LAZADA_USERNAME_SELECTORS;
@@ -1126,6 +1134,9 @@ async function attemptLogin(page, platform, username, password, opts = {}) {
     },
   });
   if (!userSel) {
+    if (isAuthenticatedShopeeAffiliatePage(page, platform)) {
+      return { filled: false, submitted: false, needsManual: false, reason: 'already_authenticated' };
+    }
     const blocker = await detectManualBlocker(page);
     const reason = blocker || 'username_field_not_found';
     const diagnostic = await captureLoginDiagnostics(page, platform, reason, [username, password]);
@@ -1140,6 +1151,9 @@ async function attemptLogin(page, platform, username, password, opts = {}) {
     },
   });
   if (!passSel) {
+    if (isAuthenticatedShopeeAffiliatePage(page, platform)) {
+      return { filled: true, submitted: false, needsManual: false, reason: 'already_authenticated' };
+    }
     const blocker = await detectManualBlocker(page);
     const reason = blocker || 'password_field_not_found';
     const diagnostic = await captureLoginDiagnostics(page, platform, reason, [username, password]);

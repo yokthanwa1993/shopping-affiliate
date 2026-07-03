@@ -239,6 +239,35 @@ test('attemptLogin reports Shopee affiliate 404 as route-not-found instead of us
   assert.equal(serialized.includes(password), false, 'password must not leak through diagnostics');
 });
 
+test('attemptLogin treats a Shopee dashboard redirect during autofill as already authenticated', async () => {
+  const username = 'stored-user@example.com';
+  const password = 'stored-password-never-returned';
+  let currentUrl = 'https://shopee.co.th/buyer/login?next=https%3A%2F%2Faffiliate.shopee.co.th%2F';
+  const { page } = makePage({
+    url: currentUrl,
+    pageTarget: {
+      domKinds: new Set(['text']),
+      resultByKind: { text: 'dom:page:text' },
+      diagnostic: { inputCount: 0, inputs: [], textSnippets: [], blockerMarkers: [] },
+    },
+  });
+  page.url = () => currentUrl;
+  const originalWait = page.waitForTimeout;
+  page.waitForTimeout = async (...args) => {
+    await originalWait(...args);
+    currentUrl = 'https://affiliate.shopee.co.th/dashboard';
+  };
+
+  const result = await attemptLogin(page, 'shopee', username, password);
+  const serialized = JSON.stringify(result);
+
+  assert.equal(result.needsManual, false);
+  assert.equal(result.reason, 'already_authenticated');
+  assert.equal(serialized.includes(username), false, 'username must not leak');
+  assert.equal(serialized.includes(password), false, 'password must not leak');
+});
+
+
 test('attemptLogin uses broad visible DOM fallback inside iframes instead of username_field_not_found', async () => {
   const { page, events } = makePage({ frameDomKinds: new Set(['text', 'password']) });
 
