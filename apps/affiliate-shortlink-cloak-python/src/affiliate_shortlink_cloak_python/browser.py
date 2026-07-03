@@ -404,6 +404,10 @@ _LOGIN_REDIRECT_RE = re.compile(
     r"shopee\.co\.th/buyer/login|affiliate\.shopee\.co\.th/login",
     re.IGNORECASE,
 )
+_DASHBOARD_DETAIL_RE = re.compile(
+    r"/api/v3/dashboard/detail(?:\?|$)",
+    re.IGNORECASE,
+)
 # A Shopee captcha / login / verify / sign-in interstitial. When the report
 # session lands here we fail closed instead of re-navigating (which would
 # refresh the visible custom_link tab and trip more reCAPTCHA).
@@ -484,7 +488,10 @@ def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object
                 and _report_url_is_login_gate(gate_url)
             ):
                 return {"login_gate": True}
-            return _report_fetch_via_context_request(request_api, api_url)
+            result = _report_fetch_via_context_request(request_api, api_url)
+            if _should_page_fallback_for_report(api_url, result):
+                return _report_fetch_via_page_once(context, api_url)
+            return result
 
         # Legacy in-page fallback (no request API available on this context).
         context, page, current_url = _open_shopee_report_page(profile_dir)
@@ -503,6 +510,38 @@ def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object
         return result
 
 
+def _is_dashboard_detail_url(api_url: object) -> bool:
+    return bool(_DASHBOARD_DETAIL_RE.search(str(api_url or "")))
+
+
+def _report_headers_for_api(api_url: object) -> Dict[str, str]:
+    headers = {
+        "accept": "application/json",
+        "origin": SHOPEE_ORIGIN,
+        "referer": _SHOPEE_REFERER,
+        "user-agent": _CHROME_UA,
+    }
+    if _is_dashboard_detail_url(api_url):
+        headers["referer"] = SHOPEE_ORIGIN + "/dashboard"
+        headers["x-requested-with"] = "XMLHttpRequest"
+    return headers
+
+
+def _should_page_fallback_for_report(api_url: object, result: object) -> bool:
+    if not _is_dashboard_detail_url(api_url):
+        return False
+    if not isinstance(result, dict):
+        return False
+    return _response_status_like(result.get("status")) in {401, 403}
+
+
+def _response_status_like(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _report_fetch_via_context_request(request_api, api_url: str) -> Dict[str, object]:
     """Primary request-first report transport.
 
@@ -511,12 +550,7 @@ def _report_fetch_via_context_request(request_api, api_url: str) -> Dict[str, ob
     (``{status, parsed, body, snippet}``) so the report classifiers are
     unchanged. Never creates/reloads a visible page. Sanitizes the failure /
     snippet so cookies/tokens are never surfaced."""
-    headers = {
-        "accept": "application/json",
-        "origin": SHOPEE_ORIGIN,
-        "referer": _SHOPEE_REFERER,
-        "user-agent": _CHROME_UA,
-    }
+    headers = _report_headers_for_api(api_url)
     try:
         response = request_api.get(
             str(api_url),
@@ -541,6 +575,34 @@ def _report_fetch_via_context_request(request_api, api_url: str) -> Dict[str, ob
         "body": body,
         "snippet": "" if parsed else sanitize_error_message(text, limit=200),
     }
+
+
+def _report_fetch_via_page_once(context, api_url: str) -> Dict[str, object]:
+    """Dashboard-detail fallback after request-context 401/403.
+
+    This reuses the existing Shopee tab and only navigates when the tab is new
+    or blank, matching the legacy report fallback without repeated refreshes.
+    """
+    page, created = _report_page(context)
+    if page is None:
+        raise BrowserLaunchError("browser_page_unavailable")
+    current_url = str(_safe_current_url(page) or "")
+    if created or _is_blank_url(current_url):
+        _navigate_to_custom_link(page)
+        current_url = str(_safe_current_url(page) or "")
+    if _report_url_is_login_gate(current_url):
+        return {"login_gate": True}
+
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        raise RuntimeError("browser_evaluate_unavailable")
+    try:
+        result = evaluate(_IN_PAGE_REPORT_FETCH_SCRIPT, [str(api_url)])
+    except Exception as exc:  # noqa: BLE001 - sanitized upstream
+        raise RuntimeError(sanitize_error_message(exc)) from None
+    if not isinstance(result, dict):
+        raise RuntimeError("shopee_report_invalid_fetch_result")
+    return result
 
 
 def _profile_lock(profile_dir: str) -> threading.Lock:
@@ -787,12 +849,30 @@ def _remove_stale_singleton_files(profile_dir: str) -> None:
 
 
 def _profile_has_live_chromium_process(profile_dir: str) -> bool:
+    """Return True only when a real Chromium process owns ``profile_dir``.
+
+    This must inspect per-process lines. A previous substring check over the
+    whole ``ps`` output could see ``profile_dir`` in the current shell command
+    and ``Chromium`` on an unrelated line, incorrectly treating stale
+    Singleton* files as live after the user closed the browser window.
+    """
+    profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
     try:
         import subprocess
-        out = subprocess.check_output(["/bin/ps", "-axo", "command"], text=True)
+        out = subprocess.check_output(["/bin/ps", "-axo", "pid=,comm=,command="], text=True)
     except Exception:
         return True
-    return profile_dir in out and "Chromium" in out
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if not line or profile_dir not in line:
+            continue
+        # Match the actual Chromium app/helper command, not grep/shell/python
+        # commands that merely mention the profile path.
+        if "Chromium" not in line:
+            continue
+        if ".app/Contents/MacOS/Chromium" in line or "Chromium Helper" in line:
+            return True
+    return False
 
 def _context_is_closed(context: object) -> bool:
     try:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -295,6 +296,97 @@ class ReportRequestFirstTests(unittest.TestCase):
         self.assertNotIn("SECRETVALUE", str(exc.exception))
         self.assertEqual([], page.goto_calls)
         self.assertEqual([], page.evaluate_calls)
+
+    def test_dashboard_detail_401_falls_back_to_page_fetch_without_reload(self) -> None:
+        class DashboardPage(FakePage):
+            def evaluate(self, script, arg=None):
+                self.evaluate_calls.append((script, arg))
+                return {
+                    "status": 200,
+                    "parsed": True,
+                    "body": {"code": 0, "data": {"cv_by_order_sum": 7}},
+                    "snippet": "",
+                }
+
+        api_url = "https://affiliate.shopee.co.th/api/v3/dashboard/detail?start_time=1&end_time=2"
+        req = FakeRequestApi(get_response=FakeResponse(401, "unauthorized"))
+        page = DashboardPage(AFFILIATE_URL)
+        ctx = FakeRequestContext(req, pages=[page])
+        with _PatchLaunch(ctx):
+            result = browser.fetch_shopee_report_json("/tmp/p", api_url)
+
+        self.assertEqual(1, len(req.get_calls))
+        self.assertEqual([], page.goto_calls)
+        self.assertEqual(1, len(page.evaluate_calls))
+        self.assertEqual(200, result["status"])
+        self.assertEqual(7, result["body"]["data"]["cv_by_order_sum"])
+
+    def test_dashboard_detail_401_blank_page_fallback_navigates_once(self) -> None:
+        class DashboardPage(FakePage):
+            def evaluate(self, script, arg=None):
+                self.evaluate_calls.append((script, arg))
+                return {
+                    "status": 200,
+                    "parsed": True,
+                    "body": {"code": 0, "data": {}},
+                    "snippet": "",
+                }
+
+        api_url = "https://affiliate.shopee.co.th/api/v3/dashboard/detail?start_time=1&end_time=2"
+        req = FakeRequestApi(get_response=FakeResponse(403, "forbidden"))
+        page = DashboardPage("about:blank")
+        ctx = FakeRequestContext(req, pages=[page])
+        with _PatchLaunch(ctx):
+            result = browser.fetch_shopee_report_json("/tmp/p", api_url)
+
+        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], page.goto_calls)
+        self.assertEqual(1, len(page.evaluate_calls))
+        self.assertEqual(200, result["status"])
+
+    def test_non_dashboard_401_does_not_fallback_to_page(self) -> None:
+        req = FakeRequestApi(get_response=FakeResponse(401, "unauthorized"))
+        page = FakePage(AFFILIATE_URL)
+        ctx = FakeRequestContext(req, pages=[page])
+        with _PatchLaunch(ctx):
+            result = browser.fetch_shopee_report_json(
+                "/tmp/p",
+                "https://affiliate.shopee.co.th/api/v3/report/list?page_num=1",
+            )
+
+        self.assertEqual(401, result["status"])
+        self.assertEqual([], page.goto_calls)
+        self.assertEqual([], page.evaluate_calls)
+
+    def test_dashboard_detail_request_uses_dashboard_referer(self) -> None:
+        api_url = "https://affiliate.shopee.co.th/api/v3/dashboard/detail?start_time=1&end_time=2"
+        req = FakeRequestApi(get_response=FakeResponse(200, '{"code":0,"data":{}}'))
+        ctx = FakeRequestContext(req, pages=[])
+        with _PatchLaunch(ctx):
+            result = browser.fetch_shopee_report_json("/tmp/p", api_url)
+
+        headers = req.get_calls[0][1]["headers"]
+        self.assertEqual(browser.SHOPEE_ORIGIN + "/dashboard", headers["referer"])
+        self.assertEqual("XMLHttpRequest", headers["x-requested-with"])
+        self.assertEqual(200, result["status"])
+
+    def test_profile_process_detection_ignores_shell_false_positive(self) -> None:
+        profile = "/tmp/profile with space"
+        ps_output = (
+            "111 /bin/zsh /bin/zsh -lc echo /tmp/profile with space\n"
+            "222 /Applications/Other.app/Contents/MacOS/Other Chromium-like-name\n"
+        )
+        with mock.patch("subprocess.check_output", return_value=ps_output):
+            self.assertFalse(browser._profile_has_live_chromium_process(profile))
+
+    def test_profile_process_detection_matches_real_chromium_profile_owner(self) -> None:
+        profile = "/tmp/profile"
+        ps_output = (
+            "111 /bin/zsh /bin/zsh -lc echo /tmp/profile\n"
+            "222 /Users/x/.cloakbrowser/Chromium.app/Contents/MacOS/Chromium "
+            "--user-data-dir=/tmp/profile about:blank\n"
+        )
+        with mock.patch("subprocess.check_output", return_value=ps_output):
+            self.assertTrue(browser._profile_has_live_chromium_process(profile))
 
 
 class ManualLoginStillNavigatesTests(unittest.TestCase):

@@ -265,7 +265,10 @@ class _CannedHandler(BaseHTTPRequestHandler):
 
 class FakeBridgeServerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.httpd = HTTPServer(("127.0.0.1", 0), _CannedHandler)
+        try:
+            self.httpd = HTTPServer(("127.0.0.1", 0), _CannedHandler)
+        except PermissionError as exc:
+            self.skipTest("loopback bind unavailable in this sandbox: %s" % exc)
         self.httpd.hits = []  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()

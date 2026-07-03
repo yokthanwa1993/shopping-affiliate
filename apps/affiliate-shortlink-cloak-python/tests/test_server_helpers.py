@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import unittest
@@ -217,6 +218,147 @@ class ServerHelperTests(unittest.TestCase):
             "https://affiliate.shopee.co.th/buyer/login",
             payload["currentUrl"],
         )
+
+
+class CompatibilityRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = server.ServerConfig(
+            host="127.0.0.1",
+            port=8811,
+            profile_root="/tmp/affiliate-shortlink-cloak-python/profiles",
+        )
+
+    def _handler(self, path: str, body: object = None):
+        raw = b""
+        if body is not None:
+            raw = json.dumps(body).encode("utf-8")
+        handler = object.__new__(server.RequestHandler)
+        handler.path = path
+        handler.server = type("FakeServer", (), {"config": self.config})()
+        handler.headers = {
+            "Host": "127.0.0.1:8811",
+            "Content-Length": str(len(raw)),
+            "Content-Type": "application/json",
+        }
+        handler.rfile = io.BytesIO(raw)
+        captured = {"headers": {}}
+
+        def _write_json(status, payload):
+            captured["status"] = status
+            captured["payload"] = payload
+
+        def _write_html(status, html_text):
+            captured["status"] = status
+            captured["html"] = html_text
+
+        def send_response(status):
+            captured["status"] = status
+
+        def send_header(key, value):
+            captured["headers"][key] = value
+
+        def end_headers():
+            captured["ended"] = True
+
+        handler._write_json = _write_json
+        handler._write_html = _write_html
+        handler.send_response = send_response
+        handler.send_header = send_header
+        handler.end_headers = end_headers
+        handler.wfile = io.BytesIO()
+        handler.captured = captured
+        return handler
+
+    def test_login_ui_route_returns_html_form(self) -> None:
+        handler = self._handler(
+            "/login-ui?account=affiliate_chearb.com&url=https%3A%2F%2Fshopee.co.th%2Fi-i.1.2&sub1=X"
+        )
+        server.RequestHandler.do_GET(handler)
+
+        self.assertEqual(200, handler.captured["status"])
+        self.assertIn("<form", handler.captured["html"])
+        self.assertIn("/api/login-and-shorten", handler.captured["html"])
+        self.assertIn("affiliate_chearb.com", handler.captured["html"])
+        self.assertNotIn("not_found", handler.captured["html"])
+
+    def test_legacy_login_platform_routes_redirect(self) -> None:
+        for platform in ("shopee", "lazada"):
+            handler = self._handler("/login/" + platform)
+            server.RequestHandler.do_GET(handler)
+            self.assertEqual(302, handler.captured["status"])
+            self.assertEqual(
+                "/login?platform=" + platform,
+                handler.captured["headers"]["Location"],
+            )
+
+    def test_api_login_fails_closed_without_echoing_credentials(self) -> None:
+        handler = self._handler(
+            "/api/login",
+            {
+                "platform": "shopee",
+                "username": "affiliate@chearb.com",
+                "password": "SUPER-SECRET-PASSWORD",
+                "remember": True,
+            },
+        )
+        server.RequestHandler.do_POST(handler)
+
+        self.assertEqual(501, handler.captured["status"])
+        payload = handler.captured["payload"]
+        self.assertEqual("error", payload["status"])
+        self.assertEqual("credential_storage_not_implemented", payload["error"])
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("SUPER-SECRET-PASSWORD", rendered)
+        self.assertNotIn("affiliate@chearb.com", rendered)
+
+    def test_api_login_and_shorten_derives_account_and_calls_shorten(self) -> None:
+        with mock.patch.object(
+            server,
+            "handle_shorten",
+            return_value=(200, {"shortLink": "https://s.shopee.co.th/abc", "account": "affiliate_chearb.com"}),
+        ) as mocked:
+            handler = self._handler(
+                "/api/login-and-shorten",
+                {
+                    "platform": "shopee",
+                    "username": "affiliate@chearb.com",
+                    "password": "SUPER-SECRET-PASSWORD",
+                    "url": "https://shopee.co.th/i-i.1.2",
+                    "sub1": "A-1",
+                    "sub2": "post_2",
+                },
+            )
+            server.RequestHandler.do_POST(handler)
+
+        self.assertEqual(200, handler.captured["status"])
+        payload = handler.captured["payload"]
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("https://s.shopee.co.th/abc", payload["shorten"]["shortLink"])
+        args, _kwargs = mocked.call_args
+        query = args[0]
+        self.assertEqual(["affiliate_chearb.com"], query["account"])
+        self.assertEqual(["https://shopee.co.th/i-i.1.2"], query["url"])
+        self.assertEqual(["A-1"], query["sub1"])
+        self.assertEqual(["post_2"], query["sub2"])
+        rendered = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("SUPER-SECRET-PASSWORD", rendered)
+        self.assertNotIn("affiliate@chearb.com", rendered)
+
+    def test_api_login_and_shorten_rejects_lazada_without_not_found(self) -> None:
+        handler = self._handler(
+            "/api/login-and-shorten",
+            {
+                "platform": "lazada",
+                "username": "affiliate@chearb.com",
+                "password": "SUPER-SECRET-PASSWORD",
+                "url": "https://www.lazada.co.th/products/x.html",
+            },
+        )
+        server.RequestHandler.do_POST(handler)
+
+        self.assertEqual(400, handler.captured["status"])
+        self.assertEqual("unsupported_platform", handler.captured["payload"]["error"])
+        self.assertNotEqual("not_found", handler.captured["payload"]["error"])
 
 
 if __name__ == "__main__":

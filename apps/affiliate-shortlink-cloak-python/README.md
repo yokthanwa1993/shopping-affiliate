@@ -75,6 +75,10 @@ Environment overrides:
 | `GET` | `/health` | Liveness and non-secret config summary |
 | `GET` | `/accounts` | Known Shopee account aliases |
 | `GET` | `/login?platform=shopee&account=affiliate_chearb.com` | Open headed CloakBrowser at `https://affiliate.shopee.co.th/offer/custom_link` |
+| `GET` | `/login-ui?account=...&url=...` | Local-only compatibility form that posts JSON to `/api/login-and-shorten` |
+| `GET` | `/login/shopee`, `/login/lazada` | Legacy 302 compatibility redirects to `/login?platform=...` |
+| `POST` | `/api/login` | Compatibility JSON route; credential storage is not implemented in Python and fails closed without echoing credentials |
+| `POST` | `/api/login-and-shorten` | Compatibility JSON route that derives `id`/`account`/`url`/`sub1..sub5` and calls the existing Shopee shortlink flow |
 | `GET` | `/shorten?id=15130770000&url=https://...&sub1=...` | Attempt real Shopee `batchCustomLink` shortening from the opened browser session |
 | `GET` | `/conversion-report?id=15130770000&time=DD/MM/YYYY` | Shopee conversion report; summary (per-`sub_id` counts) by default, `raw=1`/`mode=raw` returns one page of raw rows |
 | `GET` | `/daily-income-report?ids=15130770000,15142270000&time=today` | Multi-account daily income from Shopee `dashboard/detail`; also `/income-report` |
@@ -87,6 +91,13 @@ fetches reuse the same per-account CloakBrowser profile as `/shorten` (no stored
 tokens, cookies, or secrets in responses). If Shopee is gated by login/captcha,
 the report fails closed with a sanitized `manual_login_required` payload plus
 `loginUi: /login?platform=shopee`.
+
+`/daily-income-report` / `/income-report` use `BrowserContext.request` first.
+If Shopee returns HTTP 401/403 only for `/api/v3/dashboard/detail`, the Python
+sidecar falls back once to the legacy page-context fetch: it reuses the existing
+affiliate tab without reloading it, or navigates a blank/new tab once to
+establish the affiliate origin. Other report endpoints do not page-fallback on
+401/403.
 
 - **Accounts / id:** `id` (or `an_<id>`) selects the account; default
   `15130770000`. Daily income accepts `ids=15130770000,15142270000`.

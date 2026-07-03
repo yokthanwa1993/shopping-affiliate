@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 from dataclasses import dataclass
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +29,7 @@ from .conversion_report import (
     is_conversion_report_host,
 )
 from .report_common import ReportRequestError
+from .report_common import sanitize_account as sanitize_derived_account
 from .shopee import (
     ShopeeShortenError,
     sanitize_error_message,
@@ -155,6 +157,179 @@ def validate_shorten_query(
 def _is_valid_http_url(raw_url: str) -> bool:
     parsed = urlparse(raw_url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _compat_body_value(body: Mapping[str, object], key: str, default: str = "") -> str:
+    value = body.get(key) if isinstance(body, Mapping) else None
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else default
+    return str(value).strip()
+
+
+def _compat_platform(value: object, default: str = "shopee") -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        raw = default
+    return raw if raw in {"shopee", "lazada"} else ""
+
+
+def _derive_account_from_body(body: Mapping[str, object]) -> str:
+    raw_account = _compat_body_value(body, "account")
+    if raw_account:
+        return sanitize_derived_account(raw_account)
+    username = _compat_body_value(body, "username")
+    if username:
+        return sanitize_derived_account(username)
+    return ""
+
+
+def _redact_body_secrets(value: object, body: Mapping[str, object]) -> str:
+    text = sanitize_error_message(value)
+    for key in ("username", "password"):
+        secret = _compat_body_value(body, key)
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def login_ui_html(query: Mapping[str, object]) -> str:
+    raw_url = first_query_value(query, "url")
+    raw_platform = first_query_value(query, "platform").lower()
+    if not raw_platform:
+        raw_platform = "lazada" if "lazada." in raw_url.lower() else "shopee"
+    platform = _compat_platform(raw_platform) or "shopee"
+    account = first_query_value(query, "account")
+    shopee_id = first_query_value(query, "id")
+    hidden = {
+        "platform": platform,
+        "account": account,
+        "id": shopee_id,
+        "url": raw_url,
+        "sub1": first_query_value(query, "sub1"),
+        "sub2": first_query_value(query, "sub2"),
+        "sub3": first_query_value(query, "sub3"),
+        "sub4": first_query_value(query, "sub4"),
+        "sub5": first_query_value(query, "sub5"),
+    }
+    hidden_inputs = "\n".join(
+        '<input type="hidden" name="%s" value="%s">'
+        % (html_escape(key, quote=True), html_escape(value, quote=True))
+        for key, value in hidden.items()
+        if value
+    )
+    context = account or shopee_id or "default"
+    return "\n".join([
+        "<!doctype html>",
+        '<html lang="en"><head>',
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        "<title>Login &amp; Shorten</title>",
+        "<style>",
+        "body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;max-width:560px}",
+        "label{display:block;margin:12px 0 4px;font-weight:600}",
+        "input{box-sizing:border-box;width:100%;padding:9px 10px}",
+        "button{margin-top:14px;padding:10px 14px}",
+        ".ctx{background:#f6f8fa;padding:10px;border-radius:6px}",
+        "</style>",
+        "</head><body>",
+        "<h1>Login &amp; Shorten</h1>",
+        '<p class="ctx">platform <code>%s</code> · account <code>%s</code></p>'
+        % (html_escape(platform), html_escape(context)),
+        '<form method="post" action="/api/login-and-shorten" autocomplete="off">',
+        hidden_inputs,
+        '<label for="username">Username</label>',
+        '<input id="username" name="username" autocomplete="off">',
+        '<label for="password">Password</label>',
+        '<input id="password" name="password" type="password" autocomplete="new-password">',
+        '<label><input name="remember" type="checkbox" value="1"> Remember credential if supported</label>',
+        '<button type="submit">Shorten</button>',
+        "</form>",
+        '<script>',
+        'document.querySelector("form").addEventListener("submit",function(ev){',
+        'ev.preventDefault();var fd=new FormData(ev.target);var body={};',
+        'fd.forEach(function(v,k){body[k]=String(v);});',
+        'fetch("/api/login-and-shorten",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})',
+        '.then(function(r){return r.json().then(function(j){document.body.appendChild(document.createElement("pre")).textContent=JSON.stringify(j,null,2);});});',
+        '});',
+        '</script>',
+        "</body></html>",
+    ])
+
+
+def handle_login_compatibility(body: Mapping[str, object]) -> Tuple[int, Dict[str, object]]:
+    platform = _compat_platform(_compat_body_value(body, "platform"))
+    if not platform:
+        return 400, error_payload(
+            "unsupported_platform",
+            supported=["shopee", "lazada"],
+        )
+    remember = _compat_body_value(body, "remember", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    account = _derive_account_from_body(body)
+    payload = error_payload(
+        "credential_storage_not_implemented",
+        reason="credential_storage_not_implemented",
+        message=(
+            "Python sidecar does not store credentials. Open /login for manual "
+            "session recovery, then retry the shortlink/report route."
+        ),
+        platform=platform,
+        credential={
+            "saved": False,
+            "requested": remember,
+            "status": "credential_storage_not_implemented",
+        },
+        loginUi="/login?platform=%s" % platform,
+    )
+    if account:
+        payload["account"] = account
+    return 501, payload
+
+
+def _shorten_query_from_login_body(body: Mapping[str, object]) -> Dict[str, object]:
+    query: Dict[str, object] = {}
+    for key in ("id", "url", "sub1", "sub2", "sub3", "sub4", "sub5"):
+        value = _compat_body_value(body, key)
+        if value:
+            query[key] = [value]
+    account = _derive_account_from_body(body)
+    if account:
+        query["account"] = [account]
+    return query
+
+
+def handle_login_and_shorten_compatibility(
+    body: Mapping[str, object],
+    config: ServerConfig,
+) -> Tuple[int, Dict[str, object]]:
+    platform = _compat_platform(_compat_body_value(body, "platform"))
+    if platform != "shopee":
+        return 400, error_payload(
+            "unsupported_platform",
+            platform=platform or _compat_body_value(body, "platform") or "",
+            supported=["shopee"],
+        )
+
+    query = _shorten_query_from_login_body(body)
+    status, payload = handle_shorten(query, config)
+    if status == 200:
+        return 200, {
+            "status": "ok",
+            "platform": "shopee",
+            "account": payload.get("account"),
+            "shorten": payload,
+        }
+    out = dict(payload)
+    out.setdefault("status", "error")
+    out.setdefault("error", out.get("reason") or "shorten_failed")
+    out["platform"] = "shopee"
+    return status, out
 
 
 def handle_login(query: Mapping[str, object],
@@ -372,6 +547,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             status, payload = 200, health_payload(config)
         elif path == "/accounts":
             status, payload = 200, accounts_payload(config)
+        elif path == "/login-ui":
+            self._write_html(200, login_ui_html(query))
+            return
+        elif path == "/login/shopee":
+            self._redirect("/login?platform=shopee")
+            return
+        elif path == "/login/lazada":
+            self._redirect("/login?platform=lazada")
+            return
         elif path == "/login":
             status, payload = handle_login(query, config)
         elif path == "/shorten":
@@ -379,6 +563,40 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             status, payload = 404, error_payload("not_found", path=parsed.path)
 
+        self._write_json(status, payload)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        config = self.server.config
+
+        if path not in {"/api/login", "/api/login-and-shorten"}:
+            self._write_json(404, error_payload("not_found", path=parsed.path))
+            return
+
+        try:
+            body = self._read_json_body()
+        except ValueError as exc:
+            self._write_json(
+                400,
+                error_payload(
+                    "invalid_json",
+                    reason="invalid_json",
+                    message=sanitize_error_message(exc),
+                ),
+            )
+            return
+
+        try:
+            if path == "/api/login":
+                status, payload = handle_login_compatibility(body)
+            else:
+                status, payload = handle_login_and_shorten_compatibility(body, config)
+        except Exception as exc:  # noqa: BLE001 - fail closed and redact submitted secrets
+            status, payload = 400, error_payload(
+                "compatibility_route_failed",
+                reason=_redact_body_secrets(exc, body),
+            )
         self._write_json(status, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -393,6 +611,39 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_html(self, status: int, html: str) -> None:
+        body = str(html).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _read_json_body(self) -> Dict[str, object]:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length < 0 or length > 1024 * 1024:
+            raise ValueError("json_body_too_large")
+        raw = self.rfile.read(length) if length else b"{}"
+        if not raw.strip():
+            return {}
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_json_body") from exc
+        if not isinstance(body, dict):
+            raise ValueError("json_body_must_be_object")
+        return body
 
 
 def make_server(config: ServerConfig) -> PrototypeHTTPServer:
