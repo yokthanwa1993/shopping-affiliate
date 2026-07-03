@@ -47,6 +47,26 @@ Environment overrides:
 | `GET` | `/accounts` | Known Shopee account aliases |
 | `GET` | `/login?platform=shopee&account=affiliate_chearb.com` | Open headed CloakBrowser at `https://affiliate.shopee.co.th/offer/custom_link` |
 | `GET` | `/shorten?id=15130770000&url=https://...&sub1=...` | Attempt real Shopee `batchCustomLink` shortening from the opened browser session |
+| `GET` | `/conversion-report?id=15130770000&time=DD/MM/YYYY` | Shopee conversion report; summary (per-`sub_id` counts) by default, `raw=1`/`mode=raw` returns one page of raw rows |
+| `GET` | `/daily-income-report?ids=15130770000,15142270000&time=today` | Multi-account daily income from Shopee `dashboard/detail`; also `/income-report` |
+| `GET` | `/click-report?id=15130770000&time=DD/MM/YYYY` | Shopee click report; summary (`sub_id`/`sub1`/`sub2`/`sub3` breakdown), `raw=1` single page, `raw=complete` full enumeration |
+
+### Report routes
+
+Ported from the legacy Node `affiliate-shortlink-cloak` service. All report
+fetches reuse the same per-account CloakBrowser profile as `/shorten` (no stored
+tokens, cookies, or secrets in responses). If Shopee is gated by login/captcha,
+the report fails closed with a sanitized `manual_login_required` payload plus
+`loginUi: /login?platform=shopee`.
+
+- **Accounts / id:** `id` (or `an_<id>`) selects the account; default
+  `15130770000`. Daily income accepts `ids=15130770000,15142270000`.
+- **Dates:** `time` accepts `today`, `yesterday`, `DD/MM/YYYY`, or `YYYY-MM-DD`,
+  resolved against the Asia/Bangkok day (00:00:00 – 23:59:59).
+- **Host aliases:** `GET /` on Host `conversionreport.wwoom.com` maps to
+  `/conversion-report`; Host `clickreport.wwoom.com` maps to `/click-report`.
+- **Paging:** conversion `raw` mode honors `page`/`page_num` and `page_size`
+  (1–100, default 20); summary/complete modes force `page_size=100` from page 1.
 
 `/shorten` supports optional `sub1` through `sub5` query params. Each value is
 sanitized to alphanumeric characters and capped at 64 characters before it is

@@ -8,6 +8,7 @@ this module (and running the test suite) never requires a live browser or the
 from __future__ import annotations
 
 import os
+import re
 import threading
 from typing import Dict, List, Optional
 
@@ -46,6 +47,20 @@ _IN_PAGE_SHORTEN_SCRIPT = """async ([endpoint, body, csrfToken]) => {
   });
   const text = await response.text();
   return { status: response.status, text, currentUrl: location.href };
+}"""
+
+_IN_PAGE_REPORT_FETCH_SCRIPT = """async ([apiUrl]) => {
+  const resp = await fetch(apiUrl, {
+    method: 'GET',
+    credentials: 'include',
+    headers: { 'accept': 'application/json' },
+  });
+  const status = resp.status;
+  const text = await resp.text();
+  let parsed = false;
+  let body = null;
+  try { body = JSON.parse(text); parsed = true; } catch (e) { parsed = false; }
+  return { status, parsed, body, snippet: parsed ? '' : String(text || '').slice(0, 200) };
 }"""
 
 _IN_PAGE_CSRF_SCRIPT = """() => {
@@ -202,6 +217,45 @@ def shorten_shopee_link(
             "originalLink": parsed["originalLink"],
         }
 
+
+
+_AFFILIATE_ORIGIN_RE = re.compile(r"affiliate\.shopee\.co\.th", re.IGNORECASE)
+_LOGIN_REDIRECT_RE = re.compile(
+    r"shopee\.co\.th/buyer/login|affiliate\.shopee\.co\.th/login",
+    re.IGNORECASE,
+)
+
+
+def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object]:
+    """Run a credentialed in-page GET against a Shopee report API.
+
+    Reuses the per-account persistent CloakBrowser session (same profile the
+    shortlink flow uses). Returns a dict shaped like the legacy in-page fetch:
+    ``{status, parsed, body, snippet}``. If the session bounced to a login page
+    (or is off the affiliate origin) it fails closed with ``{login_gate: True}``
+    instead of leaking the redirect URL. Never returns cookies/tokens.
+
+    Raises ``BrowserLaunchError`` when the browser cannot be launched (callers
+    map that to ``browser_unavailable``); a failed in-page fetch raises a plain
+    ``RuntimeError`` (callers map that to a sanitized ``*_fetch_failed``).
+    """
+    profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
+    with _profile_lock(profile_dir):
+        context, page = _open_shopee_custom_link_page(profile_dir)
+        current_url = str(_safe_current_url(page) or "")
+        if _LOGIN_REDIRECT_RE.search(current_url) or not _AFFILIATE_ORIGIN_RE.search(current_url):
+            return {"login_gate": True}
+
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            raise RuntimeError("browser_evaluate_unavailable")
+        try:
+            result = evaluate(_IN_PAGE_REPORT_FETCH_SCRIPT, [str(api_url)])
+        except Exception as exc:  # noqa: BLE001 - sanitized upstream
+            raise RuntimeError(sanitize_error_message(exc)) from None
+        if not isinstance(result, dict):
+            raise RuntimeError("shopee_report_invalid_fetch_result")
+        return result
 
 
 def _profile_lock(profile_dir: str) -> threading.Lock:

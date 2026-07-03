@@ -21,6 +21,13 @@ from . import (
     __version__,
 )
 from .accounts import list_accounts, profile_dir_for, resolve_account
+from .click_report import handle_click_report, is_click_report_host
+from .conversion_report import (
+    handle_conversion_report,
+    handle_daily_income_report,
+    is_conversion_report_host,
+)
+from .report_common import ReportRequestError
 from .shopee import (
     ShopeeShortenError,
     sanitize_error_message,
@@ -285,6 +292,49 @@ def shorten_fail_closed_payload(
     return payload
 
 
+def make_report_fetcher(config: ServerConfig):
+    """Build a ``fetch(account, api_url)`` bound to the per-account Shopee
+    CloakBrowser profile. Imported lazily so the report modules stay
+    browser-free and unit-testable without CloakBrowser installed."""
+
+    def fetch(account: str, api_url: str) -> Mapping[str, object]:
+        from .browser import fetch_shopee_report_json
+
+        profile_dir = profile_dir_for(config.profile_root, "shopee", account)
+        return fetch_shopee_report_json(profile_dir, api_url)
+
+    return fetch
+
+
+def _report_route(handler) -> Tuple[int, Dict[str, object]]:
+    """Run a report handler, mapping validation failures to safe HTTP payloads."""
+    try:
+        return 200, handler()
+    except ReportRequestError as exc:
+        return exc.status_code, dict(exc.public_payload)
+
+
+def handle_conversion_report_route(
+    query: Mapping[str, object], config: ServerConfig
+) -> Tuple[int, Dict[str, object]]:
+    fetch = make_report_fetcher(config)
+    return _report_route(lambda: handle_conversion_report(query, fetch=fetch))
+
+
+def handle_daily_income_report_route(
+    query: Mapping[str, object], config: ServerConfig
+) -> Tuple[int, Dict[str, object]]:
+    fetch = make_report_fetcher(config)
+    return _report_route(lambda: handle_daily_income_report(query, fetch=fetch))
+
+
+def handle_click_report_route(
+    query: Mapping[str, object], config: ServerConfig
+) -> Tuple[int, Dict[str, object]]:
+    fetch = make_report_fetcher(config)
+    return _report_route(lambda: handle_click_report(query, fetch=fetch))
+
+
 class PrototypeHTTPServer(HTTPServer):
 
     def __init__(self, server_address, handler_class, config: ServerConfig):
@@ -303,18 +353,28 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query, keep_blank_values=True)
         config = self.server.config
+        headers = getattr(self, "headers", None)
+        host_header = headers.get("Host", "") if headers else ""
+        path = parsed.path
+        is_root = path in {"", "/"}
 
-        if parsed.path in {"", "/"} and ("url" in query or "id" in query):
+        if path == "/conversion-report" or (is_root and is_conversion_report_host(host_header)):
+            status, payload = handle_conversion_report_route(query, config)
+        elif path in {"/daily-income-report", "/income-report"}:
+            status, payload = handle_daily_income_report_route(query, config)
+        elif path == "/click-report" or (is_root and is_click_report_host(host_header)):
+            status, payload = handle_click_report_route(query, config)
+        elif is_root and ("url" in query or "id" in query):
             status, payload = handle_shorten(query, config)
-        elif parsed.path in {"", "/"}:
+        elif is_root:
             status, payload = 200, health_payload(config)
-        elif parsed.path == "/health":
+        elif path == "/health":
             status, payload = 200, health_payload(config)
-        elif parsed.path == "/accounts":
+        elif path == "/accounts":
             status, payload = 200, accounts_payload(config)
-        elif parsed.path == "/login":
+        elif path == "/login":
             status, payload = handle_login(query, config)
-        elif parsed.path == "/shorten":
+        elif path == "/shorten":
             status, payload = handle_shorten(query, config)
         else:
             status, payload = 404, error_payload("not_found", path=parsed.path)
