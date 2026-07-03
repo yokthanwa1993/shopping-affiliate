@@ -14,6 +14,10 @@ function str(value, fallback) {
   return trimmed || fallback;
 }
 
+function boolFlag(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
 // Storage modes:
 //   discord — Discord is the 100% source of truth for original + processed
 //             media. The Mac mini only indexes metadata (SQLite) and never
@@ -61,6 +65,13 @@ export const config = {
     process.env.DB_PATH,
     path.join(home, 'Library', 'Application Support', 'AffiliateAdmin', 'admin-media-drive.sqlite'),
   )),
+  processor: {
+    ffmpegBin: str(process.env.FFMPEG_BIN, 'ffmpeg'),
+    ffprobeBin: str(process.env.FFPROBE_BIN, 'ffprobe'),
+    videoEncoder: str(process.env.FFMPEG_VIDEO_ENCODER, 'auto').toLowerCase(),
+    keepTmp: boolFlag(process.env.KEEP_PROCESSING_TMP),
+    pollMs: num(process.env.PROCESS_POLL_MS, 30_000),
+  },
 };
 
 export default config;

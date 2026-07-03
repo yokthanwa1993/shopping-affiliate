@@ -64,6 +64,61 @@ curl -s http://127.0.0.1:3100/api/health
 
 ---
 
+## Local Mac video processing
+
+Processing is intentionally **100% local on this Mac mini**:
+
+- No Docker.
+- No CapRover Ubuntu.
+- No Cloudflare Worker / Container / D1 / R2 processing path.
+- Discord remains the source of truth for original and processed media.
+- The Mac mini downloads the source attachment to `MEDIA_ROOT/tmp/...`, runs
+  FFmpeg locally, uploads the processed MP4 to Discord, indexes the output
+  attachment in SQLite, then deletes temp files unless `KEEP_PROCESSING_TMP=1`.
+
+Default transform:
+
+- Normalize output to MP4 / H.264 / AAC with `+faststart`.
+- Preserve aspect ratio without crop.
+- Cap landscape output within `1280x720`; cap portrait output within
+  `720x1280`.
+- Use `yuv420p` for broad compatibility.
+- Prefer `h264_videotoolbox` on macOS when FFmpeg exposes it; fall back to
+  `libx264`. Set `FFMPEG_VIDEO_ENCODER=libx264` to force software encoding.
+
+Run one queued job:
+
+```bash
+PROCESS_ONCE=1 npm run process
+```
+
+Poll for queued jobs:
+
+```bash
+npm run process
+```
+
+Sample local API flow:
+
+```bash
+curl -s http://127.0.0.1:3100/api/processor/health
+
+curl -s -X POST http://127.0.0.1:3100/api/processor/jobs \
+  -H 'content-type: application/json' \
+  -d '{"mediaItemId":1}'
+
+curl -s -X POST http://127.0.0.1:3100/api/processor/run-next
+```
+
+Verification:
+
+```bash
+npm test --prefix apps/admin-media-drive
+node --check apps/admin-media-drive/src/worker.js
+```
+
+---
+
 ## Configuration (`.env`)
 
 | Var | Default | Purpose |
@@ -79,6 +134,11 @@ curl -s http://127.0.0.1:3100/api/health
 | `MEDIA_ROOT` | `/Users/yok-macmini/AffiliateMedia/admin-media-drive` | Temp/cache dir (discord mode); permanent mirror root (mirror mode). |
 | `DB_PATH` | `/Users/yok-macmini/Library/Application Support/AffiliateAdmin/admin-media-drive.sqlite` | SQLite index file (parent dir auto-created). |
 | `NAMESPACE_ID` | `admin` | Logical namespace stamped on indexed rows. |
+| `FFMPEG_BIN` | `ffmpeg` | Local FFmpeg binary from `PATH` (or absolute path). |
+| `FFPROBE_BIN` | `ffprobe` | Local FFprobe binary from `PATH` (or absolute path). |
+| `FFMPEG_VIDEO_ENCODER` | `auto` | `auto` prefers `h264_videotoolbox` on macOS when available; `libx264` forces software encode. |
+| `KEEP_PROCESSING_TMP` | `0` | `1` keeps job temp dirs for debugging; default cleans after success/failure. |
+| `PROCESS_POLL_MS` | `30000` | Poll interval for `npm run process`. |
 
 Discovered channel ids (safe to keep in `.env` / examples — they are ids, not
 secrets):
@@ -121,11 +181,26 @@ Table `media_items`:
 | `local_path` | **null in discord mode**; mirror path in mirror mode (null if mirror failed) |
 | `discord_url` | last-known CDN url (expires — use the fresh-url route instead) |
 | `jump_url` | permalink to the Discord message |
-| `status` | discord mode: `discord_indexed`. mirror mode: `mirrored` \| `indexed` \| `index_only` |
+| `status` | discord mode originals: `discord_indexed`; processed outputs: `processed_discord_indexed`. mirror mode: `mirrored` \| `indexed` \| `index_only` |
 | `created_at`, `updated_at` | ISO timestamps |
 
 Upserts key on `(namespace_id, attachment_id)`; a re-index never clobbers an
 existing `local_path` or the original `created_at`.
+
+Table `processing_jobs` records local processor lifecycle:
+
+| column | notes |
+|--------|-------|
+| `id` | autoincrement PK |
+| `namespace_id` | default `admin` |
+| `source_media_item_id` | original `media_items.id` |
+| `source_attachment_id`, `source_channel_id`, `source_message_id` | Discord identity for the original |
+| `status` | `queued` \| `processing` \| `processed` \| `failed` |
+| `step` | current short step such as `downloading`, `processing`, `uploading` |
+| `options_json` | currently `{}` only; free-form caller options are not persisted |
+| `temp_dir`, `input_path`, `output_path` | transient local paths; cleaned unless `KEEP_PROCESSING_TMP=1` |
+| `output_media_item_id`, `output_attachment_id`, `output_channel_id`, `output_message_id` | processed Discord output |
+| `error`, `attempts`, timestamps | retry/debug state; no secrets |
 
 ---
 
@@ -142,6 +217,24 @@ existing `local_path` or the original `created_at`.
 | `POST` | `/api/sync-channel` | **discord mode:** index recent-message metadata only — no downloads; reports `{ mode, total, indexed, skipped, failed, downloaded: 0 }`. **mirror mode:** also downloads missing local mirrors. Body: `{ channelId, limit }`. |
 | `GET` | `/api/local-media/:id/file` | **discord mode:** 302-redirects to a **fresh Discord URL** resolved from the DB row (no local file). **mirror mode:** serves the local mirror with HTTP `Range`. |
 | `POST` | `/api/upload` | Upload to Discord. **discord mode:** insert index row (metadata only, no local file). **mirror mode:** also write local mirror. Multipart: `file`, `channelId`, `caption`. |
+| `GET` | `/api/processor/health` | Local FFmpeg/FFprobe presence, selected encoder, queue counts, and output-channel config. No secrets. |
+| `POST` | `/api/processor/jobs` | Enqueue a local processing job. Body: `{ "mediaItemId": 1 }` or `{ "attachmentId": "..." }`. |
+| `GET` | `/api/processor/jobs` | List recent processor jobs (`?status`, `?limit`, `?offset`). |
+| `POST` | `/api/processor/jobs/:id/run` | Process one queued/failed job immediately. |
+| `POST` | `/api/processor/run-next` | Process the next queued job immediately. |
+| `POST` | `/api/processor/jobs/:id/retry` | Move a failed job back to queued. |
+
+Sample local curls:
+
+```bash
+curl -s http://127.0.0.1:3100/api/processor/health
+
+curl -s -X POST http://127.0.0.1:3100/api/processor/jobs \
+  -H 'content-type: application/json' \
+  -d '{"mediaItemId":123}'
+
+curl -s -X POST http://127.0.0.1:3100/api/processor/run-next
+```
 
 ---
 

@@ -123,3 +123,76 @@ test('list filters by namespace and channel, newest first', () => {
 
   db.close();
 });
+
+test('processing job lifecycle tracks queued, processing, processed, failed, and retry', () => {
+  const db = openDb(tempDb());
+  const source = db.upsert({
+    namespace_id: 'admin',
+    channel_id: 'c1',
+    message_id: 'm1',
+    attachment_id: 'a1',
+    filename: 'clip.mp4',
+    content_type: 'video/mp4',
+    status: 'discord_indexed',
+  });
+
+  const job = db.createProcessingJob({
+    namespaceId: 'admin',
+    sourceMediaItemId: source.id,
+    sourceAttachmentId: source.attachment_id,
+    sourceChannelId: source.channel_id,
+    sourceMessageId: source.message_id,
+    options: { ignored: true },
+  });
+  assert.equal(job.status, 'queued');
+  assert.equal(job.step, 'queued');
+  assert.equal(job.attempts, 0);
+  assert.equal(db.countProcessingJobs('admin').queued, 1);
+
+  const next = db.getNextQueuedProcessingJob('admin');
+  assert.equal(next.id, job.id);
+
+  const started = db.markProcessingJobStarted(job.id, {
+    step: 'downloading',
+    tempDir: '/tmp/job',
+    inputPath: '/tmp/job/source.mp4',
+    outputPath: '/tmp/job/out.mp4',
+  });
+  assert.equal(started.status, 'processing');
+  assert.equal(started.attempts, 1);
+  assert.equal(started.temp_dir, '/tmp/job');
+
+  const uploaded = db.upsert({
+    namespace_id: 'admin',
+    channel_id: 'c2',
+    message_id: 'm2',
+    attachment_id: 'a2',
+    filename: 'clip-processed.mp4',
+    content_type: 'video/mp4',
+    status: 'processed',
+  });
+  const processed = db.markProcessingJobProcessed(job.id, {
+    outputMediaItemId: uploaded.id,
+    outputAttachmentId: uploaded.attachment_id,
+    outputChannelId: uploaded.channel_id,
+    outputMessageId: uploaded.message_id,
+  });
+  assert.equal(processed.status, 'processed');
+  assert.equal(processed.output_media_item_id, uploaded.id);
+  assert.equal(db.countProcessingJobs('admin').processed, 1);
+
+  const failed = db.createProcessingJob({
+    namespaceId: 'admin',
+    sourceMediaItemId: source.id,
+    sourceAttachmentId: source.attachment_id,
+    sourceChannelId: source.channel_id,
+    sourceMessageId: source.message_id,
+  });
+  db.markProcessingJobFailed(failed.id, { step: 'processing', error: 'boom' });
+  const retry = db.retryProcessingJob(failed.id);
+  assert.equal(retry.status, 'queued');
+  assert.equal(retry.error, null);
+  assert.equal(retry.step, 'queued');
+
+  db.close();
+});

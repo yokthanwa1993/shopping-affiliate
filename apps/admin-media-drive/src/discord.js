@@ -162,14 +162,18 @@ export class DiscordService {
     return attachment.url;
   }
 
-  async uploadFile({ channelId, buffer, filename, mimetype, caption }) {
+  async uploadFile({ channelId, buffer, filePath, filename, mimetype, caption }) {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || channel.type !== ChannelType.GuildText) {
       const err = new Error('Selected channel is not a text channel');
       err.status = 400;
       throw err;
     }
-    const attachment = new AttachmentBuilder(buffer, {
+    const source = buffer ?? filePath;
+    if (!source) {
+      throw new Error('No upload source provided');
+    }
+    const attachment = new AttachmentBuilder(source, {
       name: filename,
       description: mimetype,
     });

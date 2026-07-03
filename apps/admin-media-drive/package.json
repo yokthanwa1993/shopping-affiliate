@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "process": "node src/worker.js",
+    "process:once": "PROCESS_ONCE=1 node src/worker.js",
     "test": "node --test"
   },
   "dependencies": {

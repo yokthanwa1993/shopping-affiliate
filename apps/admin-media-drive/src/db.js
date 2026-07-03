@@ -35,6 +35,38 @@ export function openDb(dbPath) {
       ON media_items (namespace_id, channel_id);
     CREATE INDEX IF NOT EXISTS idx_media_items_created
       ON media_items (created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS processing_jobs (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      namespace_id          TEXT NOT NULL DEFAULT 'admin',
+      source_media_item_id  INTEGER,
+      source_attachment_id  TEXT,
+      source_channel_id     TEXT,
+      source_message_id     TEXT,
+      status                TEXT NOT NULL DEFAULT 'queued'
+                            CHECK (status IN ('queued', 'processing', 'processed', 'failed')),
+      step                  TEXT,
+      options_json          TEXT,
+      temp_dir              TEXT,
+      input_path            TEXT,
+      output_path           TEXT,
+      output_media_item_id  INTEGER,
+      output_attachment_id  TEXT,
+      output_channel_id     TEXT,
+      output_message_id     TEXT,
+      error                 TEXT,
+      attempts              INTEGER NOT NULL DEFAULT 0,
+      created_at            TEXT,
+      updated_at            TEXT,
+      started_at            TEXT,
+      finished_at           TEXT,
+      FOREIGN KEY (source_media_item_id) REFERENCES media_items(id) ON DELETE SET NULL,
+      FOREIGN KEY (output_media_item_id) REFERENCES media_items(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_processing_jobs_status
+      ON processing_jobs (namespace_id, status, id);
+    CREATE INDEX IF NOT EXISTS idx_processing_jobs_created
+      ON processing_jobs (namespace_id, created_at DESC, id DESC);
   `);
 
   const upsertStmt = db.prepare(`
@@ -71,6 +103,93 @@ export function openDb(dbPath) {
   const countByNamespaceStmt = db.prepare(
     'SELECT COUNT(*) AS n FROM media_items WHERE namespace_id = ?',
   );
+  const createJobStmt = db.prepare(`
+    INSERT INTO processing_jobs (
+      namespace_id, source_media_item_id, source_attachment_id,
+      source_channel_id, source_message_id, status, step, options_json,
+      temp_dir, input_path, output_path, error, attempts,
+      created_at, updated_at
+    ) VALUES (
+      @namespace_id, @source_media_item_id, @source_attachment_id,
+      @source_channel_id, @source_message_id, 'queued', 'queued', @options_json,
+      NULL, NULL, NULL, NULL, 0,
+      @created_at, @updated_at
+    )
+    RETURNING *
+  `);
+  const getJobStmt = db.prepare('SELECT * FROM processing_jobs WHERE id = ?');
+  const nextQueuedJobStmt = db.prepare(`
+    SELECT * FROM processing_jobs
+    WHERE namespace_id = ? AND status = 'queued'
+    ORDER BY datetime(created_at) ASC, id ASC
+    LIMIT 1
+  `);
+  const countJobsByStatusStmt = db.prepare(`
+    SELECT status, COUNT(*) AS n
+    FROM processing_jobs
+    WHERE namespace_id = ?
+    GROUP BY status
+  `);
+  const startJobStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      status = 'processing',
+      step = @step,
+      temp_dir = @temp_dir,
+      input_path = @input_path,
+      output_path = @output_path,
+      error = NULL,
+      attempts = attempts + 1,
+      started_at = COALESCE(started_at, @now),
+      finished_at = NULL,
+      updated_at = @now
+    WHERE id = @id
+    RETURNING *
+  `);
+  const updateJobStepStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      step = @step,
+      temp_dir = COALESCE(@temp_dir, temp_dir),
+      input_path = COALESCE(@input_path, input_path),
+      output_path = COALESCE(@output_path, output_path),
+      updated_at = @now
+    WHERE id = @id
+    RETURNING *
+  `);
+  const completeJobStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      status = 'processed',
+      step = @step,
+      output_media_item_id = @output_media_item_id,
+      output_attachment_id = @output_attachment_id,
+      output_channel_id = @output_channel_id,
+      output_message_id = @output_message_id,
+      error = NULL,
+      finished_at = @now,
+      updated_at = @now
+    WHERE id = @id
+    RETURNING *
+  `);
+  const failJobStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      status = 'failed',
+      step = @step,
+      error = @error,
+      finished_at = @now,
+      updated_at = @now
+    WHERE id = @id
+    RETURNING *
+  `);
+  const retryJobStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      status = 'queued',
+      step = 'queued',
+      error = NULL,
+      started_at = NULL,
+      finished_at = NULL,
+      updated_at = @now
+    WHERE id = @id AND status = 'failed'
+    RETURNING *
+  `);
 
   function nowIso() {
     return new Date().toISOString();
@@ -137,6 +256,139 @@ export function openDb(dbPath) {
         LIMIT @limit OFFSET @offset
       `;
       return db.prepare(sql).all(params);
+    },
+
+    createProcessingJob({
+      namespaceId,
+      sourceMediaItemId = null,
+      sourceAttachmentId = null,
+      sourceChannelId = null,
+      sourceMessageId = null,
+      options = {},
+    }) {
+      const now = nowIso();
+      return createJobStmt.get({
+        namespace_id: namespaceId,
+        source_media_item_id: sourceMediaItemId,
+        source_attachment_id: sourceAttachmentId,
+        source_channel_id: sourceChannelId,
+        source_message_id: sourceMessageId,
+        options_json: JSON.stringify(options ?? {}),
+        created_at: now,
+        updated_at: now,
+      });
+    },
+
+    getProcessingJob(id) {
+      return getJobStmt.get(Number(id));
+    },
+
+    getNextQueuedProcessingJob(namespaceId) {
+      return nextQueuedJobStmt.get(namespaceId);
+    },
+
+    countProcessingJobs(namespaceId) {
+      const counts = {
+        queued: 0,
+        processing: 0,
+        processed: 0,
+        failed: 0,
+      };
+      for (const row of countJobsByStatusStmt.all(namespaceId)) {
+        counts[row.status] = row.n;
+      }
+      return counts;
+    },
+
+    listProcessingJobs({
+      namespaceId,
+      status,
+      limit = 50,
+      offset = 0,
+    } = {}) {
+      const clauses = ['namespace_id = @namespace_id'];
+      const params = {
+        namespace_id: namespaceId,
+        limit: Math.min(Math.max(Number(limit) || 50, 1), 200),
+        offset: Math.max(Number(offset) || 0, 0),
+      };
+      if (status) {
+        clauses.push('status = @status');
+        params.status = status;
+      }
+      const sql = `
+        SELECT * FROM processing_jobs
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY datetime(created_at) DESC, id DESC
+        LIMIT @limit OFFSET @offset
+      `;
+      return db.prepare(sql).all(params);
+    },
+
+    markProcessingJobStarted(id, {
+      step = 'processing',
+      tempDir = null,
+      inputPath = null,
+      outputPath = null,
+    } = {}) {
+      return startJobStmt.get({
+        id: Number(id),
+        step,
+        temp_dir: tempDir,
+        input_path: inputPath,
+        output_path: outputPath,
+        now: nowIso(),
+      });
+    },
+
+    updateProcessingJobStep(id, {
+      step,
+      tempDir = null,
+      inputPath = null,
+      outputPath = null,
+    }) {
+      return updateJobStepStmt.get({
+        id: Number(id),
+        step,
+        temp_dir: tempDir,
+        input_path: inputPath,
+        output_path: outputPath,
+        now: nowIso(),
+      });
+    },
+
+    markProcessingJobProcessed(id, {
+      step = 'uploaded',
+      outputMediaItemId = null,
+      outputAttachmentId = null,
+      outputChannelId = null,
+      outputMessageId = null,
+    } = {}) {
+      return completeJobStmt.get({
+        id: Number(id),
+        step,
+        output_media_item_id: outputMediaItemId,
+        output_attachment_id: outputAttachmentId,
+        output_channel_id: outputChannelId,
+        output_message_id: outputMessageId,
+        now: nowIso(),
+      });
+    },
+
+    markProcessingJobFailed(id, { step = 'failed', error }) {
+      return failJobStmt.get({
+        id: Number(id),
+        step,
+        error: String(error || 'processing_failed').slice(0, 2000),
+        now: nowIso(),
+      });
+    },
+
+    retryProcessingJob(id) {
+      return retryJobStmt.get({
+        id: Number(id),
+        now: nowIso(),
+      });
     },
 
     close() {

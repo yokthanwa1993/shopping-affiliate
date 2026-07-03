@@ -38,3 +38,11 @@ test('config exposes source/processed channel ids (default empty strings)', () =
   assert.equal(typeof config.discord.sourceChannelId, 'string');
   assert.equal(typeof config.discord.processedChannelId, 'string');
 });
+
+test('config exposes local processor settings without secrets', () => {
+  assert.equal(typeof config.processor.ffmpegBin, 'string');
+  assert.equal(typeof config.processor.ffprobeBin, 'string');
+  assert.equal(typeof config.processor.videoEncoder, 'string');
+  assert.equal(typeof config.processor.keepTmp, 'boolean');
+  assert.equal(typeof config.processor.pollMs, 'number');
+});

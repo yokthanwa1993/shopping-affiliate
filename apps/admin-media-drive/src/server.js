@@ -9,6 +9,12 @@ import multer from 'multer';
 import config, { defaultIndexStatus } from './config.js';
 import { openDb } from './db.js';
 import { DiscordService, isMediaUpload } from './discord.js';
+import { NativeFfmpegProcessor } from './processor.js';
+import {
+  ProcessingError,
+  ProcessingService,
+  processedChannelConfigured,
+} from './processing-service.js';
 import {
   localPathFor,
   downloadTo,
@@ -23,7 +29,14 @@ const publicDir = path.join(__dirname, '..', 'public');
  * Build the Express app + its dependencies. Exported so tests / callers can
  * construct it without necessarily connecting to Discord.
  */
-export function createApp({ cfg = config, discord, db } = {}) {
+export function createApp({
+  cfg = config,
+  discord,
+  db,
+  processor,
+  processingService,
+  downloadFile,
+} = {}) {
   const app = express();
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -32,6 +45,14 @@ export function createApp({ cfg = config, discord, db } = {}) {
 
   const svc = discord || new DiscordService(cfg.discord);
   const index = db || openDb(cfg.dbPath);
+  const nativeProcessor = processor || new NativeFfmpegProcessor(cfg.processor);
+  const processorSvc = processingService || new ProcessingService({
+    cfg,
+    db: index,
+    discord: svc,
+    processor: nativeProcessor,
+    downloadFile,
+  });
 
   // Discord-backed storage is the default: Discord holds 100% of the media,
   // the Mac mini only indexes metadata. `mirror` is the legacy local-copy mode.
@@ -51,6 +72,14 @@ export function createApp({ cfg = config, discord, db } = {}) {
       return false;
     }
     return true;
+  }
+
+  function sendProcessingError(res, error) {
+    const status = error?.status || 500;
+    return res.status(status).json({
+      error: error?.message || 'processor_error',
+      job: error instanceof ProcessingError ? error.job : undefined,
+    });
   }
 
   // Map a Discord attachment description into a media_items row and index it,
@@ -94,6 +123,7 @@ export function createApp({ cfg = config, discord, db } = {}) {
       maxUploadBytes: cfg.maxUploadBytes,
       counts: {
         mediaItems: index.count(cfg.namespaceId),
+        processingJobs: index.countProcessingJobs(cfg.namespaceId),
       },
     });
   });
@@ -394,6 +424,88 @@ export function createApp({ cfg = config, discord, db } = {}) {
     } catch (error) {
       res.status(error?.status || 500)
         .json({ error: error?.message || 'Failed to upload to Discord' });
+    }
+  });
+
+  // --- Local processor -----------------------------------------------------
+  app.get('/api/processor/health', async (_req, res) => {
+    try {
+      const health = await processorSvc.health();
+      res.json({
+        ok: true,
+        service: 'admin-media-drive-processor',
+        namespaceId: cfg.namespaceId,
+        processedChannelConfigured: processedChannelConfigured(cfg),
+        processedChannelId: cfg.discord.processedChannelId || null,
+        defaultChannelId: cfg.discord.defaultChannelId || null,
+        ...health,
+      });
+    } catch (error) {
+      res.status(500).json({ error: error?.message || 'processor_health_failed' });
+    }
+  });
+
+  app.post('/api/processor/jobs', (req, res) => {
+    try {
+      const mediaItemId = req.body?.mediaItemId;
+      const attachmentId = req.body?.attachmentId;
+      if (!mediaItemId && !attachmentId) {
+        return res.status(400).json({ error: 'mediaItemId_or_attachmentId_required' });
+      }
+      const job = processorSvc.enqueue({
+        mediaItemId,
+        attachmentId,
+        options: req.body?.options,
+      });
+      return res.status(201).json({ job });
+    } catch (error) {
+      return sendProcessingError(res, error);
+    }
+  });
+
+  app.get('/api/processor/jobs', (req, res) => {
+    try {
+      const jobs = index.listProcessingJobs({
+        namespaceId: cfg.namespaceId,
+        status: req.query.status ? String(req.query.status) : undefined,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      });
+      res.json({
+        jobs,
+        counts: index.countProcessingJobs(cfg.namespaceId),
+      });
+    } catch (error) {
+      res.status(500).json({ error: error?.message || 'processor_jobs_list_failed' });
+    }
+  });
+
+  app.post('/api/processor/jobs/:id/run', async (req, res) => {
+    if (!requireBot(res)) return;
+    try {
+      const job = await processorSvc.runJob(req.params.id);
+      res.json({ job });
+    } catch (error) {
+      sendProcessingError(res, error);
+    }
+  });
+
+  app.post('/api/processor/run-next', async (_req, res) => {
+    if (!requireBot(res)) return;
+    try {
+      const job = await processorSvc.runNext();
+      res.json({ job });
+    } catch (error) {
+      sendProcessingError(res, error);
+    }
+  });
+
+  app.post('/api/processor/jobs/:id/retry', (req, res) => {
+    try {
+      const job = processorSvc.retryJob(req.params.id);
+      res.json({ job });
+    } catch (error) {
+      sendProcessingError(res, error);
     }
   });
 
