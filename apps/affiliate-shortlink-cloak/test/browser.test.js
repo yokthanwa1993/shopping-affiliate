@@ -102,7 +102,7 @@ test('getContext closes and relaunches a persistent context when headless mode c
   assert.deepEqual(launches.map((launch) => launch.headless), [true, false]);
 });
 
-test('getContext forces Shopee headed even when headless:true is requested', async (t) => {
+test('getContext keeps Shopee headless for automatic shorten when requested', async (t) => {
   const launches = [];
   await browser.__resetForTest();
   browser.__setChromiumForTest('playwright-core', createFakeChromium(launches));
@@ -110,10 +110,10 @@ test('getContext forces Shopee headed even when headless:true is requested', asy
 
   const record = await browser.getContext('shopee', 'CHEARB', { headless: true });
 
-  assert.equal(record.headless, false);
-  assert.equal(record.launchMode, 'headed');
+  assert.equal(record.headless, true);
+  assert.equal(record.launchMode, 'headless');
   assert.equal(launches.length, 1);
-  assert.equal(launches[0].headless, false);
+  assert.equal(launches[0].headless, true);
 });
 
 test('getContext launches Shopee with defaults only — no userAgent/viewport/locale/args', async (t) => {
@@ -126,14 +126,14 @@ test('getContext launches Shopee with defaults only — no userAgent/viewport/lo
 
   const opts = launches[0].options;
   assert.deepEqual(Object.keys(opts), ['headless']);
-  assert.equal(opts.headless, false);
+  assert.equal(opts.headless, true);
   assert.equal('userAgent' in opts, false);
   assert.equal('viewport' in opts, false);
   assert.equal('locale' in opts, false);
   assert.equal('args' in opts, false);
 });
 
-test('getContext (cloakbrowser) launches Shopee headed with only humanize default', async (t) => {
+test('getContext (cloakbrowser) launches Shopee headless with only humanize default', async (t) => {
   const launches = [];
   await browser.__resetForTest();
   browser.__setChromiumForTest('cloakbrowser', createFakeCloakBrowser(launches));
@@ -145,15 +145,15 @@ test('getContext (cloakbrowser) launches Shopee headed with only humanize defaul
   assert.equal(typeof opts.userDataDir, 'string');
   assert.equal(opts.userDataDir.length > 0, true);
   assert.equal(opts.humanize, true);
-  assert.equal(opts.headless, false);
+  assert.equal(opts.headless, true);
   assert.equal('userAgent' in opts, false);
   assert.equal('viewport' in opts, false);
   assert.equal('locale' in opts, false);
   assert.equal('args' in opts, false);
-  assert.equal(record.launchMode, 'headed');
+  assert.equal(record.launchMode, 'headless');
 });
 
-test('getPage forces Shopee headed for automatic shorten/reauth (headless:true ignored)', async (t) => {
+test('getPage keeps Shopee headless for automatic shorten/reauth', async (t) => {
   const launches = [];
   await browser.__resetForTest();
   browser.__setChromiumForTest('playwright-core', createFakeChromium(launches));
@@ -161,9 +161,9 @@ test('getPage forces Shopee headed for automatic shorten/reauth (headless:true i
 
   const { record } = await browser.getPage('shopee', 'CHEARB', { headless: true });
 
-  assert.equal(record.headless, false);
-  assert.equal(record.launchMode, 'headed');
-  assert.equal(launches[0].headless, false);
+  assert.equal(record.headless, true);
+  assert.equal(record.launchMode, 'headless');
+  assert.equal(launches[0].headless, true);
   assert.deepEqual(Object.keys(launches[0].options), ['headless']);
 });
 

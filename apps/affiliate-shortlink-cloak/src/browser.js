@@ -65,12 +65,13 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
   if (!platform) throw new Error(`Invalid platform: ${platformRaw}`);
   const account = sanitizeAccount(accountRaw);
   const key = contextKey(platform, account);
-  // Shopee must behave like a normal browser: always launch headed (even when a
-  // caller requests headless:true for automatic shorten/reauth) and let
-  // CloakBrowser/Chromium supply its own userAgent/viewport/locale/args — we
-  // inject none of our own. Lazada keeps the previous configured behavior.
+  // Shopee's Custom Link GraphQL must run from a real affiliate page context
+  // (so Shopee's browser-side anti-fraud headers are generated), but the page
+  // does not need to be visible for automatic shorten/reauth. Keep Shopee's
+  // CloakBrowser defaults (no injected UA/viewport/locale/args), and only force
+  // headed mode for explicit manual-login windows.
   const isShopee = platform === 'shopee';
-  const effectiveHeadless = isShopee ? false : (forceVisible ? false : headless);
+  const effectiveHeadless = forceVisible ? false : headless;
 
   if (contexts.has(key)) {
     const existing = contexts.get(key);

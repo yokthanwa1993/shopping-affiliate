@@ -407,11 +407,10 @@ async function shortenShopeeViaContextRequest(record, page, productUrl, safeSubs
 }
 
 async function shortenShopeeOnce(account, productUrl, subIds) {
-  // Match the real Shopee Custom Link UI path: open/reuse the authenticated
-  // affiliate page and let the in-page fetch run from that page context when
-  // BrowserContext.request is rejected. Live UI proof (2026-07-03) showed the
-  // logged-in page succeeds while request-only can return 403.
-  const { record, page } = await browser.getPage('shopee', account, { headless: false });
+  // Match the real Shopee Custom Link page context without showing a browser:
+  // request-only can miss Shopee's browser-side anti-fraud headers, while
+  // in-page fetch from the authenticated affiliate page works headlessly.
+  const { record, page } = await browser.getPage('shopee', account, { headless: true });
   const safeSubs = [0, 1, 2, 3, 4].map((i) => String((subIds && subIds[i]) || '').trim());
   await browser.ensureOnPlatformPage(page, 'shopee');
   await recoverShopeeCustomLinkRoute(page);
