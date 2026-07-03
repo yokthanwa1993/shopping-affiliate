@@ -68,6 +68,16 @@ class BrowserLaunchError(RuntimeError):
     (no secrets) and suitable for returning to a client."""
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _headless_mode() -> bool:
+    return _env_bool("AFFILIATE_CLOAK_HEADLESS", False)
+
 def _import_cloakbrowser():
     """Import cloakbrowser lazily. Raises BrowserLaunchError on failure."""
     try:
@@ -100,7 +110,7 @@ def launch_persistent_context(profile_dir: str):
         try:
             context = cloakbrowser.launch_persistent_context(
                 profile_dir,
-                headless=False,
+                headless=_headless_mode(),
             )
             break
         except Exception as exc:  # pragma: no cover - depends on live env
