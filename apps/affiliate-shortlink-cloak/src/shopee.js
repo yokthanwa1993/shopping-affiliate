@@ -382,7 +382,6 @@ function parseShopeeShortlinkResponse(status, text, productUrl) {
   return { shortLink: r.shortLink || '', longLink: r.longLink || '', originalLink: productUrl };
 }
 
-
 async function shortenShopeeViaContextRequest(record, page, productUrl, safeSubs) {
   const context = record && record.context;
   const request = context && context.request;
@@ -407,11 +406,7 @@ async function shortenShopeeViaContextRequest(record, page, productUrl, safeSubs
 }
 
 async function shortenShopeeOnce(account, productUrl, subIds) {
-  // Match the real Shopee Custom Link page context without showing a browser:
-  // request-only can miss Shopee's browser-side anti-fraud headers, while
-  // in-page fetch from the authenticated affiliate page works headlessly.
   const { record, page } = await browser.getPage('shopee', account, { headless: true });
-  const safeSubs = [0, 1, 2, 3, 4].map((i) => String((subIds && subIds[i]) || '').trim());
   await browser.ensureOnPlatformPage(page, 'shopee');
   await recoverShopeeCustomLinkRoute(page);
   // Guard against a redirect-to-login (or any non-affiliate origin) that
@@ -425,6 +420,7 @@ async function shortenShopeeOnce(account, productUrl, subIds) {
       throw new Error('Execution context was destroyed: redirected off affiliate.shopee.co.th');
     }
   }
+  const safeSubs = [0, 1, 2, 3, 4].map((i) => String((subIds && subIds[i]) || '').trim());
   let contextRequestErr = null;
   try {
     const requestResult = await shortenShopeeViaContextRequest(record, page, productUrl, safeSubs);
