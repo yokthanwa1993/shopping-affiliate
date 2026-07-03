@@ -2336,6 +2336,7 @@ test('handleShorten fails fast with keychain_credential_not_found when account h
   assert.equal(snap.needsManual, true);
 });
 
+
 test('GET /?url=...&account=blank returns manual_login_required payload (no browser call, no batch API call)', async (t) => {
   server._resetSessionStateCacheForTest();
   t.after(() => server._resetSessionStateCacheForTest());
@@ -2533,3 +2534,268 @@ test('handleShorten skips preflight when a fresh sessionValid snapshot exists (n
   await server.ensureShopeeReadyForShorten('fresh_authenticated_acct');
   assert.equal(keychainLookups, 0, 'fresh valid session must not trigger a keychain lookup');
 });
+
+// ---------------------------------------------------------------------------
+// Captcha / OTP circuit breaker
+// After Shopee bounces the profile into a captcha/OTP wall, automatic shorten
+// requests must FAIL CLOSED (return manual_login_required) instead of
+// relaunching the CloakBrowser and re-hammering Shopee. Cleared by a real
+// success / session verification, or by opening the manual visible login path.
+// ---------------------------------------------------------------------------
+
+test('isCaptchaOrOtpReason recognizes captcha/otp/verify markers only', () => {
+  assert.equal(server.isCaptchaOrOtpReason('captcha_or_otp_detected'), true);
+  assert.equal(server.isCaptchaOrOtpReason('https://affiliate.shopee.co.th/verify/captcha'), true);
+  assert.equal(server.isCaptchaOrOtpReason('OTP required'), true);
+  assert.equal(server.isCaptchaOrOtpReason('login_still_required'), false);
+  assert.equal(server.isCaptchaOrOtpReason('shopee_redirected_off_affiliate'), false);
+  assert.equal(server.isCaptchaOrOtpReason(''), false);
+});
+
+test('captcha during pre-shorten reauth trips the circuit; the next request fails closed without a browser or keychain hit', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server._resetCaptchaCircuitForTest();
+  t.after(() => {
+    server._resetSessionStateCacheForTest();
+    server._resetCaptchaCircuitForTest();
+  });
+
+  const PW = 'captcha-circuit-secret-never-returned';
+  let getPageCalls = 0;
+  const originalGetPage = browser.getPage;
+  browser.getPage = async () => {
+    getPageCalls++;
+    return {
+      page: {
+        url: () => 'https://affiliate.shopee.co.th/login',
+        bringToFront: async () => {},
+        goto: async () => {},
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        content: async () => '<html><body>OTP verification required</body></html>',
+      },
+    };
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  stubKeychain(t, {
+    isSupported: () => true,
+    hasCredential: async () => ({ service: 'svc', username: 'stored-user' }),
+    findCredential: async () => ({ username: 'stored-user', password: PW }),
+  });
+
+  // First request: the reauth probe walks into the captcha wall -> manual +
+  // trip the breaker. The browser IS opened once here (to discover the wall).
+  await assert.rejects(
+    () => server.ensureShopeeReadyForShorten('affiliate_chearb.com'),
+    (err) => {
+      assert.equal(err.manualLoginRequired, true);
+      assert.equal(err.reason, 'captcha_or_otp_detected');
+      assert.equal(JSON.stringify(err).includes(PW), false, 'password must never leak');
+      return true;
+    },
+  );
+  assert.ok(getPageCalls >= 1, 'first request must open the browser to discover the captcha');
+  const breaker = server.getCaptchaCircuit('shopee', 'affiliate_chearb.com');
+  assert.ok(breaker, 'captcha must trip the circuit breaker');
+  assert.equal(breaker.reason, 'captcha_or_otp_detected');
+
+  // Second request for the SAME account: fail closed, no browser, no keychain.
+  getPageCalls = 0;
+  browser.getPage = async () => {
+    throw new Error('browser.getPage must NOT run while the captcha circuit is open');
+  };
+  let keychainTouched = false;
+  keychain.hasCredential = async () => { keychainTouched = true; return null; };
+  keychain.findCredential = async () => { keychainTouched = true; return null; };
+
+  await assert.rejects(
+    () => server.ensureShopeeReadyForShorten('affiliate_chearb.com'),
+    (err) => {
+      assert.equal(err.manualLoginRequired, true);
+      assert.equal(err.reason, 'captcha_or_otp_detected');
+      assert.equal(err.captchaCircuitOpen, true);
+      return true;
+    },
+  );
+  assert.equal(getPageCalls, 0, 'open circuit must not relaunch the browser');
+  assert.equal(keychainTouched, false, 'open circuit must not hit the keychain');
+});
+
+test('an open captcha circuit makes handleShorten fail closed with manual_login_required + loginUi (no browser, no batch call)', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server._resetCaptchaCircuitForTest();
+  t.after(() => {
+    server._resetSessionStateCacheForTest();
+    server._resetCaptchaCircuitForTest();
+  });
+
+  server.tripCaptchaCircuit('shopee', 'affiliate_chearb.com', 'captcha_or_otp_detected');
+
+  const originalGetPage = browser.getPage;
+  browser.getPage = async () => {
+    throw new Error('browser must not open while the captcha circuit is open');
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+  stubKeychain(t, {
+    isSupported: () => true,
+    hasCredential: async () => { throw new Error('keychain must not be hit while the circuit is open'); },
+  });
+
+  await assert.rejects(
+    () => server.handleShorten({
+      account: 'affiliate_chearb.com',
+      url: 'https://s.shopee.co.th/abc',
+      sub1: 'x',
+    }),
+    (err) => {
+      assert.equal(err.manualLoginRequired, true);
+      assert.equal(err.reason, 'captcha_or_otp_detected');
+      const payload = server.buildManualLoginRequiredPayload(
+        { account: 'affiliate_chearb.com', url: 'https://s.shopee.co.th/abc', sub1: 'x', platform: 'shopee' },
+        err,
+      );
+      assert.equal(payload.status, 'manual_login_required');
+      assert.equal(payload.manualLoginRequired, true);
+      assert.equal(payload.reason, 'captcha_or_otp_detected');
+      assert.equal(payload.account, 'affiliate_chearb.com');
+      assert.ok(String(payload.loginUi).includes('/login'), 'payload must carry a loginUi');
+      return true;
+    },
+  );
+});
+
+test('a tripped captcha circuit does not block a different account', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server._resetCaptchaCircuitForTest();
+  t.after(() => {
+    server._resetSessionStateCacheForTest();
+    server._resetCaptchaCircuitForTest();
+  });
+
+  server.tripCaptchaCircuit('shopee', 'affiliate_chearb.com', 'captcha_or_otp_detected');
+  // A different account with a fresh valid session must sail through untouched.
+  server.recordSessionState('shopee', 'affiliate_neezs.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+  });
+
+  const originalGetPage = browser.getPage;
+  browser.getPage = async () => {
+    throw new Error('a fresh valid neezs session must not open a browser');
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  await server.ensureShopeeReadyForShorten('affiliate_neezs.com'); // resolves — not blocked
+  assert.equal(server.getCaptchaCircuit('shopee', 'affiliate_neezs.com'), null, 'neezs must have no breaker');
+  assert.ok(
+    server.getCaptchaCircuit('shopee', 'affiliate_chearb.com'),
+    'chearb breaker stays tripped and isolated',
+  );
+});
+
+test('manual visible login path is never blocked by the circuit and clears it', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server._resetCaptchaCircuitForTest();
+  t.after(() => {
+    server._resetSessionStateCacheForTest();
+    server._resetCaptchaCircuitForTest();
+  });
+
+  server.tripCaptchaCircuit('shopee', 'affiliate_chearb.com', 'captcha_or_otp_detected');
+  assert.ok(server.getCaptchaCircuit('shopee', 'affiliate_chearb.com'), 'precondition: circuit tripped');
+
+  let opened = false;
+  const originalGetPage = browser.getPage;
+  browser.getPage = async (platform, account, opts = {}) => {
+    opened = true;
+    assert.equal(opts.forceVisible, true, 'manual path opens a visible window');
+    return {
+      page: {
+        url: () => 'https://affiliate.shopee.co.th/login',
+        bringToFront: async () => {},
+        goto: async () => {},
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+      },
+    };
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  const result = await server.handleLogin({
+    platform: 'shopee',
+    account: 'affiliate_chearb.com',
+    noAutofill: '1',
+  });
+
+  assert.equal(result.status, 'login_window_opened');
+  assert.equal(opened, true, 'manual login path must still open the browser so the operator can solve captcha');
+  assert.equal(
+    server.getCaptchaCircuit('shopee', 'affiliate_chearb.com'),
+    null,
+    'opening the manual login path clears the circuit',
+  );
+});
+
+test('direct captcha manual_login_required from shortenShopee trips circuit for the next request', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server._resetCaptchaCircuitForTest();
+  t.after(() => {
+    server._resetSessionStateCacheForTest();
+    server._resetCaptchaCircuitForTest();
+  });
+
+  server.recordSessionState('shopee', 'affiliate_chearb.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+    currentUrl: 'https://affiliate.shopee.co.th/offer/custom_link',
+  });
+
+  const captchaErr = new Error('MANUAL_LOGIN_REQUIRED');
+  captchaErr.manualLoginRequired = true;
+  captchaErr.reason = 'captcha_or_otp_detected';
+
+  let thrown;
+  try {
+    await server.handleShorten({
+      account: 'affiliate_chearb.com',
+      url: 'https://shopee.co.th/-i.6817918.28499498718',
+      sub1: 'captcha-test',
+    }, {
+      shortenShopeeForTest: async () => { throw captchaErr; },
+    });
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(thrown, captchaErr);
+  const breaker = server.getCaptchaCircuit('shopee', 'affiliate_chearb.com');
+  assert.ok(breaker, 'direct captcha throw must trip circuit');
+  assert.equal(breaker.reason, 'captcha_or_otp_detected');
+
+  const originalGetPage = browser.getPage;
+  const getPageCalls = [];
+  browser.getPage = async (...args) => {
+    getPageCalls.push(args);
+    throw new Error('browser.getPage must not be called after direct captcha tripped the circuit');
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  let second;
+  try {
+    await server.handleShorten({
+      account: 'affiliate_chearb.com',
+      url: 'https://shopee.co.th/-i.6817918.28499498718',
+      sub1: 'captcha-test-2',
+    });
+  } catch (err) {
+    second = err;
+  }
+
+  assert.ok(second);
+  assert.equal(second.manualLoginRequired, true);
+  assert.equal(second.reason, 'captcha_or_otp_detected');
+  assert.equal(second.captchaCircuitOpen, true);
+  assert.equal(getPageCalls.length, 0);
+});
+

@@ -139,6 +139,90 @@ function _resetSessionStateCacheForTest() {
   sessionStateCache.clear();
 }
 
+// --- Captcha / OTP circuit breaker ------------------------------------------
+// After a Shopee shorten/reauth bounces into a captcha or OTP wall, automatic
+// shorten requests for that same (platform, account) must FAIL CLOSED instead
+// of relaunching the CloakBrowser and retrying — repeated automated hits only
+// harden the block and keep re-bouncing the profile to /verify/captcha. The
+// breaker stays tripped until a real successful shorten / session verification
+// clears it, or the operator opens the manual visible login path to solve it.
+// Keyed the same way as the session-state cache (`${platform}::${account}`).
+const captchaCircuitBreakers = new Map();
+const CAPTCHA_CIRCUIT_REASON = 'captcha_or_otp_detected';
+
+// A reason/marker counts as a captcha or OTP wall if it mentions captcha, the
+// /verify/captcha route, or an OTP challenge. Kept deliberately broad so the
+// canonical `captcha_or_otp_detected` reason, a raw `/verify/captcha` URL, and
+// bare `captcha`/`otp` blocker markers all trip the breaker.
+function isCaptchaOrOtpReason(reason) {
+  const value = String(reason == null ? '' : reason).toLowerCase();
+  if (!value) return false;
+  return value.includes('captcha') || /\botp\b/.test(value) || value.includes('verifycode');
+}
+
+function tripCaptchaCircuit(platform, account, reason) {
+  const p = sanitizePlatform(platform);
+  if (!p) return null;
+  const key = sessionStateKey(p, account);
+  const entry = {
+    platform: p,
+    account: sanitizeAccount(account),
+    reason: CAPTCHA_CIRCUIT_REASON,
+    detail: isCaptchaOrOtpReason(reason) ? String(reason) : CAPTCHA_CIRCUIT_REASON,
+    trippedAt: new Date().toISOString(),
+  };
+  captchaCircuitBreakers.set(key, entry);
+  return entry;
+}
+
+function getCaptchaCircuit(platform, account) {
+  const p = sanitizePlatform(platform);
+  if (!p) return null;
+  return captchaCircuitBreakers.get(sessionStateKey(p, account)) || null;
+}
+
+function clearCaptchaCircuit(platform, account) {
+  const p = sanitizePlatform(platform);
+  if (!p) return false;
+  return captchaCircuitBreakers.delete(sessionStateKey(p, account));
+}
+
+function listCaptchaCircuitSnapshots() {
+  return Array.from(captchaCircuitBreakers.values()).map((entry) => Object.assign({}, entry));
+}
+
+// Fail-closed manual-login error for an open captcha circuit. Records the
+// in-memory session state and returns a manualLoginRequired error WITHOUT
+// touching the browser or Keychain, so a tripped breaker cannot re-hammer
+// Shopee. buildManualLoginRequiredPayload turns it into the public
+// manual_login_required + loginUi response.
+function captchaCircuitManualError(platform, account, breaker) {
+  recordSessionState(platform, account, {
+    sessionValid: false,
+    customLinkAuthenticated: false,
+    reason: CAPTCHA_CIRCUIT_REASON,
+    needsManual: true,
+  });
+  const err = new Error('MANUAL_LOGIN_REQUIRED');
+  err.manualLoginRequired = true;
+  err.reason = CAPTCHA_CIRCUIT_REASON;
+  err.captchaCircuitOpen = true;
+  err.diagnostic = recordLoginDiagnostic(
+    {
+      reason: CAPTCHA_CIRCUIT_REASON,
+      platform,
+      source: 'captcha_circuit_breaker',
+      trippedAt: breaker && breaker.trippedAt ? breaker.trippedAt : undefined,
+    },
+    { platform, account, source: 'captcha_circuit_breaker' },
+  );
+  return err;
+}
+
+function _resetCaptchaCircuitForTest() {
+  captchaCircuitBreakers.clear();
+}
+
 function escapeForRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -307,6 +391,9 @@ async function probeShopeeCustomLinkSession(page, platform, account, source, sec
   const probe = await validateShopeeCustomLinkSession(page);
   const sanitizedUrl = probe && probe.sanitizedUrl ? probe.sanitizedUrl : '';
   if (probe && probe.ok) {
+    // Verified authenticated custom_link session — the captcha wall (if any) is
+    // gone, so clear the breaker and let automatic shorten resume.
+    clearCaptchaCircuit(platform, account);
     recordSessionState(platform, account, {
       sessionValid: true,
       customLinkAuthenticated: true,
@@ -760,19 +847,46 @@ async function handleShorten(query, opts = {}) {
   const autoReauth = opts.autoReauth !== false;
 
   const onSessionExpired = autoReauth
-    ? (info) => attemptReauthWithStoredCredential(info.platform, info.account, { headless: true, forceNew: true })
+    ? async (info) => {
+        const reauth = await attemptReauthWithStoredCredential(
+          info.platform,
+          info.account,
+          { headless: true, forceNew: true },
+        );
+        // If Shopee threw up a captcha/OTP wall mid-shorten, trip the breaker so
+        // shortenShopee stops early (it bubbles manualLoginRequired) and the next
+        // request fails closed instead of running the full retry loop again.
+        if (reauth && reauth.manualLoginRequired && isCaptchaOrOtpReason(reauth.reason)) {
+          tripCaptchaCircuit(info.platform, info.account, reauth.reason);
+        }
+        return reauth;
+      }
     : null;
 
   if (platform === 'shopee') {
     await ensureShopeeReadyForShorten(account);
     const resolvedOriginalLink = await resolveOriginalLink(rawUrl);
     const productUrl = normalizeShopeeOriginalLink(resolvedOriginalLink || rawUrl) || (resolvedOriginalLink || rawUrl);
-    const d = await shortenShopee(
-      account,
-      productUrl,
-      [query.sub1, query.sub2, query.sub3, query.sub4, query.sub5],
-      { onSessionExpired },
-    );
+    const shortenShopeeImpl = opts.shortenShopeeForTest || shortenShopee;
+    let d;
+    try {
+      d = await shortenShopeeImpl(
+        account,
+        productUrl,
+        [query.sub1, query.sub2, query.sub3, query.sub4, query.sub5],
+        { onSessionExpired },
+      );
+    } catch (err) {
+      // A captcha/OTP wall can surface as a manualLoginRequired error thrown
+      // DIRECTLY by the shorten path (e.g. shortenShopee bubbling the block
+      // itself), not only via the onSessionExpired reauth hook. Trip the breaker
+      // here too so the NEXT automatic request fails closed instead of re-running
+      // the full browser retry loop. Non-captcha errors are rethrown untouched.
+      if (err && err.manualLoginRequired && isCaptchaOrOtpReason(err.reason || err.message)) {
+        tripCaptchaCircuit(platform, account, err.reason || err.message);
+      }
+      throw err;
+    }
     const resolvedShortLink = await resolveTrackingLink(d.shortLink);
     const actualUtmSource = extractUtmSource(resolvedShortLink);
     if (explicitId) {
@@ -790,6 +904,8 @@ async function handleShorten(query, opts = {}) {
         });
       }
     }
+    // A real successful shorten proves the session is clear — reset the breaker.
+    clearCaptchaCircuit(platform, account);
     return buildShopeeShortlinkPayload({
       link: rawUrl,
       longLink: d.longLink || resolvedOriginalLink || '',
@@ -821,6 +937,11 @@ async function handleLogin(query) {
   const account = sanitizeAccount(query.account);
   const profileDir = ensureProfileDir(platform, account);
   const target = platform === 'shopee' ? SHOPEE_LOGIN_URL : LAZADA_LOGIN_URL;
+  // Opening the manual visible login path is a deliberate operator action to
+  // solve the captcha/OTP. Clear the breaker so that, once solved, the next
+  // automatic shorten is allowed to re-probe the session (a still-present wall
+  // simply re-trips it — no infinite auto-hammering).
+  clearCaptchaCircuit(platform, account);
   const explicitAutofill = isTruthyFlag(query.autofill) || isTruthyFlag(query.autoFill);
   const autofillOptOut = isExplicitFalseFlag(query.autofill)
     || isExplicitFalseFlag(query.autoFill)
@@ -1046,6 +1167,13 @@ function listReadyShopeeAccountsForFallback(credentialPresence) {
 // requests against a profile we have never freshly probed.
 async function ensureShopeeReadyForShorten(account) {
   const platform = 'shopee';
+  // Circuit breaker first: if Shopee already bounced this account into a
+  // captcha/OTP wall, fail closed immediately (no browser, no Keychain, no
+  // retry) until a real success or the manual login path clears it.
+  const breaker = getCaptchaCircuit(platform, account);
+  if (breaker) {
+    throw captchaCircuitManualError(platform, account, breaker);
+  }
   const snapshot = getSessionStateSnapshot(platform, account);
   if (
     snapshot
@@ -1114,6 +1242,11 @@ async function ensureShopeeReadyForShorten(account) {
     readyAccounts = listReadyShopeeAccountsForFallback(await credentialPresenceForAccounts());
   } catch { readyAccounts = []; }
   const reason = (reauth && reauth.reason) || 'session_not_ready';
+  // A captcha/OTP wall during the readiness reauth trips the breaker so the
+  // NEXT automatic request fails closed instead of relaunching the browser.
+  if (isCaptchaOrOtpReason(reason)) {
+    tripCaptchaCircuit(platform, account, reason);
+  }
   recordSessionState(platform, account, {
     sessionValid: false,
     customLinkAuthenticated: false,
@@ -1408,6 +1541,7 @@ function handleDebug() {
     loaded: browser.listLoadedContexts(),
     recentLoginDiagnostics: recentLoginDiagnosticsForDebug(),
     sessionState: listSessionStateSnapshots(),
+    captchaCircuits: listCaptchaCircuitSnapshots(),
     pid: process.pid,
     node: process.version,
     platform: process.platform,
@@ -2230,4 +2364,10 @@ module.exports = {
   isSessionSnapshotFresh,
   SESSION_FRESHNESS_MS,
   _resetSessionStateCacheForTest,
+  isCaptchaOrOtpReason,
+  tripCaptchaCircuit,
+  getCaptchaCircuit,
+  clearCaptchaCircuit,
+  listCaptchaCircuitSnapshots,
+  _resetCaptchaCircuitForTest,
 };
