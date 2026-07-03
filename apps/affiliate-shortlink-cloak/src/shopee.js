@@ -382,6 +382,7 @@ function parseShopeeShortlinkResponse(status, text, productUrl) {
   return { shortLink: r.shortLink || '', longLink: r.longLink || '', originalLink: productUrl };
 }
 
+
 async function shortenShopeeViaContextRequest(record, page, productUrl, safeSubs) {
   const context = record && record.context;
   const request = context && context.request;
@@ -406,7 +407,12 @@ async function shortenShopeeViaContextRequest(record, page, productUrl, safeSubs
 }
 
 async function shortenShopeeOnce(account, productUrl, subIds) {
-  const { record, page } = await browser.getPage('shopee', account, { headless: true });
+  // Match the real Shopee Custom Link UI path: open/reuse the authenticated
+  // affiliate page and let the in-page fetch run from that page context when
+  // BrowserContext.request is rejected. Live UI proof (2026-07-03) showed the
+  // logged-in page succeeds while request-only can return 403.
+  const { record, page } = await browser.getPage('shopee', account, { headless: false });
+  const safeSubs = [0, 1, 2, 3, 4].map((i) => String((subIds && subIds[i]) || '').trim());
   await browser.ensureOnPlatformPage(page, 'shopee');
   await recoverShopeeCustomLinkRoute(page);
   // Guard against a redirect-to-login (or any non-affiliate origin) that
@@ -420,7 +426,6 @@ async function shortenShopeeOnce(account, productUrl, subIds) {
       throw new Error('Execution context was destroyed: redirected off affiliate.shopee.co.th');
     }
   }
-  const safeSubs = [0, 1, 2, 3, 4].map((i) => String((subIds && subIds[i]) || '').trim());
   let contextRequestErr = null;
   try {
     const requestResult = await shortenShopeeViaContextRequest(record, page, productUrl, safeSubs);
