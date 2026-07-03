@@ -7,6 +7,7 @@ this module (and running the test suite) never requires a live browser or the
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -22,6 +23,19 @@ from .shopee import (
 )
 
 SHOPEE_CUSTOM_LINK_URL = "https://affiliate.shopee.co.th/offer/custom_link"
+
+# Request-first hot path (mirrors the legacy stable Node baseline c63c3306). The
+# primary shortlink / report transport is Playwright's ``BrowserContext.request``
+# APIRequestContext, which shares the persistent profile's logged-in cookies. It
+# needs NO visible tab and NO per-call navigation, so thousands of shortlink /
+# report calls never reload the affiliate tab (which was tripping reCAPTCHA).
+# Values match the Node config: same UA, same 25s timeout, same affiliate origin.
+_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
+SHORTEN_TIMEOUT_MS = 25000
+_SHOPEE_REFERER = SHOPEE_ORIGIN + "/"
 
 _IN_PAGE_SHORTEN_SCRIPT = """async ([endpoint, body, csrfToken]) => {
   let token = csrfToken || '';
@@ -164,62 +178,224 @@ def shorten_shopee_link(
     original_link: str,
     sub_ids: object,
 ) -> Dict[str, Optional[str]]:
-    """Create a real Shopee shortlink using the opened browser session.
+    """Create a real Shopee shortlink using the logged-in browser session.
 
-    This intentionally performs one in-page fetch from Shopee's affiliate
-    origin. It does not auto-login, retry, or surface cookies/tokens. Shopee
-    uses one headed persistent page per profile, so calls for the same profile
-    are serialized to avoid concurrent navigation/evaluate collisions.
+    Request-first hot path (legacy Node baseline parity): the primary transport
+    is the persistent context's ``request`` APIRequestContext, which reuses the
+    profile cookies WITHOUT creating or navigating a visible tab. Only when the
+    request-first call reports a login/session/403-style failure do we fall back
+    once to the gate-aware in-page path (which never re-navigates a login/captcha
+    gate, so Shopee is never hammered). It does not auto-login or surface
+    cookies/tokens. Calls for the same profile are serialized.
     """
     profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
     with _profile_lock(profile_dir):
-        context, page = _open_shopee_custom_link_page(profile_dir)
+        context = launch_persistent_context(profile_dir)
         body = build_shortlink_body(original_link, sub_ids)
-        csrf_token = _csrf_token_from_context(context, page)
-        fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
-        current_url = str(fetch_result.get("currentUrl") or _safe_current_url(page) or "")
 
-        try:
-            parsed = parse_shortlink_response(
-                int(fetch_result.get("status") or 0),
-                fetch_result.get("text") or "",
-                original_link,
-            )
-        except ShopeeShortenError as exc:
-            if not exc.current_url:
-                exc.current_url = current_url
-            # Recover by re-navigating + retrying once for transient failures,
-            # but NEVER when the session is sitting on a Shopee login/captcha/
-            # verify gate: re-navigating there just reloads the gate and trips
-            # more reCAPTCHA. Fail closed and let the caller classify instead.
-            if _is_recoverable_shopee_error(exc) and not _url_is_shopee_gate(current_url):
-                _navigate_to_custom_link(page)
-                csrf_token = _csrf_token_from_context(context, page)
-                fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
-                current_url = str(
-                    fetch_result.get("currentUrl") or _safe_current_url(page) or ""
+        request_api = _context_request_api(context)
+        if request_api is not None and callable(getattr(request_api, "post", None)):
+            try:
+                parsed = _shorten_via_context_request(
+                    context, request_api, body, original_link
                 )
-                try:
-                    parsed = parse_shortlink_response(
-                        int(fetch_result.get("status") or 0),
-                        fetch_result.get("text") or "",
-                        original_link,
-                    )
-                except ShopeeShortenError as retry_exc:
-                    if not retry_exc.current_url:
-                        retry_exc.current_url = current_url
+                return {
+                    "profileDir": profile_dir,
+                    "targetUrl": SHOPEE_CUSTOM_LINK_URL,
+                    "currentUrl": _existing_page_url(context),
+                    "shortLink": parsed["shortLink"],
+                    "longLink": parsed["longLink"],
+                    "originalLink": parsed["originalLink"],
+                }
+            except ShopeeShortenError as exc:
+                # Non-session classifications (bad JSON, failCode, etc.) fail
+                # closed immediately. Only a login/session/403-style failure is
+                # worth one fallback to the gate-aware page path below.
+                if not exc.manual_login_required:
                     raise
-            else:
-                raise
 
-        return {
-            "profileDir": profile_dir,
-            "targetUrl": SHOPEE_CUSTOM_LINK_URL,
-            "currentUrl": current_url,
-            "shortLink": parsed["shortLink"],
-            "longLink": parsed["longLink"],
-            "originalLink": parsed["originalLink"],
-        }
+        return _shorten_via_page(profile_dir, original_link, body)
+
+
+def _shorten_via_page(
+    profile_dir: str,
+    original_link: str,
+    body: Dict[str, object],
+) -> Dict[str, Optional[str]]:
+    """Legacy in-page fallback for the shortlink flow.
+
+    Performs one in-page fetch from Shopee's affiliate origin using the already
+    open (or minimally navigated) custom_link tab. Kept intact from the original
+    implementation so it stays gate-aware and never hammers reCAPTCHA.
+
+    The caller (``shorten_shopee_link``) already holds the per-profile lock, so
+    this helper must NOT re-acquire it (``threading.Lock`` is non-reentrant).
+    """
+    context, page = _open_shopee_custom_link_page(profile_dir)
+    csrf_token = _csrf_token_from_context(context, page)
+    fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
+    current_url = str(fetch_result.get("currentUrl") or _safe_current_url(page) or "")
+
+    try:
+        parsed = parse_shortlink_response(
+            int(fetch_result.get("status") or 0),
+            fetch_result.get("text") or "",
+            original_link,
+        )
+    except ShopeeShortenError as exc:
+        if not exc.current_url:
+            exc.current_url = current_url
+        # Recover by re-navigating + retrying once for transient failures,
+        # but NEVER when the session is sitting on a Shopee login/captcha/
+        # verify gate: re-navigating there just reloads the gate and trips
+        # more reCAPTCHA. Fail closed and let the caller classify instead.
+        if _is_recoverable_shopee_error(exc) and not _url_is_shopee_gate(current_url):
+            _navigate_to_custom_link(page)
+            csrf_token = _csrf_token_from_context(context, page)
+            fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
+            current_url = str(
+                fetch_result.get("currentUrl") or _safe_current_url(page) or ""
+            )
+            try:
+                parsed = parse_shortlink_response(
+                    int(fetch_result.get("status") or 0),
+                    fetch_result.get("text") or "",
+                    original_link,
+                )
+            except ShopeeShortenError as retry_exc:
+                if not retry_exc.current_url:
+                    retry_exc.current_url = current_url
+                raise
+        else:
+            raise
+
+    return {
+        "profileDir": profile_dir,
+        "targetUrl": SHOPEE_CUSTOM_LINK_URL,
+        "currentUrl": current_url,
+        "shortLink": parsed["shortLink"],
+        "longLink": parsed["longLink"],
+        "originalLink": parsed["originalLink"],
+    }
+
+
+def _context_request_api(context):
+    """Return the persistent context's ``request`` APIRequestContext, or None.
+
+    Returning None means "no request-first transport available" and keeps the
+    legacy in-page path fully in control (this is also why the existing
+    fake-context tests, which have no ``.request``, behave exactly as before)."""
+    try:
+        request = getattr(context, "request", None)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return request
+
+
+def _response_status(response) -> int:
+    """Read a Playwright ``APIResponse.status`` (int property) defensively.
+
+    Also tolerates a callable ``status()`` for fakes / older shims."""
+    status = getattr(response, "status", 0)
+    if callable(status):
+        try:
+            status = status()
+        except Exception:  # pragma: no cover - defensive
+            status = 0
+    try:
+        return int(status or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_text(response) -> str:
+    """Read a Playwright ``APIResponse.text()`` body defensively."""
+    text_fn = getattr(response, "text", None)
+    if callable(text_fn):
+        try:
+            return str(text_fn() or "")
+        except Exception as exc:  # pragma: no cover - surfaced upstream
+            raise RuntimeError(sanitize_error_message(exc)) from None
+    return str(text_fn or "")
+
+
+def _existing_page_url(context) -> str:
+    """Peek an already-open tab's URL WITHOUT creating a page.
+
+    The request-first path never needs a visible tab, but if the profile still
+    has a tab parked on a login/captcha gate we can fail closed from it."""
+    try:
+        pages = getattr(context, "pages", None)
+        if callable(pages):
+            pages = pages()
+        if pages:
+            return str(_safe_current_url(pages[0]) or "")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return ""
+
+
+def _csrf_token_from_cookies(context) -> str:
+    """Cookie-only csrf lookup for the request-first path (no page.evaluate)."""
+    try:
+        cookies_fn = getattr(context, "cookies", None)
+        if callable(cookies_fn):
+            for cookie in cookies_fn(SHOPEE_ORIGIN) or []:
+                if _cookie_value(cookie, "name") == "csrftoken":
+                    return _cookie_value(cookie, "value")
+    except Exception:  # pragma: no cover - best-effort
+        pass
+    return ""
+
+
+def _shorten_via_context_request(
+    context,
+    request_api,
+    body: Dict[str, object],
+    original_link: str,
+) -> Dict[str, str]:
+    """Primary request-first shortlink transport.
+
+    POSTs ``batchCustomLink`` through the persistent context's APIRequestContext
+    (shares profile cookies, no visible tab, no navigation). Response parsing and
+    classification reuse the same pure helpers as the in-page path, so response
+    shapes and sanitization are identical. Raises ``ShopeeShortenError`` on any
+    failure; a login/session/403-style failure sets ``manual_login_required`` so
+    the caller can fall back once to the gate-aware page path."""
+    headers = {
+        "Content-Type": "application/json",
+        "affiliate-program-type": "1",
+        "origin": SHOPEE_ORIGIN,
+        "referer": _SHOPEE_REFERER,
+        "user-agent": _CHROME_UA,
+    }
+    csrf_token = _csrf_token_from_cookies(context)
+    if csrf_token:
+        headers["csrf-token"] = csrf_token
+
+    try:
+        response = request_api.post(
+            SHOPEE_GQL_ENDPOINT,
+            headers=headers,
+            data=body,
+            timeout=SHORTEN_TIMEOUT_MS,
+        )
+    except Exception as exc:
+        raise ShopeeShortenError(
+            _classify_fetch_error(exc),
+            sanitize_error_message(exc),
+            current_url=_existing_page_url(context),
+            manual_login_required=True,
+        )
+
+    status = _response_status(response)
+    text = _response_text(response)
+    try:
+        return parse_shortlink_response(status, text, original_link)
+    except ShopeeShortenError as exc:
+        if not exc.current_url:
+            exc.current_url = _existing_page_url(context)
+        raise
 
 
 
@@ -293,6 +469,24 @@ def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object
     """
     profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
     with _profile_lock(profile_dir):
+        context = launch_persistent_context(profile_dir)
+
+        # Request-first hot path: GET the report through the persistent context's
+        # APIRequestContext (shares profile cookies, no visible tab, no reload).
+        request_api = _context_request_api(context)
+        if request_api is not None and callable(getattr(request_api, "get", None)):
+            gate_url = _existing_page_url(context)
+            # If a real tab is parked on a login/captcha/verify gate, fail closed
+            # from it (a blank/new tab is fine — the request API uses cookies).
+            if (
+                gate_url
+                and not _is_blank_url(gate_url)
+                and _report_url_is_login_gate(gate_url)
+            ):
+                return {"login_gate": True}
+            return _report_fetch_via_context_request(request_api, api_url)
+
+        # Legacy in-page fallback (no request API available on this context).
         context, page, current_url = _open_shopee_report_page(profile_dir)
         if _report_url_is_login_gate(current_url):
             return {"login_gate": True}
@@ -307,6 +501,46 @@ def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object
         if not isinstance(result, dict):
             raise RuntimeError("shopee_report_invalid_fetch_result")
         return result
+
+
+def _report_fetch_via_context_request(request_api, api_url: str) -> Dict[str, object]:
+    """Primary request-first report transport.
+
+    GETs a Shopee report API through the persistent context's APIRequestContext
+    and returns the SAME shape as the legacy in-page fetch
+    (``{status, parsed, body, snippet}``) so the report classifiers are
+    unchanged. Never creates/reloads a visible page. Sanitizes the failure /
+    snippet so cookies/tokens are never surfaced."""
+    headers = {
+        "accept": "application/json",
+        "origin": SHOPEE_ORIGIN,
+        "referer": _SHOPEE_REFERER,
+        "user-agent": _CHROME_UA,
+    }
+    try:
+        response = request_api.get(
+            str(api_url),
+            headers=headers,
+            timeout=SHORTEN_TIMEOUT_MS,
+        )
+    except Exception as exc:  # noqa: BLE001 - sanitized upstream
+        raise RuntimeError(sanitize_error_message(exc)) from None
+
+    status = _response_status(response)
+    text = _response_text(response)
+    parsed = False
+    body: object = None
+    try:
+        body = json.loads(text)
+        parsed = True
+    except (TypeError, ValueError):
+        parsed = False
+    return {
+        "status": status,
+        "parsed": parsed,
+        "body": body,
+        "snippet": "" if parsed else sanitize_error_message(text, limit=200),
+    }
 
 
 def _profile_lock(profile_dir: str) -> threading.Lock:
