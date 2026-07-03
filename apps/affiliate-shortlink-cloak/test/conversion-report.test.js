@@ -271,10 +271,10 @@ test('classifyConversionReportFailure returns null for healthy envelope', () => 
 // isConversionReportHost
 // ---------------------------------------------------------------------------
 
-test('isConversionReportHost matches conversionreport.wwoom.com (any port, case-insensitive)', () => {
-  assert.equal(conversionReport.isConversionReportHost('conversionreport.wwoom.com'), true);
-  assert.equal(conversionReport.isConversionReportHost('conversionreport.wwoom.com:8810'), true);
-  assert.equal(conversionReport.isConversionReportHost('ConversionReport.WWoom.com'), true);
+test('isConversionReportHost is disabled for local-only operation', () => {
+  assert.equal(conversionReport.isConversionReportHost('conversionreport.wwoom.com'), false);
+  assert.equal(conversionReport.isConversionReportHost('conversionreport.wwoom.com:8810'), false);
+  assert.equal(conversionReport.isConversionReportHost('ConversionReport.WWoom.com'), false);
 });
 
 test('isConversionReportHost rejects other hosts', () => {
@@ -1667,7 +1667,7 @@ test('GET /conversion-report returns conversion_report_time_invalid JSON for gar
   assert.equal(getPageCalls.length, 0);
 });
 
-test('GET / on Host conversionreport.wwoom.com is routed to /conversion-report and returns summary by default', async (t) => {
+test('GET /conversion-report returns summary by default in local-only mode', async (t) => {
   stubBrowserForConversionReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
     evaluateResult: {
@@ -1692,8 +1692,7 @@ test('GET / on Host conversionreport.wwoom.com is routed to /conversion-report a
   t.after(() => stopTestServer(instance));
 
   const res = await httpRequest(instance, {
-    path: '/?time=25/05/2026',
-    headers: { Host: 'conversionreport.wwoom.com' },
+    path: '/conversion-report?time=25/05/2026',
   });
   assert.equal(res.statusCode, 200);
   assert.match(String(res.headers['content-type'] || ''), /application\/json/);
@@ -1753,7 +1752,7 @@ test('GET /conversion-report?raw=1 preserves single-page list response', async (
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'sub_ids'), false);
 });
 
-test('GET / on Host clickreport.wwoom.com still routes to click-report, not conversion-report', async (t) => {
+test('GET /click-report stays separate from conversion-report in local-only mode', async (t) => {
   stubBrowserForConversionReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: (args) => {
@@ -1779,8 +1778,7 @@ test('GET / on Host clickreport.wwoom.com still routes to click-report, not conv
   t.after(() => stopTestServer(instance));
 
   const res = await httpRequest(instance, {
-    path: '/?time=25/05/2026',
-    headers: { Host: 'clickreport.wwoom.com' },
+    path: '/click-report?time=25/05/2026',
   });
   assert.equal(res.statusCode, 200);
   const parsed = JSON.parse(res.body);

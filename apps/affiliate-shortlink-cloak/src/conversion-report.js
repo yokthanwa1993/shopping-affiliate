@@ -1130,11 +1130,8 @@ async function handleConversionReport(query = {}, deps = {}) {
   });
 }
 
-function isConversionReportHost(hostHeader) {
-  if (!hostHeader) return false;
-  const host = String(hostHeader).split(',')[0].split(':')[0].trim().toLowerCase();
-  if (!host) return false;
-  return SHOPEE_CONVERSION_REPORT_HOST_PATTERN.test(host);
+function isConversionReportHost(_hostHeader) {
+  return false;
 }
 
 module.exports = {

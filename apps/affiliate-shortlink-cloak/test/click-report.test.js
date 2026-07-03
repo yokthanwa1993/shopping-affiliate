@@ -239,10 +239,10 @@ test('classifyClickReportFailure returns null for healthy envelope', () => {
 // isClickReportHost
 // ---------------------------------------------------------------------------
 
-test('isClickReportHost matches clickreport.wwoom.com (any port, case-insensitive)', () => {
-  assert.equal(clickReport.isClickReportHost('clickreport.wwoom.com'), true);
-  assert.equal(clickReport.isClickReportHost('clickreport.wwoom.com:8810'), true);
-  assert.equal(clickReport.isClickReportHost('ClickReport.WWoom.com'), true);
+test('isClickReportHost is disabled for local-only operation', () => {
+  assert.equal(clickReport.isClickReportHost('clickreport.wwoom.com'), false);
+  assert.equal(clickReport.isClickReportHost('clickreport.wwoom.com:8810'), false);
+  assert.equal(clickReport.isClickReportHost('ClickReport.WWoom.com'), false);
 });
 
 test('isClickReportHost rejects other hosts', () => {
@@ -935,7 +935,7 @@ test('GET /click-report returns click_report_time_invalid JSON for garbage time 
   assert.equal(getPageCalls.length, 0);
 });
 
-test('GET / on Host clickreport.wwoom.com is routed to /click-report and returns summary by default', async (t) => {
+test('GET /click-report returns summary by default in local-only mode', async (t) => {
   stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: {
@@ -960,8 +960,7 @@ test('GET / on Host clickreport.wwoom.com is routed to /click-report and returns
   t.after(() => stopTestServer(instance));
 
   const res = await httpRequest(instance, {
-    path: '/?time=25/05/2026',
-    headers: { Host: 'clickreport.wwoom.com' },
+    path: '/click-report?time=25/05/2026',
   });
   assert.equal(res.statusCode, 200);
   assert.match(String(res.headers['content-type'] || ''), /application\/json/);

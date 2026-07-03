@@ -1,6 +1,6 @@
 # affiliate-shortlink-cloak
 
-Current CloakBrowser + Playwright bridge for Shopee / Lazada affiliate shortlinks. This is the active `short.wwoom.com` / `customlink.wwoom.com` bridge after removing the legacy Electron `apps/affiliate-shortlink/` app.
+Current local-only CloakBrowser + Playwright bridge for Shopee / Lazada affiliate shortlinks. It runs on the Mac mini at `http://127.0.0.1:8810` only; Cloudflare tunnel/domain operation has been removed from this machine.
 
 | Bridge | Port | Browser | Multi-account |
 |---|---|---|---|
@@ -130,12 +130,12 @@ Examples:
 
 ```
 # Summary by default — daily total + sub_id breakdown for the chosen affiliate id
-curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026'
-curl 'https://clickreport.wwoom.com/?time=26/05/2026'
-curl 'https://clickreport.wwoom.com/?time=2026-06-09&complete=1'
+curl 'http://127.0.0.1:8810/click-report?id=15130770000&time=25/05/2026'
+curl 'http://127.0.0.1:8810/click-report?time=26/05/2026'
+curl 'http://127.0.0.1:8810/click-report?time=2026-06-09&complete=1'
 
 # Summary filtered to a single sub_id (Shopee filters on the server side; summary aggregates the filtered rows)
-curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026&sub_id=16MAY26FBSPCAD'
+curl 'http://127.0.0.1:8810/click-report?id=15130770000&time=25/05/2026&sub_id=16MAY26FBSPCAD'
 
 # Raw mode — inspect Shopee rows verbatim, one page at a time
 curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=yesterday&raw=1&page_size=5'
@@ -264,7 +264,7 @@ Failure shapes (no cookies / tokens / passwords are ever included):
 - Shopee responds with `code: 30001`, redirects to `shopee.co.th/buyer/login`, or returns HTTP `401`/`403` → `status: "manual_login_required"`, `reason: "shopee_login_required"` or `"shopee_unauthorized"`, plus `loginUi: "/login?platform=shopee"`.
 - Browser/fetch transport failure → `status: "error"`, `reason: "click_report_fetch_failed"` (or `"click_report_invalid_json"`, `"click_report_empty_response"`).
 
-When the request Host is `clickreport.wwoom.com` (any port), `GET /` is treated as `GET /click-report`. Other hosts keep the existing shortlink behavior on `/` and `/shorten`.
+Use the explicit local endpoint `GET http://127.0.0.1:8810/click-report`. Domain Host routing is disabled; reports are local-path only.
 
 ### `GET /login`
 
@@ -335,3 +335,8 @@ Pure-JS helpers now live inside this app (the legacy `apps/affiliate-shortlink/`
 - Member-id / utm extraction
 
 The Lazada in-page MTOP script is loaded directly from `../affiliate-shortlink/lazada-shorten.js` (read-only) to keep both bridges using the same signing logic.
+
+## Local-only operation
+
+This Mac mini is the source of truth for shortlinks and reports. Use `http://127.0.0.1:8810` only. Do not run Cloudflare tunnel/domain LaunchAgents for this bridge. Removed runtime domain artifacts include `com.affiliate.customlink-wwoom.tunnel`, `com.affiliate.shortlink-cloak.tunnel`, `cloudflared/short-wwoom.yml`, and the tunnel LaunchAgent plist.
+
