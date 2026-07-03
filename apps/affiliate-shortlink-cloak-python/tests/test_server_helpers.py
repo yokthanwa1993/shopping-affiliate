@@ -126,7 +126,7 @@ class ServerHelperTests(unittest.TestCase):
             "targetUrl": "https://affiliate.shopee.co.th/offer/custom_link",
             "currentUrl": "https://affiliate.shopee.co.th/offer/custom_link",
             "shortLink": "https://s.shopee.co.th/abc",
-            "longLink": "https://shopee.co.th/product/1/2?utm=1",
+            "longLink": "https://shopee.co.th/product/1/2?utm_content=A1-post2---&utm_source=an_15130770000",
             "originalLink": "https://shopee.co.th/product/1/2",
         }
 
@@ -140,16 +140,18 @@ class ServerHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(200, status)
-        self.assertEqual("ok", payload["status"])
         self.assertEqual("https://s.shopee.co.th/abc", payload["shortLink"])
         self.assertEqual("https://s.shopee.co.th/abc", payload["link"])
         self.assertEqual("affiliate_chearb.com", payload["account"])
         self.assertEqual("15130770000", payload["id"])
         self.assertEqual("an_15130770000", payload["utm_source"])
-        self.assertEqual(
-            "https://affiliate.shopee.co.th/offer/custom_link",
-            payload["browser"]["currentUrl"],
-        )
+        self.assertEqual("A1-post2---", payload["utm_content"])
+        self.assertEqual("A1", payload["sub1"])
+        self.assertEqual("post2", payload["sub2"])
+        self.assertNotIn("status", payload)
+        self.assertNotIn("browser", payload)
+        self.assertNotIn("profileDir", payload)
+        self.assertNotIn("display", payload)
         shorten_mock.assert_called_once_with(
             (
                 "/tmp/affiliate-shortlink-cloak-python/profiles/"

@@ -95,13 +95,23 @@ def launch_persistent_context(profile_dir: str):
     cloakbrowser = _import_cloakbrowser()
     os.makedirs(profile_dir, exist_ok=True)
 
-    try:
-        context = cloakbrowser.launch_persistent_context(
-            profile_dir,
-            headless=False,
-        )
-    except Exception as exc:  # pragma: no cover - depends on live env
-        raise BrowserLaunchError("cloakbrowser_launch_failed: %s" % type(exc).__name__)
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            context = cloakbrowser.launch_persistent_context(
+                profile_dir,
+                headless=False,
+            )
+            break
+        except Exception as exc:  # pragma: no cover - depends on live env
+            last_exc = exc
+            if attempt == 1:
+                _forget_profile_context(profile_dir)
+                _remove_stale_singleton_files(profile_dir)
+                continue
+            raise BrowserLaunchError("cloakbrowser_launch_failed: %s" % type(exc).__name__)
+    else:  # pragma: no cover
+        raise BrowserLaunchError("cloakbrowser_launch_failed: %s" % type(last_exc).__name__)
 
     with _LOCK:
         _OPEN_CONTEXTS.append(context)
@@ -153,7 +163,25 @@ def shorten_shopee_link(
         except ShopeeShortenError as exc:
             if not exc.current_url:
                 exc.current_url = current_url
-            raise
+            if _is_recoverable_shopee_error(exc):
+                _navigate_to_custom_link(page)
+                csrf_token = _csrf_token_from_context(context, page)
+                fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
+                current_url = str(
+                    fetch_result.get("currentUrl") or _safe_current_url(page) or ""
+                )
+                try:
+                    parsed = parse_shortlink_response(
+                        int(fetch_result.get("status") or 0),
+                        fetch_result.get("text") or "",
+                        original_link,
+                    )
+                except ShopeeShortenError as retry_exc:
+                    if not retry_exc.current_url:
+                        retry_exc.current_url = current_url
+                    raise
+            else:
+                raise
 
         return {
             "profileDir": profile_dir,
@@ -174,6 +202,19 @@ def _profile_lock(profile_dir: str) -> threading.Lock:
             lock = threading.Lock()
             _PROFILE_LOCKS[profile_dir] = lock
         return lock
+
+
+def _is_recoverable_shopee_error(exc: ShopeeShortenError) -> bool:
+    reason = str(getattr(exc, "reason", "") or "").lower()
+    message = str(exc or "").lower()
+    return any(marker in reason or marker in message for marker in (
+        "http_401",
+        "http_403",
+        "session_fetch_failed",
+        "browser_fetch_failed",
+        "invalid_json",
+        "no_results",
+    ))
 
 def _open_shopee_custom_link_page(profile_dir: str):
     context = launch_persistent_context(profile_dir)
@@ -279,6 +320,47 @@ def _classify_fetch_error(exc: object) -> str:
         return "shopee_session_fetch_failed"
     return "shopee_browser_fetch_failed"
 
+
+
+def _forget_profile_context(profile_dir: str) -> None:
+    profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
+    with _LOCK:
+        context = _CONTEXT_BY_PROFILE.pop(profile_dir, None)
+        if context in _OPEN_CONTEXTS:
+            try:
+                _OPEN_CONTEXTS.remove(context)
+            except ValueError:
+                pass
+    if context is not None:
+        try:
+            close = getattr(context, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+
+def _remove_stale_singleton_files(profile_dir: str) -> None:
+    # Only called after a launch failure. If a Chromium process still owns the
+    # profile, removing these files would be unsafe; otherwise they are stale.
+    if _profile_has_live_chromium_process(profile_dir):
+        return
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        path = os.path.join(profile_dir, name)
+        try:
+            if os.path.lexists(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
+
+def _profile_has_live_chromium_process(profile_dir: str) -> bool:
+    try:
+        import subprocess
+        out = subprocess.check_output(["/bin/ps", "-axo", "command"], text=True)
+    except Exception:
+        return True
+    return profile_dir in out and "Chromium" in out
 
 def _context_is_closed(context: object) -> bool:
     try:

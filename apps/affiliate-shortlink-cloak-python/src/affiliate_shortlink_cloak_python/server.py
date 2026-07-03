@@ -50,7 +50,6 @@ def json_bytes(payload: Mapping[str, object]) -> bytes:
     return json.dumps(
         payload,
         ensure_ascii=False,
-        sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
 
@@ -178,6 +177,40 @@ def handle_login(query: Mapping[str, object],
     }
 
 
+
+def _utm_content_from_long_link(long_link: object) -> str:
+    try:
+        parsed = urlparse(str(long_link or ""))
+        return parse_qs(parsed.query).get("utm_content", [""])[0] or ""
+    except Exception:
+        return ""
+
+
+def build_legacy_success_payload(
+    record: Mapping[str, object],
+    original_url: str,
+    shorten_info: Mapping[str, object],
+) -> Dict[str, object]:
+    short_link = str(shorten_info.get("shortLink") or "")
+    long_link = str(shorten_info.get("longLink") or "") or short_link
+    utm_content = _utm_content_from_long_link(long_link)
+    sub_parts = utm_content.split("-")
+    return {
+        "link": short_link,
+        "longLink": long_link,
+        "originalLink": str(shorten_info.get("originalLink") or original_url),
+        "shortLink": short_link,
+        "id": record["id"],
+        "utm_source": record["utm_source"],
+        "utm_content": utm_content,
+        "account": record["account"],
+        "sub1": (sub_parts[0] if len(sub_parts) > 0 else "") or "",
+        "sub2": (sub_parts[1] if len(sub_parts) > 1 else "") or "",
+        "sub3": (sub_parts[2] if len(sub_parts) > 2 else "") or "",
+        "sub4": (sub_parts[3] if len(sub_parts) > 3 else "") or "",
+        "sub5": (sub_parts[4] if len(sub_parts) > 4 else "") or "",
+    }
+
 def handle_shorten(query: Mapping[str, object],
                    config: ServerConfig) -> Tuple[int, Dict[str, object]]:
     status, payload = validate_shorten_query(query, config)
@@ -215,24 +248,7 @@ def handle_shorten(query: Mapping[str, object],
             )
         )
 
-    browser_info = {
-        "profileDir": profile_dir,
-        "targetUrl": shorten_info.get("targetUrl"),
-        "currentUrl": shorten_info.get("currentUrl"),
-    }
-    return 200, {
-        "status": "ok",
-        "link": shorten_info.get("shortLink"),
-        "originalLink": url,
-        "longLink": shorten_info.get("longLink") or "",
-        "shortLink": shorten_info.get("shortLink"),
-        "id": record["id"],
-        "account": record["account"],
-        "display": record["display"],
-        "utm_source": record["utm_source"],
-        "profileDir": profile_dir,
-        "browser": browser_info,
-    }
+    return 200, build_legacy_success_payload(record, url, shorten_info)
 
 
 def shorten_fail_closed_payload(
