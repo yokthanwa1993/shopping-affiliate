@@ -8,10 +8,39 @@ cloudflared tunnel, no auto-start, and no production wiring. It binds
 `~/.affiliate-shortlink-cloak-python/profiles`, and does not touch the active
 Node service on port `8810`.
 
-`/shorten` validates the request, opens the headed persistent CloakBrowser
-context, and attempts a real Shopee Affiliate `batchCustomLink` GraphQL call
-from the logged-in browser session. This remains a test-only sidecar: no
-LaunchAgent, no cloudflared tunnel, no auto-start, and no production wiring.
+`/shorten` validates the request and attempts a real Shopee Affiliate
+`batchCustomLink` GraphQL call from the logged-in browser session. This remains a
+test-only sidecar: no LaunchAgent, no cloudflared tunnel, no auto-start, and no
+production wiring.
+
+### Request-first hot path (legacy Node baseline parity)
+
+The primary transport for both `/shorten` and the report routes is Playwright's
+`BrowserContext.request` APIRequestContext, which reuses the persistent profile's
+logged-in cookies. This mirrors the old stable Node baseline (`c63c3306`):
+
+- `/shorten` POSTs `batchCustomLink` via `context.request.post(...)` — **no
+  visible tab is created and no navigation happens** on the hot path. Only when
+  that request reports a login/session/403-style failure does it fall back once
+  to the gate-aware in-page path (which never re-navigates a login/captcha gate,
+  so Shopee is never hammered).
+- The report routes GET the Shopee report API via `context.request.get(...)`
+  instead of an in-page `page.evaluate`, so thousands of report fetches never
+  reload the visible custom_link tab (which was tripping reCAPTCHA).
+- Manual `/login` (`open_shopee_custom_link`) may still open a visible page.
+- If the browser was closed, the next hot-path request relaunches the persistent
+  context cleanly (stale/closed context records are cleared) and uses the request
+  API — no `cloakbrowser_launch_failed` unless a real launch fails.
+
+Cookies, CSRF values, and tokens are never surfaced in any response.
+
+### Local-only
+
+This is a Mac-local sidecar. There is no tunnel config change; the server still
+binds `127.0.0.1`/`::1` (default port `8811`, overridable via `PORT`). Agents and
+the MCP tools reach the bridge at `http://127.0.0.1:8810`
+(`AFFILIATE_SHORTLINK_BRIDGE_URL`, the active local service) — everything stays
+on loopback and no public domain / tunnel testing is required.
 
 The HTTP server uses only the Python standard library. The optional
 `cloakbrowser` import is lazy and happens only when `/login` or `/shorten`
