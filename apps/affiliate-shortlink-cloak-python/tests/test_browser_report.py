@@ -182,22 +182,86 @@ class ShortlinkNavigationTests(unittest.TestCase):
             "currentUrl": AFFILIATE_URL,
         }
 
-    def test_shorten_still_navigates(self) -> None:
+    def test_shorten_reuses_affiliate_tab_without_reloading(self) -> None:
         page = FakePage(AFFILIATE_URL, eval_return=self._shorten_ok_eval)
         ctx = FakeContext([page])
         with _PatchLaunch(ctx):
             result = browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
-        # Shortlink creation path still navigates to custom_link, as before.
-        self.assertIn(browser.SHOPEE_CUSTOM_LINK_URL, page.goto_calls)
+        # The fix: an already-open affiliate custom_link tab is NOT reloaded on
+        # shortlink creation (reload == reCAPTCHA risk), yet the link is created.
+        self.assertEqual([], page.goto_calls)
+        self.assertEqual(0, ctx.new_page_count)
         self.assertEqual("https://s.shopee.co.th/abc", result["shortLink"])
 
-    def test_open_custom_link_still_navigates(self) -> None:
+    def test_shorten_on_deep_custom_link_url_does_not_reload(self) -> None:
+        page = FakePage(AFFILIATE_URL + "?foo=1", eval_return=self._shorten_ok_eval)
+        ctx = FakeContext([page])
+        with _PatchLaunch(ctx):
+            result = browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
+        self.assertEqual([], page.goto_calls)
+        self.assertEqual("https://s.shopee.co.th/abc", result["shortLink"])
+
+    def test_shorten_blank_tab_navigates_once(self) -> None:
+        page = FakePage("about:blank", eval_return=self._shorten_ok_eval)
+        ctx = FakeContext([page])
+        with _PatchLaunch(ctx):
+            result = browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
+        # A blank/new tab still gets one navigation to establish the origin.
+        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], page.goto_calls)
+        self.assertEqual("https://s.shopee.co.th/abc", result["shortLink"])
+
+    def test_shorten_new_page_navigates_once(self) -> None:
+        ctx = FakeContext([])  # no existing page -> new_page() (blank)
+        # The freshly created page needs its eval wired for the shorten fetch.
+        with _PatchLaunch(ctx):
+            created_holder = {}
+            orig_new_page = ctx.new_page
+
+            def new_page():
+                page = orig_new_page()
+                page.eval_return = self._shorten_ok_eval
+                created_holder["page"] = page
+                return page
+
+            ctx.new_page = new_page
+            result = browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
+        self.assertEqual(1, ctx.new_page_count)
+        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], created_holder["page"].goto_calls)
+        self.assertEqual("https://s.shopee.co.th/abc", result["shortLink"])
+
+    def test_shorten_non_affiliate_origin_navigates_once(self) -> None:
+        page = FakePage("https://www.google.com/", eval_return=self._shorten_ok_eval)
+        ctx = FakeContext([page])
+        with _PatchLaunch(ctx):
+            result = browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
+        # Off-origin: navigate exactly once (the API fetch needs affiliate origin).
+        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], page.goto_calls)
+        self.assertEqual("https://s.shopee.co.th/abc", result["shortLink"])
+
+    def test_shorten_on_login_gate_does_not_navigate(self) -> None:
+        # Sitting on a Shopee login/captcha gate: do NOT re-navigate/hammer.
+        page = FakePage("https://affiliate.shopee.co.th/login")
+        ctx = FakeContext([page])
+        with _PatchLaunch(ctx):
+            with self.assertRaises(browser.ShopeeShortenError):
+                browser.shorten_shopee_link("/tmp/p", "https://shopee.co.th/x", ["a"])
+        self.assertEqual([], page.goto_calls)
+
+    def test_open_custom_link_reuses_affiliate_tab(self) -> None:
         page = FakePage(AFFILIATE_URL)
         ctx = FakeContext([page])
         with _PatchLaunch(ctx):
             out = browser.open_shopee_custom_link("/tmp/p")
-        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], page.goto_calls)
+        # Already on the affiliate origin: no reload.
+        self.assertEqual([], page.goto_calls)
         self.assertEqual(AFFILIATE_URL, out["currentUrl"])
+
+    def test_open_custom_link_blank_navigates_once(self) -> None:
+        page = FakePage("about:blank")
+        ctx = FakeContext([page])
+        with _PatchLaunch(ctx):
+            browser.open_shopee_custom_link("/tmp/p")
+        self.assertEqual([browser.SHOPEE_CUSTOM_LINK_URL], page.goto_calls)
 
 
 class BlankUrlHelperTests(unittest.TestCase):

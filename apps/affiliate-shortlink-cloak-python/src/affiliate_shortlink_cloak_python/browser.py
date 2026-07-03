@@ -188,7 +188,11 @@ def shorten_shopee_link(
         except ShopeeShortenError as exc:
             if not exc.current_url:
                 exc.current_url = current_url
-            if _is_recoverable_shopee_error(exc):
+            # Recover by re-navigating + retrying once for transient failures,
+            # but NEVER when the session is sitting on a Shopee login/captcha/
+            # verify gate: re-navigating there just reloads the gate and trips
+            # more reCAPTCHA. Fail closed and let the caller classify instead.
+            if _is_recoverable_shopee_error(exc) and not _url_is_shopee_gate(current_url):
                 _navigate_to_custom_link(page)
                 csrf_token = _csrf_token_from_context(context, page)
                 fetch_result = _fetch_shortlink_from_page(page, body, csrf_token)
@@ -241,6 +245,17 @@ def _is_blank_url(url: str) -> bool:
     if not text:
         return True
     return bool(_BLANK_URL_RE.match(text))
+
+
+def _url_is_shopee_gate(url: str) -> bool:
+    """True when the URL is a Shopee login/captcha/verify interstitial.
+
+    Unlike ``_report_url_is_login_gate`` this does NOT treat an arbitrary
+    non-affiliate origin as a gate — the shortlink path navigates such origins
+    once to reach the affiliate origin, and only refuses to re-navigate a real
+    login/captcha gate (to avoid hammering reCAPTCHA)."""
+    text = str(url or "")
+    return bool(_SHOPEE_GATE_RE.search(text) or _LOGIN_REDIRECT_RE.search(text))
 
 
 def _report_url_is_login_gate(url: str) -> bool:
@@ -317,12 +332,51 @@ def _is_recoverable_shopee_error(exc: ShopeeShortenError) -> bool:
     ))
 
 def _open_shopee_custom_link_page(profile_dir: str):
+    """Open (or reuse) the persistent custom-link page for the shortlink hot
+    path WITHOUT reloading the affiliate custom_link tab on every request.
+
+    Legacy/browser-like behavior (mirrors the report path so shortlink creation
+    no longer trips reCAPTCHA on the visible tab):
+
+    - Reuse the already-open tab. If it is already on the affiliate origin
+      (especially ``/offer/custom_link``) we do NOT navigate — the in-page
+      shortlink fetch runs against the live affiliate origin, so a reload only
+      adds reCAPTCHA risk.
+    - Only when the tab has no real origin yet (freshly created / ``about:blank``)
+      do we navigate once to establish the affiliate origin.
+    - A page sitting on a Shopee login/captcha/verify gate is left untouched; we
+      never re-navigate/hammer it. The shorten flow classifies the gate from the
+      current URL / fetch result and fails closed (``manual_login_required``).
+    - Any other non-affiliate origin is navigated once (never in a loop), because
+      the affiliate shortlink API fetch requires the affiliate origin.
+    """
     context = launch_persistent_context(profile_dir)
-    page = _first_page(context)
+    page, created = _report_page(context)
     if page is None:
         raise BrowserLaunchError("browser_page_unavailable")
-    _navigate_to_custom_link(page)
+    if _should_navigate_custom_link(created, str(_safe_current_url(page) or "")):
+        _navigate_to_custom_link(page)
     return context, page
+
+
+def _should_navigate_custom_link(created: bool, current_url: str) -> bool:
+    """Decide whether the shortlink path must ``page.goto`` custom_link.
+
+    Navigate only when strictly necessary so an already-open affiliate
+    custom_link tab is never reloaded (reload == reCAPTCHA risk)."""
+    if created or _is_blank_url(current_url):
+        # Brand-new / blank tab: navigate once to establish the affiliate origin.
+        return True
+    if _AFFILIATE_ORIGIN_RE.search(current_url):
+        # Already on the affiliate origin (incl. /offer/custom_link): reuse it.
+        return False
+    if _SHOPEE_GATE_RE.search(current_url) or _LOGIN_REDIRECT_RE.search(current_url):
+        # Login/captcha/verify gate: do not re-navigate/hammer. The shorten flow
+        # fails closed based on the current URL / fetch result instead.
+        return False
+    # Some other non-affiliate origin: navigate once (the API fetch needs the
+    # affiliate origin), never loop.
+    return True
 
 
 def _open_shopee_report_page(profile_dir: str):
