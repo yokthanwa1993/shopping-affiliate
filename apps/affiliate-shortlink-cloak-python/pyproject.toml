@@ -11,6 +11,10 @@ dependencies = []
 
 [project.optional-dependencies]
 browser = ["cloakbrowser"]
+mcp = ["mcp>=1.2.0"]
+
+[project.scripts]
+affiliate-shortlink-cloak-mcp = "affiliate_shortlink_cloak_python.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

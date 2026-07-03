@@ -78,6 +78,85 @@ URL metadata. If Shopee login/session/captcha blocks the call, it fails closed
 with `manualLoginRequired`, `needsManual`, `reason`, `currentUrl`, `account`,
 and `profileDir`. Cookies, CSRF values, and tokens are never returned.
 
+## MCP server (Hermes tools)
+
+A pure-Python MCP stdio server exposes the same bridge endpoints as tools so a
+Hermes profile can call tools instead of raw URL endpoints. It lives in
+`affiliate_shortlink_cloak_python.mcp_server` and calls the local bridge over
+stdlib `urllib` (no third-party HTTP client). The only optional dependency is
+`mcp` (`FastMCP`), imported lazily.
+
+Install and run with Python 3.10+ (the `mcp` package does not support macOS system Python 3.9):
+
+```bash
+cd apps/affiliate-shortlink-cloak-python
+python3.11 -m pip install --upgrade pip
+python3.11 -m pip install -e '.[mcp]'
+affiliate-shortlink-cloak-mcp          # console entry point
+# or, equivalently:
+PYTHONPATH=src python3.11 -m affiliate_shortlink_cloak_python.mcp_server
+```
+
+The server targets the local bridge base URL from `AFFILIATE_SHORTLINK_BRIDGE_URL`
+(default `http://127.0.0.1:8810`, i.e. the active Node service). Optional
+`AFFILIATE_SHORTLINK_BRIDGE_TIMEOUT` sets the per-request timeout (default `30`).
+
+### Tools
+
+| Tool | Bridge endpoint |
+| --- | --- |
+| `health()` | `/health` |
+| `accounts()` | `/accounts` |
+| `create_shopee_shortlink(url, id='15130770000', sub1..sub5='')` | `/shorten` |
+| `get_conversion_report(id, time, raw, page, page_size, sub_id, order_id, checkout_id, conversion_id, order_status, conversion_status)` | `/conversion-report` |
+| `get_daily_income_report(id, ids, time)` | `/daily-income-report` |
+| `get_click_report(id, time, raw, page, page_size, sub_id)` | `/click-report` |
+| `open_manual_login(id='15130770000', no_autofill=True)` | `/login?json=1&platform=shopee&account=<mapped>&noAutofill=1&autofill=0` |
+
+`id` accepts `15130770000` (chearb) or `15142270000` (neezs). Every response is
+passed through a redactor that strips cookie / access-token / CSRF fields before
+it leaves the process, and the server never retries: a `manual_login_required` /
+captcha payload from Shopee is returned verbatim (sanitized) so it never
+re-hammers Shopee.
+
+### Hermes profile `cgo` config
+
+Add the server to the `cgo` profile's MCP config (adjust the absolute path):
+
+```json
+{
+  "mcpServers": {
+    "affiliate-shortlink-cloak": {
+      "command": "affiliate-shortlink-cloak-mcp",
+      "args": [],
+      "env": {
+        "AFFILIATE_SHORTLINK_BRIDGE_URL": "http://127.0.0.1:8810"
+      }
+    }
+  }
+}
+```
+
+If the console script is not on `PATH`, use the module form instead:
+
+```json
+{
+  "mcpServers": {
+    "affiliate-shortlink-cloak": {
+      "command": "python3.11",
+      "args": ["-m", "affiliate_shortlink_cloak_python.mcp_server"],
+      "env": {
+        "PYTHONPATH": "/Users/yok-macmini/Developer/shopping-affiliate/apps/affiliate-shortlink-cloak-python/src",
+        "AFFILIATE_SHORTLINK_BRIDGE_URL": "http://127.0.0.1:8810"
+      }
+    }
+  }
+}
+```
+
+Restart Hermes (reload the `cgo` profile) after editing the config so the new
+MCP server is picked up.
+
 ## Known Shopee Aliases
 
 | Shopee id | account | utm_source | display |
