@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "affiliate-shortlink-cloak-python"
+version = "0.0.1"
+description = "Parallel Python CloakBrowser shortlink prototype (test-only, port 8811)"
+requires-python = ">=3.9"
+# No runtime deps: stdlib HTTP server only. `cloakbrowser` is imported lazily
+# at browser-launch time and is intentionally NOT declared here so the package
+# imports and tests run without it installed.
+dependencies = []
+
+[project.optional-dependencies]
+browser = ["cloakbrowser"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
