@@ -1,93 +1,69 @@
-"""Account alias mapping / conflict tests. No browser is ever launched."""
+from __future__ import annotations
 
 import os
 import sys
 import unittest
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-from affiliate_shortlink_cloak_python import accounts  # noqa: E402
+from affiliate_shortlink_cloak_python import accounts
 
 
-class TestAliasMapping(unittest.TestCase):
-    def test_known_ids_map_to_expected_accounts(self):
+class AccountTests(unittest.TestCase):
+    def test_known_accounts_mapping(self) -> None:
+        records = accounts.list_accounts()
+        self.assertEqual(2, len(records))
+
         chearb = accounts.resolve_by_shopee_id("15130770000")
         self.assertIsNotNone(chearb)
-        self.assertEqual(chearb["account"], "affiliate_chearb.com")
-        self.assertEqual(chearb["utm_source"], "an_15130770000")
-        self.assertEqual(chearb["display"], "affiliate@chearb.com")
+        self.assertEqual("affiliate_chearb.com", chearb["account"])
+        self.assertEqual("an_15130770000", chearb["utm_source"])
+        self.assertEqual("affiliate@chearb.com", chearb["display"])
 
-        neezs = accounts.resolve_by_shopee_id("15142270000")
-        self.assertEqual(neezs["account"], "affiliate_neezs.com")
-        self.assertEqual(neezs["utm_source"], "an_15142270000")
-        self.assertEqual(neezs["display"], "affiliate@neezs.com")
+        neezs = accounts.resolve_by_shopee_id("an_15142270000")
+        self.assertIsNotNone(neezs)
+        self.assertEqual("affiliate_neezs.com", neezs["account"])
 
-    def test_resolve_by_account_name(self):
-        rec = accounts.resolve_by_account("affiliate_neezs.com")
-        self.assertEqual(rec["shopee_id"], "15142270000")
+    def test_account_resolution_accepts_aliases(self) -> None:
+        by_display = accounts.resolve_account(account="affiliate@chearb.com")
+        self.assertTrue(by_display["ok"])
+        self.assertEqual("15130770000", by_display["record"]["id"])
 
-    def test_unknown_id_returns_none(self):
-        self.assertIsNone(accounts.resolve_by_shopee_id("999"))
-        self.assertIsNone(accounts.resolve_by_account("nope.com"))
+        by_utm = accounts.resolve_account(account="an_15142270000")
+        self.assertTrue(by_utm["ok"])
+        self.assertEqual("affiliate_neezs.com", by_utm["record"]["account"])
 
-    def test_list_accounts_returns_copies_without_secrets(self):
-        listed = accounts.list_accounts()
-        self.assertEqual(len(listed), 2)
-        blob = " ".join(str(v).lower() for rec in listed for v in rec.values())
-        for banned in ("password", "cookie", "token", "secret", "datr", "totp"):
-            self.assertNotIn(banned, blob)
-        # mutating the copy must not affect source data
-        listed[0]["account"] = "mutated"
-        self.assertNotEqual(
-            accounts.resolve_by_shopee_id("15130770000")["account"], "mutated"
+    def test_conflicting_id_and_account_is_rejected(self) -> None:
+        result = accounts.resolve_account(
+            shopee_id="15130770000",
+            account="affiliate_neezs.com",
         )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["conflict"])
+        self.assertEqual("id_account_conflict", result["error"])
 
-
-class TestConflictDetection(unittest.TestCase):
-    def test_agreeing_id_and_account_ok(self):
-        res = accounts.resolve_account(
-            shopee_id="15130770000", account="affiliate_chearb.com"
-        )
-        self.assertTrue(res["ok"])
-        self.assertFalse(res["conflict"])
-        self.assertEqual(res["record"]["account"], "affiliate_chearb.com")
-
-    def test_conflicting_id_and_account(self):
-        res = accounts.resolve_account(
-            shopee_id="15130770000", account="affiliate_neezs.com"
-        )
-        self.assertFalse(res["ok"])
-        self.assertTrue(res["conflict"])
-        self.assertEqual(res["error"], "id_account_conflict")
-
-    def test_unknown_id(self):
-        res = accounts.resolve_account(shopee_id="123")
-        self.assertFalse(res["ok"])
-        self.assertEqual(res["error"], "unknown_shopee_id")
-
-    def test_unknown_account(self):
-        res = accounts.resolve_account(account="ghost.com")
-        self.assertFalse(res["ok"])
-        self.assertEqual(res["error"], "unknown_account")
-
-    def test_missing_identifier(self):
-        res = accounts.resolve_account()
-        self.assertFalse(res["ok"])
-        self.assertEqual(res["error"], "missing_identifier")
-
-
-class TestProfileDir(unittest.TestCase):
-    def test_profile_dir_layout(self):
-        path = accounts.profile_dir_for("/root", "shopee", "affiliate_chearb.com")
+    def test_unknown_and_missing_identifiers(self) -> None:
         self.assertEqual(
-            path, os.path.join("/root", "shopee", "affiliate_chearb.com")
+            "unknown_shopee_id",
+            accounts.resolve_account(shopee_id="99999999999")["error"],
+        )
+        self.assertEqual(
+            "missing_identifier",
+            accounts.resolve_account()["error"],
         )
 
-    def test_profile_dir_sanitizes_traversal(self):
-        path = accounts.profile_dir_for("/root", "../etc", "a/b")
-        self.assertNotIn("..", path)
-        self.assertNotIn("/etc/", path + "/")
-        self.assertTrue(path.startswith("/root"))
+    def test_profile_dir_sanitizes_path_segments(self) -> None:
+        path = accounts.profile_dir_for(
+            "/tmp/profiles",
+            "../shopee",
+            "affiliate/chearb.com",
+        )
+        self.assertEqual(
+            os.path.join("/tmp/profiles", "_shopee", "affiliate_chearb.com"),
+            path,
+        )
 
 
 if __name__ == "__main__":

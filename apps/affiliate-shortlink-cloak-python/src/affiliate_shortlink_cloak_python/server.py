@@ -1,19 +1,13 @@
-"""Stdlib HTTP server for the Python CloakBrowser shortlink prototype.
-
-No FastAPI / third-party web framework — `http.server` only. Run with:
-
-    PYTHONPATH=src python3 -m affiliate_shortlink_cloak_python.server
-
-Binds 127.0.0.1:8811 by default. Does not touch the production Node service
-on 8810. `cloakbrowser` is only imported when a browser is actually launched.
-"""
+"""Stdlib HTTP server for the Python CloakBrowser prototype."""
 
 from __future__ import annotations
 
 import json
 import os
+import sys
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from . import (
@@ -21,292 +15,260 @@ from . import (
     BACKEND,
     DEFAULT_HOST,
     DEFAULT_PORT,
+    DEFAULT_PROFILE_ROOT,
+    SHOPEE_CUSTOM_LINK_URL,
     __version__,
 )
-from . import accounts as accounts_mod
+from .accounts import list_accounts, profile_dir_for, resolve_account
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
-def default_profile_root() -> str:
-    return os.path.expanduser(
-        os.environ.get(
-            "PROFILE_ROOT",
-            os.path.join("~", ".affiliate-shortlink-cloak-python", "profiles"),
-        )
+@dataclass(frozen=True)
+class ServerConfig:
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
+    profile_root: str = DEFAULT_PROFILE_ROOT
+
+
+def load_config(environ: Optional[Mapping[str, str]] = None) -> ServerConfig:
+    env = os.environ if environ is None else environ
+    return ServerConfig(
+        host=env.get("HOST", DEFAULT_HOST),
+        port=int(env.get("PORT", str(DEFAULT_PORT))),
+        profile_root=os.path.expanduser(
+            env.get("PROFILE_ROOT", DEFAULT_PROFILE_ROOT)
+        ),
     )
 
 
-def resolve_host() -> str:
-    return os.environ.get("HOST", DEFAULT_HOST)
+def json_bytes(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
-def resolve_port() -> int:
-    raw = os.environ.get("PORT", str(DEFAULT_PORT))
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_PORT
-
-
-# In-memory runtime state — which accounts have had a login window opened this
-# process. No secrets/cookies, just booleans + last-seen url.
-_RUNTIME_STATE: Dict[str, Dict[str, object]] = {}
-
-
-def _record_runtime(account: str, current_url: Optional[str]) -> None:
-    entry = _RUNTIME_STATE.setdefault(account, {"loginOpened": False, "opens": 0})
-    entry["loginOpened"] = True
-    entry["opens"] = int(entry.get("opens", 0)) + 1
-    entry["lastUrl"] = current_url
-
-
-def loaded_runtime_state() -> Dict[str, Dict[str, object]]:
-    """Safe snapshot of runtime state for /accounts and /health."""
-    return {acct: dict(info) for acct, info in _RUNTIME_STATE.items()}
-
-
-def loaded_count() -> int:
-    return len(_RUNTIME_STATE)
-
-
-# ---------------------------------------------------------------------------
-# Pure handler helpers — return (status_code, body_dict). No browser needed.
-# ---------------------------------------------------------------------------
-
-def build_health(profile_root: str, port: int) -> Tuple[int, Dict[str, object]]:
-    return 200, {
+def health_payload(config: ServerConfig) -> Dict[str, object]:
+    return {
         "status": "ok",
         "app": APP_NAME,
-        "backend": BACKEND,
         "version": __version__,
-        "port": port,
-        "loaded": loaded_count(),
-        "profileRoot": profile_root,
-    }
-
-
-def build_accounts(profile_root: str) -> Tuple[int, Dict[str, object]]:
-    return 200, {
-        "app": APP_NAME,
         "backend": BACKEND,
-        "profileRoot": profile_root,
-        "known": accounts_mod.list_accounts(),
-        "loaded": loaded_count(),
-        "runtime": loaded_runtime_state(),
+        "host": config.host,
+        "port": config.port,
+        "profileRoot": config.profile_root,
+        "shopeeCustomLinkUrl": SHOPEE_CUSTOM_LINK_URL,
     }
 
 
-def validate_shorten(params: Dict[str, str]) -> Tuple[bool, Dict[str, object]]:
-    """Validate /shorten inputs against known aliases. Pure — no browser.
-
-    Returns (ok, detail). `detail` carries either an `error` reason or the
-    resolved `record` plus echoed id/url.
-    """
-    link_id = (params.get("id") or "").strip()
-    url = (params.get("url") or "").strip()
-    account = (params.get("account") or "").strip() or None
-
-    if not link_id:
-        return False, {"error": "missing_id"}
-    if not url:
-        return False, {"error": "missing_url"}
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return False, {"error": "invalid_url"}
-
-    resolution = accounts_mod.resolve_account(shopee_id=link_id, account=account)
-    if not resolution["ok"]:
-        return False, {
-            "error": resolution["error"],
-            "conflict": resolution["conflict"],
-        }
-
-    return True, {
-        "record": resolution["record"],
-        "id": link_id,
-        "url": url,
+def accounts_payload(config: ServerConfig) -> Dict[str, object]:
+    accounts = list_accounts()
+    return {
+        "status": "ok",
+        "accounts": accounts,
+        "count": len(accounts),
+        "profileRoot": config.profile_root,
     }
 
 
-# ---------------------------------------------------------------------------
-# Browser-backed handlers (import cloakbrowser lazily via browser module).
-# ---------------------------------------------------------------------------
+def error_payload(error: str, **fields: object) -> Dict[str, object]:
+    payload: Dict[str, object] = {"status": "error", "error": error}
+    payload.update(fields)
+    return payload
 
-def handle_login(profile_root: str, params: Dict[str, str]) -> Tuple[int, Dict[str, object]]:
-    platform = (params.get("platform") or "shopee").strip() or "shopee"
-    account = (params.get("account") or "").strip()
 
-    resolution = accounts_mod.resolve_account(account=account)
+def first_query_value(query: Mapping[str, object],
+                      key: str,
+                      default: str = "") -> str:
+    value = query.get(key)
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else default
+    text = str(value).strip()
+    return text if text else default
+
+
+def validate_login_query(
+    query: Mapping[str, object],
+    config: ServerConfig,
+) -> Tuple[int, Dict[str, object]]:
+    platform = first_query_value(query, "platform", "shopee").lower()
+    if platform != "shopee":
+        return 400, error_payload(
+            "unsupported_platform",
+            platform=platform,
+            supported=["shopee"],
+        )
+
+    resolution = resolve_account(
+        shopee_id=first_query_value(query, "id"),
+        account=first_query_value(query, "account"),
+    )
     if not resolution["ok"]:
-        return 400, {
-            "status": "invalid_account",
-            "app": APP_NAME,
-            "platform": platform,
-            "account": account or None,
-            "error": resolution["error"],
-        }
+        return 400, error_payload(
+            str(resolution["error"]),
+            conflict=bool(resolution["conflict"]),
+        )
 
     record = resolution["record"]
-    resolved_account = record["account"]
-    profile_dir = accounts_mod.profile_dir_for(profile_root, platform, resolved_account)
-
-    # Lazy import so a missing/broken browser can't crash the process.
-    from . import browser as browser_mod
-
-    try:
-        result = browser_mod.open_shopee_custom_link(profile_dir)
-    except browser_mod.BrowserLaunchError as exc:
-        return 503, {
-            "status": "browser_unavailable",
-            "app": APP_NAME,
-            "platform": platform,
-            "account": resolved_account,
-            "profileDir": profile_dir,
-            "error": str(exc),
-        }
-
-    _record_runtime(resolved_account, result.get("currentUrl"))
-
+    assert isinstance(record, dict)
+    profile_dir = profile_dir_for(config.profile_root, platform, record["account"])
     return 200, {
-        "status": "login_window_opened",
-        "app": APP_NAME,
         "platform": platform,
-        "account": resolved_account,
-        "display": record["display"],
+        "record": record,
         "profileDir": profile_dir,
-        "targetUrl": result.get("targetUrl"),
-        "currentUrl": result.get("currentUrl"),
     }
 
 
-def handle_shorten(profile_root: str, params: Dict[str, str]) -> Tuple[int, Dict[str, object]]:
-    ok, detail = validate_shorten(params)
-    if not ok:
-        return 400, {
-            "status": "invalid_request",
-            "app": APP_NAME,
-            **detail,
-        }
+def validate_shorten_query(
+    query: Mapping[str, object],
+    config: ServerConfig,
+) -> Tuple[int, Dict[str, object]]:
+    raw_url = first_query_value(query, "url")
+    if not _is_valid_http_url(raw_url):
+        return 400, error_payload("invalid_url")
 
-    record = detail["record"]
-    account = record["account"]
-    platform = (params.get("platform") or "shopee").strip() or "shopee"
-    profile_dir = accounts_mod.profile_dir_for(profile_root, platform, account)
+    status, payload = validate_login_query(query, config)
+    if status != 200:
+        return status, payload
 
-    # Best-effort open of the context; real Shopee shorten is NOT implemented.
-    current_url: Optional[str] = None
-    browser_error: Optional[str] = None
-    from . import browser as browser_mod
+    payload = dict(payload)
+    payload["url"] = raw_url
+    return 200, payload
+
+
+def _is_valid_http_url(raw_url: str) -> bool:
+    parsed = urlparse(raw_url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def handle_login(query: Mapping[str, object],
+                 config: ServerConfig) -> Tuple[int, Dict[str, object]]:
+    status, payload = validate_login_query(query, config)
+    if status != 200:
+        return status, payload
+
+    from .browser import BrowserLaunchError, open_shopee_custom_link
 
     try:
-        result = browser_mod.open_shopee_custom_link(profile_dir)
-        current_url = result.get("currentUrl")
-        _record_runtime(account, current_url)
-    except browser_mod.BrowserLaunchError as exc:
-        browser_error = str(exc)
+        browser_info = open_shopee_custom_link(str(payload["profileDir"]))
+    except BrowserLaunchError as exc:
+        return 503, error_payload("browser_launch_failed", reason=str(exc))
 
+    record = payload["record"]
+    assert isinstance(record, dict)
+    return 200, {
+        "status": "ok",
+        "platform": payload["platform"],
+        "id": record["id"],
+        "account": record["account"],
+        "display": record["display"],
+        "utm_source": record["utm_source"],
+        "profileDir": payload["profileDir"],
+        "browser": browser_info,
+    }
+
+
+def handle_shorten(query: Mapping[str, object],
+                   config: ServerConfig) -> Tuple[int, Dict[str, object]]:
+    status, payload = validate_shorten_query(query, config)
+    if status != 200:
+        return status, payload
+
+    from .browser import BrowserLaunchError, open_shopee_custom_link
+
+    try:
+        browser_info = open_shopee_custom_link(str(payload["profileDir"]))
+    except BrowserLaunchError as exc:
+        return 503, error_payload("browser_launch_failed", reason=str(exc))
+
+    record = payload["record"]
+    assert isinstance(record, dict)
+    url = str(payload["url"])
     return 200, {
         "status": "not_implemented_after_login",
-        "app": APP_NAME,
-        "platform": platform,
-        "account": account,
+        "error": "not_implemented_after_login",
+        "link": url,
+        "originalLink": url,
+        "longLink": url,
+        "shortLink": None,
+        "id": record["id"],
+        "account": record["account"],
+        "display": record["display"],
         "utm_source": record["utm_source"],
-        "id": detail["id"],
-        "url": detail["url"],
-        "profileDir": profile_dir,
-        "currentUrl": current_url,
-        "session": {
-            "profileDir": profile_dir,
-            "opened": browser_error is None,
-        },
-        "note": "Shopee GraphQL shorten not implemented in this prototype.",
-        "browserError": browser_error,
+        "profileDir": payload["profileDir"],
+        "browser": browser_info,
     }
 
 
-# ---------------------------------------------------------------------------
-# HTTP request handler
-# ---------------------------------------------------------------------------
-
-def _flatten(qs: Dict[str, List[str]]) -> Dict[str, str]:
-    return {k: (v[0] if v else "") for k, v in qs.items()}
-
-
-class CloakRequestHandler(BaseHTTPRequestHandler):
-    server_version = "AffiliateShortlinkCloakPy/" + __version__
-
-    # Silence default noisy logging; keep it minimal and safe.
-    def log_message(self, fmt, *args):  # noqa: A003
-        return
-
-    def _send_json(self, status: int, body: Dict[str, object]) -> None:
-        payload = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self):  # noqa: N802
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        params = _flatten(parse_qs(parsed.query))
-        profile_root = self.server.profile_root  # type: ignore[attr-defined]
-        port = self.server.server_address[1]
-
-        if path == "/health":
-            self._send_json(*build_health(profile_root, port))
-        elif path == "/accounts":
-            self._send_json(*build_accounts(profile_root))
-        elif path == "/login":
-            self._send_json(*handle_login(profile_root, params))
-        elif path == "/shorten":
-            self._send_json(*handle_shorten(profile_root, params))
-        else:
-            self._send_json(404, {"status": "not_found", "app": APP_NAME, "path": path})
-
-
-class CloakServer(ThreadingHTTPServer):
+class PrototypeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, host: str, port: int, profile_root: str):
-        super().__init__((host, port), CloakRequestHandler)
-        self.profile_root = profile_root
+    def __init__(self, server_address, handler_class, config: ServerConfig):
+        super().__init__(server_address, handler_class)
+        self.config = config
 
 
-def make_server(host: Optional[str] = None,
-                port: Optional[int] = None,
-                profile_root: Optional[str] = None) -> CloakServer:
-    host = host or resolve_host()
-    port = port if port is not None else resolve_port()
-    profile_root = profile_root or default_profile_root()
-    os.makedirs(profile_root, exist_ok=True)
-    return CloakServer(host, port, profile_root)
+class RequestHandler(BaseHTTPRequestHandler):
+    server_version = "affiliate-shortlink-cloak-python/0.0.1"
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        config = self.server.config
+
+        if parsed.path in {"", "/"}:
+            status, payload = 200, health_payload(config)
+        elif parsed.path == "/health":
+            status, payload = 200, health_payload(config)
+        elif parsed.path == "/accounts":
+            status, payload = 200, accounts_payload(config)
+        elif parsed.path == "/login":
+            status, payload = handle_login(query, config)
+        elif parsed.path == "/shorten":
+            status, payload = handle_shorten(query, config)
+        else:
+            status, payload = 404, error_payload("not_found", path=parsed.path)
+
+        self._write_json(status, payload)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        sys.stderr.write(
+            "[affiliate-shortlink-cloak-python] %s\n" % (fmt % args)
+        )
+
+    def _write_json(self, status: int, payload: Mapping[str, object]) -> None:
+        body = json_bytes(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def make_server(config: ServerConfig) -> PrototypeHTTPServer:
+    return PrototypeHTTPServer((config.host, config.port), RequestHandler, config)
 
 
 def main() -> None:
-    server = make_server()
-    host, port = server.server_address
+    config = load_config()
+    httpd = make_server(config)
     print(
-        "[%s] listening on http://%s:%s  profileRoot=%s"
-        % (APP_NAME, host, port, server.profile_root)
+        "%s listening on http://%s:%s"
+        % (APP_NAME, config.host, config.port),
+        flush=True,
     )
-    print("  prototype only — not production, does not touch port 8810")
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down...")
+        pass
     finally:
-        try:
-            from . import browser as browser_mod
+        from .browser import close_all
 
-            closed = browser_mod.close_all()
-            if closed:
-                print("closed %d browser context(s)" % closed)
-        except Exception:
-            pass
-        server.server_close()
+        close_all()
+        httpd.server_close()
 
 
 if __name__ == "__main__":
