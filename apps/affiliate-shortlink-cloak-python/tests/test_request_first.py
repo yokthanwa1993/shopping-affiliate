@@ -229,7 +229,7 @@ class ShortlinkRequestFirstTests(unittest.TestCase):
                 ctx, req, {"operationName": "batchGetCustomLink"}, "https://shopee.co.th/x"
             )
         self.assertNotIn("SECRETVALUE", str(exc.exception))
-        self.assertNotIn("SECRET", exc.exception.reason.replace("REDACTED", ""))
+        self.assertNotIn("SECRETVALUE", exc.exception.reason)
         self.assertTrue(exc.exception.manual_login_required)
 
 
@@ -281,6 +281,20 @@ class ReportRequestFirstTests(unittest.TestCase):
             result = browser.fetch_shopee_report_json("/tmp/p", AFFILIATE_URL + "/api")
         self.assertFalse(result["parsed"])
         self.assertNotIn("SECRETVALUE", result["snippet"])
+
+    def test_report_transport_exception_is_sanitized(self) -> None:
+        # The report path has NO fallback; a transport error surfaces as a
+        # sanitized RuntimeError without ever touching a page.
+        boom = RuntimeError("cookie: SECRETVALUE csrftoken=SECRET failed")
+        req = FakeRequestApi(get_response=boom)
+        page = FakePage(AFFILIATE_URL)
+        ctx = FakeRequestContext(req, pages=[page])
+        with _PatchLaunch(ctx):
+            with self.assertRaises(RuntimeError) as exc:
+                browser.fetch_shopee_report_json("/tmp/p", AFFILIATE_URL + "/api")
+        self.assertNotIn("SECRETVALUE", str(exc.exception))
+        self.assertEqual([], page.goto_calls)
+        self.assertEqual([], page.evaluate_calls)
 
 
 class ManualLoginStillNavigatesTests(unittest.TestCase):
