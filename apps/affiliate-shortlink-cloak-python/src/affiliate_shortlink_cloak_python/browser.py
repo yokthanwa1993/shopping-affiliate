@@ -224,16 +224,53 @@ _LOGIN_REDIRECT_RE = re.compile(
     r"shopee\.co\.th/buyer/login|affiliate\.shopee\.co\.th/login",
     re.IGNORECASE,
 )
+# A Shopee captcha / login / verify / sign-in interstitial. When the report
+# session lands here we fail closed instead of re-navigating (which would
+# refresh the visible custom_link tab and trip more reCAPTCHA).
+_SHOPEE_GATE_RE = re.compile(
+    r"/buyer/login|/login|captcha|verify|sign[- ]?in|/otp",
+    re.IGNORECASE,
+)
+# "No established origin yet" URLs for a freshly created / reused blank tab.
+_BLANK_URL_RE = re.compile(r"^(about:|chrome://newtab|data:,?$)", re.IGNORECASE)
+
+
+def _is_blank_url(url: str) -> bool:
+    """True when the page has no real origin yet (new tab / about:blank)."""
+    text = str(url or "").strip()
+    if not text:
+        return True
+    return bool(_BLANK_URL_RE.match(text))
+
+
+def _report_url_is_login_gate(url: str) -> bool:
+    """Decide whether a report page URL should fail closed.
+
+    A URL is a gate when it is a Shopee login/captcha/verify interstitial, or
+    when it is simply not on the affiliate origin (blank tabs are handled
+    separately by navigating once, so by the time this runs a non-affiliate URL
+    means the session really is off-origin)."""
+    text = str(url or "")
+    if _SHOPEE_GATE_RE.search(text) or _LOGIN_REDIRECT_RE.search(text):
+        return True
+    return not _AFFILIATE_ORIGIN_RE.search(text)
 
 
 def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object]:
     """Run a credentialed in-page GET against a Shopee report API.
 
     Reuses the per-account persistent CloakBrowser session (same profile the
-    shortlink flow uses). Returns a dict shaped like the legacy in-page fetch:
-    ``{status, parsed, body, snippet}``. If the session bounced to a login page
-    (or is off the affiliate origin) it fails closed with ``{login_gate: True}``
-    instead of leaking the redirect URL. Never returns cookies/tokens.
+    shortlink flow uses) and, crucially, reuses whatever page/tab is already
+    open **without forcing a fresh navigation on every call**. Thousands of
+    report fetches therefore no longer reload the visible custom_link tab
+    (which was tripping reCAPTCHA). Navigation happens at most once, only to
+    establish the affiliate origin on a brand-new / blank tab.
+
+    Returns a dict shaped like the legacy in-page fetch:
+    ``{status, parsed, body, snippet}``. If the session is on a login/captcha
+    page (or is off the affiliate origin) it fails closed with
+    ``{login_gate: True}`` instead of leaking the redirect URL or re-navigating.
+    Never returns cookies/tokens.
 
     Raises ``BrowserLaunchError`` when the browser cannot be launched (callers
     map that to ``browser_unavailable``); a failed in-page fetch raises a plain
@@ -241,9 +278,8 @@ def fetch_shopee_report_json(profile_dir: str, api_url: str) -> Dict[str, object
     """
     profile_dir = os.path.abspath(os.path.expanduser(profile_dir))
     with _profile_lock(profile_dir):
-        context, page = _open_shopee_custom_link_page(profile_dir)
-        current_url = str(_safe_current_url(page) or "")
-        if _LOGIN_REDIRECT_RE.search(current_url) or not _AFFILIATE_ORIGIN_RE.search(current_url):
+        context, page, current_url = _open_shopee_report_page(profile_dir)
+        if _report_url_is_login_gate(current_url):
             return {"login_gate": True}
 
         evaluate = getattr(page, "evaluate", None)
@@ -287,6 +323,50 @@ def _open_shopee_custom_link_page(profile_dir: str):
         raise BrowserLaunchError("browser_page_unavailable")
     _navigate_to_custom_link(page)
     return context, page
+
+
+def _open_shopee_report_page(profile_dir: str):
+    """Reuse the persistent context + an existing page for a report fetch
+    WITHOUT forcing ``page.goto`` on every call.
+
+    - Reuses the already-open tab. If it is already on the affiliate origin we
+      do NOT navigate (this is the hot path for thousands of report fetches).
+    - Only when the tab has no real origin yet (freshly created / ``about:blank``)
+      do we navigate once to establish the affiliate origin.
+    - A page sitting on a login/captcha/verify or otherwise non-affiliate origin
+      is left untouched here; the caller fails closed with ``login_gate`` rather
+      than re-navigating and hammering Shopee.
+
+    Returns ``(context, page, current_url)``.
+    """
+    context = launch_persistent_context(profile_dir)
+    page, created = _report_page(context)
+    if page is None:
+        raise BrowserLaunchError("browser_page_unavailable")
+    current_url = str(_safe_current_url(page) or "")
+    if created or _is_blank_url(current_url):
+        # At most one navigation, purely to establish the affiliate origin on a
+        # blank/new tab. Existing affiliate pages skip this entirely.
+        _navigate_to_custom_link(page)
+        current_url = str(_safe_current_url(page) or "")
+    return context, page, current_url
+
+
+def _report_page(context):
+    """Like ``_first_page`` but reports whether the page was newly created, so
+    the report path knows when a one-time navigation is warranted."""
+    try:
+        pages = getattr(context, "pages", None)
+        if callable(pages):
+            pages = pages()
+        if pages:
+            return pages[0], False
+    except Exception:  # pragma: no cover - defensive
+        pass
+    try:
+        return context.new_page(), True
+    except Exception:  # pragma: no cover
+        return None, True
 
 
 def _navigate_to_custom_link(page) -> None:
