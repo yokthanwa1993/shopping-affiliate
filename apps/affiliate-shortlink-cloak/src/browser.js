@@ -22,12 +22,9 @@ async function loadChromium() {
         return chromiumImpl;
       }
     } catch (err) {
-      console.warn(`[affiliate-shortlink-cloak] cloakbrowser load failed: ${err && err.message ? err.message : err}`);
+      throw new Error(`[affiliate-shortlink-cloak] cloakbrowser is required; refusing playwright-core fallback: ${err && err.message ? err.message : err}`);
     }
-    const { chromium } = require('playwright-core');
-    chromiumImpl = chromium;
-    chromiumSource = 'playwright-core';
-    return chromiumImpl;
+    throw new Error('[affiliate-shortlink-cloak] cloakbrowser is required; launchPersistentContext not found');
   })();
   return loadPromise;
 }
@@ -68,7 +65,12 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
   if (!platform) throw new Error(`Invalid platform: ${platformRaw}`);
   const account = sanitizeAccount(accountRaw);
   const key = contextKey(platform, account);
-  const effectiveHeadless = forceVisible ? false : headless;
+  // Shopee must behave like a normal browser: always launch headed (even when a
+  // caller requests headless:true for automatic shorten/reauth) and let
+  // CloakBrowser/Chromium supply its own userAgent/viewport/locale/args — we
+  // inject none of our own. Lazada keeps the previous configured behavior.
+  const isShopee = platform === 'shopee';
+  const effectiveHeadless = isShopee ? false : (forceVisible ? false : headless);
 
   if (contexts.has(key)) {
     const existing = contexts.get(key);
@@ -85,13 +87,15 @@ async function getContext(platformRaw, accountRaw, opts = {}) {
 
   const chromium = await loadChromium();
   const profileDir = ensureProfileDir(platform, account);
-  const launchOpts = {
-    headless: effectiveHeadless,
-    userAgent: CHROME_UA,
-    viewport: { width: 1280, height: 800 },
-    locale: 'en-US',
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-  };
+  const launchOpts = isShopee
+    ? { headless: effectiveHeadless }
+    : {
+        headless: effectiveHeadless,
+        userAgent: CHROME_UA,
+        viewport: { width: 1280, height: 800 },
+        locale: 'en-US',
+        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+      };
   const context = chromiumSource === 'cloakbrowser'
     ? await chromium.launchPersistentContext({ userDataDir: profileDir, humanize: true, ...launchOpts })
     : await chromium.launchPersistentContext(profileDir, launchOpts);
