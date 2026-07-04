@@ -220,9 +220,204 @@ def build_in_page_shorten_expression(body: Mapping[str, object]) -> str:
         "  const response = await fetch(endpoint, { method: 'POST',"
         " credentials: 'include', headers, body: JSON.stringify(body) });\n"
         "  const text = await response.text();\n"
-        "  return { status: response.status, text: text, currentUrl: location.href };\n"
+        # Return a JSON *string* (a primitive) rather than an object. Primitives
+        # round-trip reliably through nodriver's evaluate regardless of whether
+        # Chrome answers via returnByValue or deep serialization, so the result
+        # is not lost as an unwrapped RemoteObject.
+        "  return JSON.stringify({ status: response.status, text: text,"
+        " currentUrl: location.href });\n"
         "})()"
     )
+
+
+# ---------------------------------------------------------------------------
+# tab.evaluate result normalization (pure, fully unit-testable)
+# ---------------------------------------------------------------------------
+#
+# nodriver's ``Tab.evaluate`` is inconsistent about what it hands back. It sends
+# CDP ``Runtime.evaluate`` with BOTH ``returnByValue=True`` and
+# ``serializationOptions={serialization: "deep"}``. When Chrome honours the deep
+# serialization it populates ``deepSerializedValue`` (WebDriver-BiDi shape) and
+# leaves ``value`` empty, so nodriver falls through and returns the raw
+# ``RemoteObject`` instead of a plain Python value. Depending on Chrome version
+# the same call can also yield: a plain decoded value (returnByValue), a
+# ``DeepSerializedValue``, a BiDi node dict, or — on a JS throw — an
+# ``ExceptionDetails``. The helpers below collapse every one of those shapes into
+# a plain Python value (or raise for a JS exception) without importing nodriver.
+
+
+class _StealthEvalError(Exception):
+    """Internal marker: the tab reported a JS exception while evaluating."""
+
+
+# WebDriver-BiDi deep-serialization node types (Runtime.DeepSerializedValue.type).
+_BIDI_NODE_TYPES = frozenset(
+    {
+        "undefined",
+        "null",
+        "string",
+        "number",
+        "boolean",
+        "bigint",
+        "regexp",
+        "date",
+        "symbol",
+        "array",
+        "object",
+        "function",
+        "map",
+        "set",
+        "weakmap",
+        "weakset",
+        "error",
+        "proxy",
+        "promise",
+        "typedarray",
+        "arraybuffer",
+        "node",
+        "window",
+        "generator",
+    }
+)
+
+
+def _looks_like_bidi_node(value: object) -> bool:
+    """True when a dict has the WebDriver-BiDi deep-serialized node shape.
+
+    A plain result payload (``{"status": ..., "text": ...}``) has no ``type``
+    key, so it is never mistaken for a BiDi node."""
+    if not isinstance(value, dict):
+        return False
+    node_type = value.get("type")
+    if not isinstance(node_type, str) or node_type not in _BIDI_NODE_TYPES:
+        return False
+    return "value" in value or node_type in ("null", "undefined")
+
+
+def _decode_bidi_key(key: object) -> str:
+    if isinstance(key, str):
+        return key
+    if isinstance(key, dict) and "value" in key:
+        return str(key.get("value"))
+    return str(key)
+
+
+def _decode_bidi_node(node: object) -> object:
+    """Decode a WebDriver-BiDi deep-serialized node into a plain Python value.
+
+    Non-node values (already-plain dicts/lists/primitives) pass through
+    untouched so this is safe to call on any evaluate result."""
+    if not _looks_like_bidi_node(node):
+        return node
+    node_type = node.get("type")  # type: ignore[union-attr]
+    node_value = node.get("value")  # type: ignore[union-attr]
+    if node_type in ("null", "undefined"):
+        return None
+    if node_type == "object":
+        decoded: Dict[str, object] = {}
+        if isinstance(node_value, list):
+            for pair in node_value:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    decoded[_decode_bidi_key(pair[0])] = _decode_bidi_node(pair[1])
+        elif isinstance(node_value, dict):
+            for raw_key, raw_val in node_value.items():
+                decoded[_decode_bidi_key(raw_key)] = _decode_bidi_node(raw_val)
+        return decoded
+    if node_type in ("array", "set"):
+        if isinstance(node_value, list):
+            return [_decode_bidi_node(item) for item in node_value]
+        return []
+    if node_type == "map":
+        decoded_map: Dict[str, object] = {}
+        if isinstance(node_value, list):
+            for pair in node_value:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    decoded_map[_decode_bidi_key(pair[0])] = _decode_bidi_node(pair[1])
+        return decoded_map
+    # string / number / boolean / bigint / etc: value is the primitive itself.
+    return node_value
+
+
+def _is_exception_details(result: object) -> bool:
+    """Duck-type nodriver/CDP ``ExceptionDetails`` (JS threw during evaluate)."""
+    if isinstance(result, dict):
+        return False
+    return hasattr(result, "exception_id") or type(result).__name__ == "ExceptionDetails"
+
+
+def _exception_details_text(result: object) -> str:
+    text = getattr(result, "text", None)
+    return str(text) if text else "stealth_evaluate_exception"
+
+
+def _is_remote_object(result: object) -> bool:
+    if isinstance(result, dict):
+        return False
+    return hasattr(result, "deep_serialized_value")
+
+
+def _is_deep_serialized_value(result: object) -> bool:
+    if isinstance(result, dict):
+        return False
+    return (
+        hasattr(result, "type_")
+        and hasattr(result, "value")
+        and not hasattr(result, "deep_serialized_value")
+    )
+
+
+def _normalize_deep_serialized(dsv: object) -> object:
+    if dsv is None:
+        return None
+    if isinstance(dsv, dict):
+        node = {"type": dsv.get("type") or dsv.get("type_"), "value": dsv.get("value")}
+    else:
+        node = {"type": getattr(dsv, "type_", None), "value": getattr(dsv, "value", None)}
+    return _decode_bidi_node(node)
+
+
+def normalize_evaluate_result(result: object) -> object:
+    """Collapse any nodriver ``tab.evaluate`` return shape into a plain value.
+
+    Handles the plain ``returnByValue`` value, a JSON string, a nodriver
+    ``RemoteObject`` (via ``.value`` or ``.deep_serialized_value``), a bare
+    ``DeepSerializedValue``, and a raw BiDi node dict. Raises
+    ``_StealthEvalError`` when the tab reported a JS exception. Never logs or
+    exposes the (potentially secret-bearing) payload."""
+    if result is None:
+        return None
+    if _is_exception_details(result):
+        raise _StealthEvalError(_exception_details_text(result))
+    if _is_remote_object(result):
+        value = getattr(result, "value", None)
+        if value is not None:
+            return normalize_evaluate_result(value)
+        dsv = getattr(result, "deep_serialized_value", None)
+        if dsv is not None:
+            return _normalize_deep_serialized(dsv)
+        return None
+    if _is_deep_serialized_value(result):
+        return _normalize_deep_serialized(result)
+    if _looks_like_bidi_node(result):
+        return _decode_bidi_node(result)
+    return result
+
+
+def coerce_shorten_result_payload(value: object) -> Optional[Dict[str, object]]:
+    """Coerce a normalized evaluate result into the ``{status,text,currentUrl}``
+    dict. Accepts an already-decoded dict or a JSON string; returns ``None`` when
+    it cannot be turned into a dict (so the caller fails closed)."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, dict):
+        return value
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +552,7 @@ class _StealthRuntime:
 
         expression = build_in_page_shorten_expression(body)
         try:
-            result = await tab.evaluate(
+            raw_result = await tab.evaluate(
                 expression,
                 await_promise=True,
                 return_by_value=True,
@@ -370,7 +565,21 @@ class _StealthRuntime:
                 manual_login_required=True,
             )
 
-        if not isinstance(result, dict):
+        # nodriver may hand back a plain dict, a JSON string, a RemoteObject, or
+        # a deep-serialized BiDi node depending on Chrome/serialization; collapse
+        # them all into the {status,text,currentUrl} payload here.
+        try:
+            normalized = normalize_evaluate_result(raw_result)
+        except _StealthEvalError as exc:
+            raise ShopeeShortenError(
+                "shopee_stealth_fetch_failed",
+                sanitize_error_message(exc),
+                current_url=current_url,
+                manual_login_required=True,
+            )
+
+        result = coerce_shorten_result_payload(normalized)
+        if result is None:
             raise ShopeeShortenError(
                 "shopee_stealth_invalid_fetch_result",
                 "Invalid fetch result from stealth browser",
