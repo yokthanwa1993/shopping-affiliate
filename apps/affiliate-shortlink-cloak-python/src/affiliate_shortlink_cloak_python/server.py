@@ -6,7 +6,7 @@ import json
 import os
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Mapping, Optional, Tuple
@@ -15,13 +15,20 @@ from urllib.parse import parse_qs, urlparse
 from . import (
     APP_NAME,
     BACKEND,
+    BACKEND_STEALTH,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_PROFILE_ROOT,
+    DEFAULT_STEALTH_PROFILE_ROOT,
     SHOPEE_CUSTOM_LINK_URL,
     __version__,
 )
 from .accounts import list_accounts, profile_dir_for, resolve_account
+from .stealth_backend import (
+    parse_profile_map,
+    resolve_backend,
+    stealth_profile_dir,
+)
 from .click_report import handle_click_report, is_click_report_host
 from .conversion_report import (
     handle_conversion_report,
@@ -42,17 +49,43 @@ class ServerConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     profile_root: str = DEFAULT_PROFILE_ROOT
+    backend: str = BACKEND
+    stealth_profile_map: Mapping[str, str] = field(default_factory=dict)
 
 
 def load_config(environ: Optional[Mapping[str, str]] = None) -> ServerConfig:
     env = os.environ if environ is None else environ
+    backend = resolve_backend(env)
+    default_root = (
+        DEFAULT_STEALTH_PROFILE_ROOT
+        if backend == BACKEND_STEALTH
+        else DEFAULT_PROFILE_ROOT
+    )
     return ServerConfig(
         host=env.get("HOST", DEFAULT_HOST),
         port=int(env.get("PORT", str(DEFAULT_PORT))),
-        profile_root=os.path.expanduser(
-            env.get("PROFILE_ROOT", DEFAULT_PROFILE_ROOT)
+        profile_root=os.path.expanduser(env.get("PROFILE_ROOT", default_root)),
+        backend=backend,
+        stealth_profile_map=parse_profile_map(
+            env.get("AFFILIATE_STEALTH_ACCOUNT_PROFILE_MAP", "")
         ),
     )
+
+
+def browser_backend_for(config: ServerConfig):
+    """Return the browser backend module matching the configured backend.
+
+    Both modules expose the same ``open_shopee_custom_link`` /
+    ``shorten_shopee_link`` / ``close_all`` / ``BrowserLaunchError`` surface, so
+    the request handlers dispatch without any per-backend branching. Imported
+    lazily so selecting one backend never imports the other's browser stack."""
+    if config.backend == BACKEND_STEALTH:
+        from . import stealth_backend
+
+        return stealth_backend
+    from . import browser
+
+    return browser
 
 
 def json_bytes(payload: Mapping[str, object]) -> bytes:
@@ -68,7 +101,7 @@ def health_payload(config: ServerConfig) -> Dict[str, object]:
         "status": "ok",
         "app": APP_NAME,
         "version": __version__,
-        "backend": BACKEND,
+        "backend": config.backend,
         "host": config.host,
         "port": config.port,
         "profileRoot": config.profile_root,
@@ -128,7 +161,17 @@ def validate_login_query(
 
     record = resolution["record"]
     assert isinstance(record, dict)
-    profile_dir = profile_dir_for(config.profile_root, platform, record["account"])
+    if config.backend == BACKEND_STEALTH:
+        # Stealth profiles are flat directories under the profile root, resolved
+        # via the optional account->profile env map (falls back to a sanitized
+        # account name).
+        profile_dir = stealth_profile_dir(
+            config.profile_root, record, config.stealth_profile_map
+        )
+    else:
+        profile_dir = profile_dir_for(
+            config.profile_root, platform, record["account"]
+        )
     return 200, {
         "platform": platform,
         "record": record,
@@ -338,12 +381,15 @@ def handle_login(query: Mapping[str, object],
     if status != 200:
         return status, payload
 
-    from .browser import BrowserLaunchError, open_shopee_custom_link
+    backend = browser_backend_for(config)
 
     try:
-        browser_info = open_shopee_custom_link(str(payload["profileDir"]))
-    except BrowserLaunchError as exc:
-        return 503, error_payload("browser_launch_failed", reason=str(exc))
+        browser_info = backend.open_shopee_custom_link(str(payload["profileDir"]))
+    except backend.BrowserLaunchError as exc:
+        return 503, error_payload(
+            "browser_launch_failed",
+            reason=sanitize_error_message(exc),
+        )
 
     record = payload["record"]
     assert isinstance(record, dict)
@@ -399,19 +445,19 @@ def handle_shorten(query: Mapping[str, object],
     if status != 200:
         return status, payload
 
-    from .browser import BrowserLaunchError, shorten_shopee_link
+    backend = browser_backend_for(config)
 
     record = payload["record"]
     assert isinstance(record, dict)
     url = str(payload["url"])
     profile_dir = str(payload["profileDir"])
     try:
-        shorten_info = shorten_shopee_link(
+        shorten_info = backend.shorten_shopee_link(
             profile_dir,
             url,
             payload.get("subIds") or [],
         )
-    except BrowserLaunchError as exc:
+    except backend.BrowserLaunchError as exc:
         return 503, shorten_fail_closed_payload(
             record,
             profile_dir,
@@ -655,8 +701,8 @@ def main() -> None:
     config = load_config()
     httpd = make_server(config)
     print(
-        "%s listening on http://%s:%s"
-        % (APP_NAME, config.host, config.port),
+        "%s listening on http://%s:%s (backend=%s)"
+        % (APP_NAME, config.host, config.port, config.backend),
         flush=True,
     )
     try:
@@ -664,9 +710,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        from .browser import close_all
-
-        close_all()
+        browser_backend_for(config).close_all()
         httpd.server_close()
 
 

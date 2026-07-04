@@ -66,7 +66,83 @@ Environment overrides:
 | --- | --- |
 | `HOST` | `127.0.0.1` |
 | `PORT` | `8811` |
-| `PROFILE_ROOT` | `~/.affiliate-shortlink-cloak-python/profiles` |
+| `PROFILE_ROOT` | `~/.affiliate-shortlink-cloak-python/profiles` (CloakBrowser) / `~/.stealth-browser-mcp/profiles` (Stealth) |
+| `AFFILIATE_SHORTLINK_BROWSER_BACKEND` | *(unset)* → default CloakBrowser backend |
+
+## Stealth / nodriver backend (opt-in, test-only)
+
+A side-by-side **Stealth Browser (nodriver)** backend can be selected instead of
+the default CloakBrowser/Playwright backend. It is **fully opt-in**: if the
+backend env is not set, behavior on port `8811` is unchanged. It exists only to
+make the already-installed Stealth Browser profile usable for Shopee shortlink
+creation; it does **not** touch the production Node service on port `8810`.
+
+> **Test-only.** No LaunchAgent, no cloudflared tunnel, no auto-start, and no
+> production replacement. It binds `127.0.0.1:8811` like the default backend and
+> is intended for a single manual verification run, not a service.
+
+### What it does
+
+- `/login` opens a headed Stealth/nodriver Chrome at
+  `https://affiliate.shopee.co.th/offer/custom_link` using a **persistent
+  per-account profile directory** and leaves it open for **manual** login
+  (no autofill, no secrets).
+- `/shorten` reuses that same authenticated profile/tab and runs Shopee's
+  `batchCustomLink` GraphQL via an **in-page `fetch`** from
+  `affiliate.shopee.co.th` — no raw HTTP requests and no static anti-fraud
+  headers (the browser's own headers + cookie-derived CSRF are used).
+- Cookies, CSRF values, and tokens are never surfaced in any response. A session
+  parked on a Shopee login/captcha gate fails closed with
+  `manualLoginRequired` instead of re-hammering Shopee.
+
+### Backend env vars
+
+| Var | Purpose |
+| --- | --- |
+| `AFFILIATE_SHORTLINK_BROWSER_BACKEND` | Set to `stealth` (or `python-stealth-nodriver`) to select the Stealth backend. `BACKEND` is a legacy fallback for the same value. |
+| `PROFILE_ROOT` | Stealth profile root. Defaults to `~/.stealth-browser-mcp/profiles` **only** when the Stealth backend is selected. |
+| `AFFILIATE_STEALTH_ACCOUNT_PROFILE_MAP` | Maps a Shopee id / account alias to a flat profile directory **name** under the profile root, e.g. `15130770000=shopee-login-test`. Comma/semicolon/newline separated. |
+| `AFFILIATE_STEALTH_SITE_PACKAGES` | Optional. Absolute path to a `site-packages` dir that contains `nodriver`, injected onto `sys.path` at launch. Only needed if you run under a Python that does not already have `nodriver`. |
+| `AFFILIATE_STEALTH_HEADLESS` | Optional. `1`/`true` to run headless (default headed, so manual login works). |
+
+### Run (Stealth sidecar on 8811)
+
+`nodriver` lives in the Stealth Browser repo venv (Python 3.12), so the simplest
+command runs this sidecar under that venv's Python:
+
+```bash
+cd apps/affiliate-shortlink-cloak-python
+AFFILIATE_SHORTLINK_BROWSER_BACKEND=stealth \
+AFFILIATE_STEALTH_ACCOUNT_PROFILE_MAP='15130770000=shopee-login-test' \
+PYTHONPATH=src \
+/Users/yok-macmini/SupportRepos/stealth-browser-mcp/.venv/bin/python \
+  -m affiliate_shortlink_cloak_python.server
+```
+
+Then, for the id `15130770000` (chearb) test profile:
+
+```bash
+# Open the headed Stealth profile for manual login (leaves the browser open):
+curl 'http://127.0.0.1:8811/login?platform=shopee&id=15130770000'
+
+# Reuse the logged-in profile to create a real Shopee shortlink:
+curl 'http://127.0.0.1:8811/shorten?id=15130770000&url=https://shopee.co.th/product/1/2&sub1=TEST'
+```
+
+Alternatively, run under this app's own Python and point it at the Stealth
+`site-packages` so `nodriver` is importable:
+
+```bash
+cd apps/affiliate-shortlink-cloak-python
+AFFILIATE_SHORTLINK_BROWSER_BACKEND=stealth \
+AFFILIATE_STEALTH_ACCOUNT_PROFILE_MAP='15130770000=shopee-login-test' \
+AFFILIATE_STEALTH_SITE_PACKAGES='/Users/yok-macmini/SupportRepos/stealth-browser-mcp/.venv/lib/python3.12/site-packages' \
+PYTHONPATH=src python3 -m affiliate_shortlink_cloak_python.server
+```
+
+> ⚠️ **Warning:** This Stealth backend is a manual test path only. Do not add a
+> LaunchAgent, tunnel, or auto-start for it, and do not treat it as a replacement
+> for the production port `8810` service.
 
 ## Endpoints
 
