@@ -15,6 +15,60 @@ Side-by-side local Facebook token bridge for CloakBrowser + macOS Keychain.
 npm --prefix apps/facebook-token-cloak start
 ```
 
+## Browser backend selection (CloakBrowser vs Stealth) — opt-in
+
+By default the bridge uses the **CloakBrowser** backend (`browser.js`), and `GET /health`
+reports `"backend":"cloakbrowser"`. There is an **opt-in** alternative **Stealth Browser**
+backend (nodriver / Stealth Browser MCP, like the Shopee 8811 sidecar) that ATTACHES to an
+already-running, already-authenticated Chromium over its Chrome DevTools (CDP) endpoint using
+`playwright-core`'s `chromium.connectOverCDP`. Both backends feed the same
+`resolveSessionToken → graphFetch → /update-cta` code path, so token extraction and CTA edits
+behave identically and stay fail-closed (`token_not_found` / `no_session`).
+
+The Stealth path is selected **only** when an env var explicitly asks for it — otherwise the
+default is unchanged and the production `8820` LaunchAgent is untouched. It never launches a
+profile, autofills, submits a login, or drives a checkpoint/CAPTCHA; manual/visible login stays
+the operator's job inside the Stealth browser.
+
+Env vars (module `src/stealthBrowser.js`):
+
+| Env | Meaning |
+|-----|---------|
+| `FACEBOOK_TOKEN_CLOAK_BROWSER_BACKEND` | `stealth` (aliases: `nodriver`, `stealth-browser-mcp`, …) selects Stealth. Anything else / unset → `cloakbrowser`. |
+| `ACCOUNTS_BRIDGE_BROWSER_BACKEND` | Fallback selector, only used when the primary is empty. |
+| `FACEBOOK_TOKEN_CLOAK_STEALTH_CDP_URL` | Default CDP endpoint (e.g. `http://127.0.0.1:9222`) to attach to when no per-account mapping matches. |
+| `FACEBOOK_TOKEN_CLOAK_STEALTH_ACCOUNT_CDP_MAP` | Per-account `key=endpoint` map, comma-separated, e.g. `100090320823561=http://127.0.0.1:9222`. |
+
+Fail-closed codes when misconfigured/unreachable (never a fake success): `stealth_cdp_endpoint_missing`,
+`stealth_cdp_connect_failed`, `stealth_cdp_context_missing`, `stealth_playwright_missing`.
+
+### Side-by-side Stealth instance (does NOT disturb the 8820 LaunchAgent)
+
+Run a second local instance on a different port with the Stealth backend, pointed at the
+running Stealth browser's CDP endpoint. First start the Stealth Browser / nodriver Chromium
+with remote debugging (e.g. `--remote-debugging-port=9222`) and log in manually to the
+`ads_power_editor` account (`100090320823561`). Then:
+
+```sh
+PORT=8821 \
+FACEBOOK_TOKEN_CLOAK_BROWSER_BACKEND=stealth \
+FACEBOOK_TOKEN_CLOAK_STEALTH_ACCOUNT_CDP_MAP='100090320823561=http://127.0.0.1:9222' \
+npm --prefix apps/facebook-token-cloak start
+```
+
+Smoke it (8821 stays isolated from 8820):
+
+```sh
+curl http://127.0.0.1:8821/health                          # expect "backend":"stealth"
+curl 'http://127.0.0.1:8821/pages?account=100090320823561' # expect page 1008898512617594 in data[]
+curl -X POST http://127.0.0.1:8821/update-cta \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"100090320823561","page_id":"1008898512617594","story_id":"1008898512617594_1220849613553068","final_cta_link":"https://s.shopee.co.th/7prNYwcQ4p"}'
+```
+
+If the Stealth session is not logged in / has no user token, `/update-cta` fails closed with
+`{"ok":false,"step":"session","error":"no_session"}` (no token is ever leaked).
+
 ## Web console (UI)
 
 Once running, open the local console in a browser:

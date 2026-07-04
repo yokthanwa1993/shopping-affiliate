@@ -39,24 +39,63 @@ function toBangkokIso(epochSeconds) {
 // page. Fully self-contained (no closure refs) so it serializes for page.evaluate.
 function inPageTokenExtractor() {
   var out = { token: null, fbDtsgPresent: false, userId: null };
-  try { if (typeof window !== 'undefined' && window.__accessToken) out.token = String(window.__accessToken); } catch (e) {}
-  var html = '';
-  try { html = (typeof document !== 'undefined' && document.documentElement) ? document.documentElement.innerHTML : ''; } catch (e) {}
+  function takeToken(v) {
+    try {
+      var s = String(v || '').trim();
+      if (!out.token && /^EAA[A-Za-z0-9_-]{20,}$/.test(s)) out.token = s;
+    } catch (e) {}
+  }
+  try { if (typeof window !== 'undefined' && window.__accessToken) takeToken(window.__accessToken); } catch (e) {}
+  try { if (typeof window !== 'undefined' && window.accessToken) takeToken(window.accessToken); } catch (e) {}
   try {
     if (typeof require === 'function') {
       try { var d = require('DTSGInitData'); if (d && d.token) out.fbDtsgPresent = true; } catch (e) {}
+      try { var cu = require('CurrentUserInitialData'); if (cu && cu.USER_ID && String(cu.USER_ID) !== '0') out.userId = String(cu.USER_ID); } catch (e) {}
+      try { var si = require('SiteData'); if (si && si.access_token) takeToken(si.access_token); if (si && si.USER_ID && String(si.USER_ID) !== '0') out.userId = String(si.USER_ID); } catch (e) {}
+      try { var at = require('AdsMgmtAccessToken'); if (at && (at.accessToken || at.token)) takeToken(at.accessToken || at.token); } catch (e) {}
+      try { var gu = require('GraphURI'); if (gu && gu.accessToken) takeToken(gu.accessToken); } catch (e) {}
     }
   } catch (e) {}
   try {
+    if (typeof localStorage !== 'undefined') {
+      for (var i = 0; i < localStorage.length; i++) {
+        var v = localStorage.getItem(localStorage.key(i));
+        takeToken(v);
+        if (!out.token && v) {
+          var lm = String(v).match(/EAA[A-Za-z0-9_-]{20,}/);
+          if (lm) takeToken(lm[0]);
+        }
+      }
+    }
+  } catch (e) {}
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      for (var j = 0; j < sessionStorage.length; j++) {
+        var sv = sessionStorage.getItem(sessionStorage.key(j));
+        takeToken(sv);
+        if (!out.token && sv) {
+          var sm = String(sv).match(/EAA[A-Za-z0-9_-]{20,}/);
+          if (sm) takeToken(sm[0]);
+        }
+      }
+    }
+  } catch (e) {}
+  var html = '';
+  try { html = (typeof document !== 'undefined' && document.documentElement) ? document.documentElement.innerHTML : ''; } catch (e) {}
+  try {
     if (!out.token && html) {
-      var m = html.match(/"accessToken":"(EAA[^"]+)"/) || html.match(/__accessToken"?\s*[:=]\s*"(EAA[^"]+)"/);
-      if (m) out.token = m[1];
+      var m = html.match(/"accessToken"\s*:\s*"(EAA[^"]+)"/) ||
+        html.match(/"access_token"\s*:\s*"(EAA[^"]+)"/) ||
+        html.match(/__accessToken"?\s*[:=]\s*"(EAA[^"]+)"/) ||
+        html.match(/access_token=([^&"'<>\s]+)/) ||
+        html.match(/EAA[A-Za-z0-9_-]{20,}/);
+      if (m) takeToken(m[1] || m[0]);
     }
     if (!out.fbDtsgPresent && html) {
-      out.fbDtsgPresent = /DTSGInitData[\s\S]{0,80}"token":"[^"]+"/.test(html) || /name="fb_dtsg"\s+value="[^"]+"/.test(html);
+      out.fbDtsgPresent = /DTSGInitData[\s\S]{0,200}"token"\s*:\s*"[^"]+"/.test(html) || /name="fb_dtsg"\s+value="[^"]+"/.test(html);
     }
     if (!out.userId && html) {
-      var um = html.match(/"USER_ID":"(\d+)"/) || html.match(/"actorID":"(\d+)"/);
+      var um = html.match(/"USER_ID"\s*:\s*"(\d+)"/) || html.match(/"actorID"\s*:\s*"(\d+)"/) || html.match(/"userID"\s*:\s*"(\d+)"/);
       if (um && um[1] !== '0') out.userId = um[1];
     }
   } catch (e) {}
@@ -101,7 +140,10 @@ function makeBrowserGraphFetch(target) {
           json: async () => { try { return JSON.parse(text || '{}'); } catch { return {}; } }
         };
       } catch (e) {
-        return { ok: false, status: 0, json: async () => ({ error: { message: 'browser_graph_request_failed' } }) };
+        // Playwright APIRequestContext can intermittently fail against Meta's Ads Manager/Graph
+        // session even while the page itself is logged in. Fall through to the in-page fetch path
+        // before declaring browser_graph_request_failed, so a healthy operator-visible Ads Manager
+        // session can still create/copy ads.
       }
     }
 
@@ -167,9 +209,20 @@ async function resolveSessionToken({ browser, account, visible = false } = {}) {
     // inspection window. When none is open, this launches a fresh one-off context that closeSession closes.
     opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible, reuseIfPresent: true });
   } catch (e) {
-    // Preserve the sanitized blocker code (operator_visible_session_open / profile_already_open / browser_open_failed)
-    // so the route can surface it instead of collapsing every open failure into a bare no_session.
-    return { token: null, reason: (e && (e.code || e.message)) || 'browser_open_failed', reused: false, fbDtsgPresent: false, userId: null };
+    const code = (e && (e.code || e.message)) || 'browser_open_failed';
+    if (code === 'profile_already_open') {
+      try {
+        const profileDir = browser.profileDirFor ? browser.profileDirFor(account) : '';
+        if (profileDir && browser.clearStaleProfileSingletons) await browser.clearStaleProfileSingletons(profileDir);
+        opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible, reuseIfPresent: true });
+      } catch (retryError) {
+        return { token: null, reason: (retryError && (retryError.code || retryError.message)) || code, reused: false, fbDtsgPresent: false, userId: null };
+      }
+    } else {
+      // Preserve the sanitized blocker code (operator_visible_session_open / profile_already_open / browser_open_failed)
+      // so the route can surface it instead of collapsing every open failure into a bare no_session.
+      return { token: null, reason: code, reused: false, fbDtsgPresent: false, userId: null };
+    }
   }
 
   let currentUrl = '';

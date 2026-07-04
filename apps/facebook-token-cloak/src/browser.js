@@ -1,5 +1,6 @@
 'use strict';
 const path=require('path'); const os=require('os'); const crypto=require('crypto'); const {sanitizeAccount}=require('./accounts');
+const stealthBrowser=require('./stealthBrowser');
 
 const TWO_FACTOR_SELECTORS=[
   'input[name="approvals_code"]',
@@ -24,6 +25,9 @@ let _backendOverride=null;
 function setBrowserBackend(launcher,backend='mock'){ _backendOverride=launcher?{backend,launcher}:null; }
 async function loadBrowserBackend(){
   if(_backendOverride) return _backendOverride;
+  // OPT-IN Stealth Browser (nodriver / Stealth Browser MCP) backend, selected only when an env var
+  // explicitly asks for it. Default (unset/unknown) stays cloakbrowser so production 8820 is untouched.
+  if(stealthBrowser.isStealthBackendSelected(process.env)) return stealthBrowser.loadStealthBackend();
   let cloakModule;
   try{
     cloakModule=await import('cloakbrowser');
