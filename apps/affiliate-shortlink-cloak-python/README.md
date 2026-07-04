@@ -91,9 +91,22 @@ creation; it does **not** touch the production Node service on port `8810`.
   `batchCustomLink` GraphQL via an **in-page `fetch`** from
   `affiliate.shopee.co.th` — no raw HTTP requests and no static anti-fraud
   headers (the browser's own headers + cookie-derived CSRF are used).
+- The report routes (`/conversion-report`, `/daily-income-report` /
+  `/income-report`, `/click-report`) work under this backend too: each report
+  page GETs the Shopee report API via an **in-page `fetch` with
+  `credentials: 'include'`** from the already-open affiliate tab (the same
+  per-account Stealth profile the shortlink flow uses, resolved through the id/
+  account profile map). The affiliate tab is **not** re-navigated for every
+  report page — it navigates at most once, only to establish the affiliate
+  origin on a blank/off-affiliate tab.
 - Cookies, CSRF values, and tokens are never surfaced in any response. A session
-  parked on a Shopee login/captcha gate fails closed with
-  `manualLoginRequired` instead of re-hammering Shopee.
+  parked on a Shopee login/captcha gate (or any off-affiliate origin) fails
+  closed — shortlink with `manualLoginRequired`, reports with the sanitized
+  `manual_login_required` payload — instead of re-hammering Shopee. If the
+  Stealth Chrome is alive but has lost its usable tab (nodriver
+  `RuntimeError: coroutine raised StopIteration`), the sidecar relaunches the
+  browser once and otherwise returns a JSON error rather than dropping the HTTP
+  connection.
 
 ### Backend env vars
 
@@ -127,6 +140,11 @@ curl 'http://127.0.0.1:8811/login?platform=shopee&id=15130770000'
 
 # Reuse the logged-in profile to create a real Shopee shortlink:
 curl 'http://127.0.0.1:8811/shorten?id=15130770000&url=https://shopee.co.th/product/1/2&sub1=TEST'
+
+# Reports run against the same logged-in Stealth profile:
+curl 'http://127.0.0.1:8811/conversion-report?id=15130770000&time=today'
+curl 'http://127.0.0.1:8811/click-report?id=15130770000&time=today'
+curl 'http://127.0.0.1:8811/daily-income-report?id=15130770000&time=today'
 ```
 
 Alternatively, run under this app's own Python and point it at the Stealth

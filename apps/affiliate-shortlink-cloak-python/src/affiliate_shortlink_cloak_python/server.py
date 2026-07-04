@@ -23,7 +23,12 @@ from . import (
     SHOPEE_CUSTOM_LINK_URL,
     __version__,
 )
-from .accounts import list_accounts, profile_dir_for, resolve_account
+from .accounts import (
+    list_accounts,
+    profile_dir_for,
+    resolve_account,
+    resolve_by_account,
+)
 from .stealth_backend import (
     parse_profile_map,
     resolve_backend,
@@ -514,9 +519,34 @@ def shorten_fail_closed_payload(
 
 
 def make_report_fetcher(config: ServerConfig):
-    """Build a ``fetch(account, api_url)`` bound to the per-account Shopee
-    CloakBrowser profile. Imported lazily so the report modules stay
-    browser-free and unit-testable without CloakBrowser installed."""
+    """Build a ``fetch(account, api_url)`` bound to the per-account Shopee profile
+    for the ACTIVE backend.
+
+    - Default (CloakBrowser) backend: per-account Playwright persistent-context
+      profile under ``<root>/shopee/<account>``.
+    - Stealth/nodriver backend: the same flat per-account Stealth profile the
+      shortlink flow uses, resolved via the account->profile env map (so report
+      routes work under ``AFFILIATE_SHORTLINK_BROWSER_BACKEND=stealth`` instead
+      of failing with ``cloakbrowser_import_failed``).
+
+    The browser module is imported lazily inside ``fetch`` so the report modules
+    stay browser-free and unit-testable, and so selecting one backend never
+    imports the other's browser stack."""
+    if config.backend == BACKEND_STEALTH:
+        def fetch(account: str, api_url: str) -> Mapping[str, object]:
+            from . import stealth_backend
+
+            # The report handlers hand us the sanitized internal account name;
+            # resolve it back to the full record so the id-keyed profile map
+            # (e.g. ``15130770000=shopee-login-test``) still applies. Falls back
+            # to the account name as the profile name when unmapped/unknown.
+            record = resolve_by_account(account) or {"account": account}
+            profile_dir = stealth_profile_dir(
+                config.profile_root, record, config.stealth_profile_map
+            )
+            return stealth_backend.fetch_shopee_report_json(profile_dir, api_url)
+
+        return fetch
 
     def fetch(account: str, api_url: str) -> Mapping[str, object]:
         from .browser import fetch_shopee_report_json
