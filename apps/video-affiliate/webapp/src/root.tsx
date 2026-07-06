@@ -19,7 +19,7 @@ export const links: LinksFunction = () => ([
     href: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>",
   },
   { rel: 'preconnect', href: 'https://static.line-scdn.net', crossOrigin: 'anonymous' },
-  { rel: 'preconnect', href: 'https://api.pubilo.com', crossOrigin: 'anonymous' },
+  { rel: 'preconnect', href: 'https://api.oomnn.com', crossOrigin: 'anonymous' },
   { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
   { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossOrigin: 'anonymous' },
   {

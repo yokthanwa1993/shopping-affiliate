@@ -1,5 +1,5 @@
 const DEFAULT_WORKER_URL = 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev'
-const PUBLIC_API_URL = 'https://api.pubilo.com'
+const PUBLIC_API_URL = 'https://api.oomnn.com'
 
 const getCurrentHost = () =>
   typeof window !== 'undefined'
