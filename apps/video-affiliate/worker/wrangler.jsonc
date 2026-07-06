@@ -75,7 +75,7 @@
     // Environment variables
     "vars": {
         "CORS_ORIGIN": "*",
-        "WORKER_URL": "https://api.pubilo.com",
+        "WORKER_URL": "https://api.oomnn.com",
         "R2_PUBLIC_URL": "https://pub-14b6c1dd39f14ed7a219a84afc93c182.r2.dev",
         "GEMINI_MODEL": "gemini-3-flash-preview",
         "VERTEX_TTS_ENDPOINT": "https://aiplatform.googleapis.com",
