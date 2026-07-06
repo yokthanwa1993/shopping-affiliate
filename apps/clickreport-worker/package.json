@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare Worker proxy serving clickreport.wwoom.com -> customlink.wwoom.com/click-report. Sibling app; does not modify affiliate-shortlink-cloak.",
+  "description": "Cloudflare Worker proxy serving clickreport.wwoom.com -> the local Shopee zip runtime click-report contract.",
   "main": "src/index.js",
   "scripts": {
     "check": "node --check src/index.js",

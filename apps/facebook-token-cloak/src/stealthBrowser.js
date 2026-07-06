@@ -5,7 +5,7 @@
 // ONLY when an env var explicitly asks for it (see resolveBrowserBackend); otherwise the existing
 // CloakBrowser behavior is untouched and the production 8820 LaunchAgent is unaffected.
 //
-// Design (mirrors apps/affiliate-shortlink-cloak-python/.../stealth_backend.py, but this is Node):
+// Design note: this is Node-specific and independent from the retired Shopee shortlink Python sidecar.
 //   - The Stealth Browser (nodriver-launched Chromium) is an ALREADY-RUNNING, ALREADY-AUTHENTICATED
 //     process that exposes a Chrome DevTools (CDP) endpoint. We ATTACH to it with playwright-core's
 //     chromium.connectOverCDP and hand back its live BrowserContext/Page. That context/page is fully

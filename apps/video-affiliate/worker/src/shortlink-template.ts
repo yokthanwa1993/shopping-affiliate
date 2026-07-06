@@ -1,10 +1,10 @@
 export const MAX_SHORTLINK_URL_TEMPLATE_CHARS = 2048
 export const MAX_SHORTLINK_SUB_ID_CHARS = 128
 
-// Numeric customlink id for the admin CHEARB affiliate account. short.wwoom.com
-// now routes through the Cloak shortlink bridge, which rejects the legacy
-// account=CHEARB form (manual_login_required) but resolves a real shortLink for
-// the id= form. See apps/affiliate-shortlink-cloak.
+// Numeric Shopee customlink id for the admin CHEARB affiliate account. The local
+// source of truth is now the Python zip runtime on 127.0.0.1:8810
+// (`/Users/yok-macmini/SupportRepos/shopee-zip-shortener-runtime`), which
+// resolves id=15130770000 to the CHEARB affiliate profile.
 export const DEFAULT_SHOPEE_CUSTOMLINK_ID = '15130770000'
 
 // Default Shopee shortlink request template used when a page/namespace has not

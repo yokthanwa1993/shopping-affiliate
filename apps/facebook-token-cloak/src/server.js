@@ -839,7 +839,7 @@ function createHandler(deps = {}) {
           shopee: {
             managed: false,
             roles: {},
-            note: 'Shopee report/login is handled by the affiliate-shortlink-cloak bridge, not this Accounts Bridge.'
+            note: 'Shopee report/login is handled by the local Shopee zip runtime, not this Accounts Bridge.'
           },
           facebook: {
             accountsCount: accountList.length,

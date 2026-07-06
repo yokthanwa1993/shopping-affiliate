@@ -40,8 +40,9 @@ AI agents must not wait for the user to say “อ่าน AGENTS.md”, “que
 3. `apps/dashboard/`
    - Dashboard web UI แยกสำหรับงานจัดการ/monitoring
 
-4. `apps/affiliate-shortlink-cloak/`
-   - ระบบ Shopee/Lazada shortlink + report bridge ปัจจุบัน ใช้ CloakBrowser/Playwright บน port `8810`; legacy Electron `apps/affiliate-shortlink/` ถูกถอดออกแล้ว
+4. Shopee shortlink/report runtime
+   - ระบบ Shopee shortlink/report ปัจจุบันถูกย้ายออกจาก legacy app แล้ว ใช้ runtime ใหม่ที่ `/Users/yok-macmini/SupportRepos/shopee-zip-shortener-runtime` ผ่าน LaunchAgent `com.affiliate.shortlink-cloak` บน `127.0.0.1:8810`
+   - Runtime ใหม่ใช้ Python + bundled profile + headless page-context GraphQL fetch; legacy `apps/affiliate-shortlink-cloak/`, `apps/affiliate-shortlink-cloak-python/`, และ MCP Shopee profile ถูกลบออกจาก active path แล้ว
 
 5. `apps/cloak-fb-bridge/`
    - **non-Electron CloakBrowser Facebook posting bridge** ปัจจุบันสำหรับ organic Reels/Page comment (`/token`, `/pages`, `/post`, `/page-comment`) ผ่าน Worker env `CLOAK_FB_BRIDGE_URL`. ใช้ persistent logged-in CloakBrowser session (ไม่มี stored/manual page token), port `8830` (127.0.0.1) ออกผ่าน cloudflared tunnel

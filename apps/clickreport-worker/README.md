@@ -3,8 +3,8 @@
 Tiny Cloudflare Worker that exposes `clickreport.wwoom.com` as a clean,
 parameter-only URL surface on top of the real Shopee click-report bridge.
 
-**Source of truth (upstream):** the Cloak bridge in
-`apps/affiliate-shortlink-cloak/src/click-report.js`, currently reachable at:
+**Source of truth (upstream):** the local Shopee zip runtime on the Mac mini,
+`/Users/yok-macmini/SupportRepos/shopee-zip-shortener-runtime`, currently reachable at:
 
 ```
 https://customlink.wwoom.com/click-report?id=<affiliateId>&time=<DD/MM/YYYY>&page_size=<n>
@@ -35,9 +35,8 @@ Both `/` and `/<anything>` are accepted; the worker always forwards to
 | Secrets / cookies   | None. No tokens, no `Set-Cookie`, no HTML.                               |
 | Upstream failure    | `502` JSON `{ status: "error", error: "upstream_unreachable", ... }`.    |
 
-The worker also does not modify the existing
-`apps/affiliate-shortlink-cloak` server. The bridge there owns date parsing,
-affiliate-id validation, login detection, and the actual Shopee API call.
+The worker does not own Shopee login/session state. The local zip runtime owns
+date parsing, affiliate-id validation, login detection, and the actual Shopee API call.
 
 ## Local development
 
