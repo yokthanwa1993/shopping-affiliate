@@ -53,7 +53,7 @@ test('recognizeProxyTarget maps every income spelling to the daily-income upstre
 test('buildUpstreamUrl points every income alias at the daily-income-report route', () => {
     assert.equal(
         buildUpstreamUrl('income', '?ids=15130770000&time=today'),
-        'https://customlink.wwoom.com/daily-income-report?ids=15130770000&time=today',
+        'https://short.wwoom.com/daily-income-report?ids=15130770000&time=today',
     )
     // The upstream route name is never part of the public surface.
     assert.equal(recognizeProxyTarget('/daily-income-report'), null)
@@ -81,7 +81,7 @@ test('handleReportProxyRequest proxies GET /daily_income to the daily-income ups
     assert.equal(response!.status, 200)
     assert.equal(
         observedUrl,
-        'https://customlink.wwoom.com/daily-income-report?ids=15130770000&time=today',
+        'https://short.wwoom.com/daily-income-report?ids=15130770000&time=today',
     )
     assert.equal(observedHeaders['cookie'], undefined)
     assert.equal(observedHeaders['x-admin-token'], undefined)
@@ -116,29 +116,29 @@ test('recognizeProxyTarget rejects anything that is not an exact recognized path
     assert.equal(recognizeProxyTarget(undefined), null)
 })
 
-test('buildUpstreamUrl points click at the customlink click-report route', () => {
+test('buildUpstreamUrl points click at the short.wwoom.com click-report route', () => {
     assert.equal(
         buildUpstreamUrl('click', '?id=15130770000&time=25/05/2026'),
-        'https://customlink.wwoom.com/click-report?id=15130770000&time=25/05/2026',
+        'https://short.wwoom.com/click-report?id=15130770000&time=25/05/2026',
     )
     // A query string without a leading "?" is normalized the same way.
     assert.equal(
         buildUpstreamUrl('click', 'id=15130770000&time=25/05/2026'),
-        'https://customlink.wwoom.com/click-report?id=15130770000&time=25/05/2026',
+        'https://short.wwoom.com/click-report?id=15130770000&time=25/05/2026',
     )
 })
 
-test('buildUpstreamUrl points conversion at the customlink conversion-report route', () => {
+test('buildUpstreamUrl points conversion at the short.wwoom.com conversion-report route', () => {
     assert.equal(
         buildUpstreamUrl('conversion', '?id=15130770000&time=26/05/2026'),
-        'https://customlink.wwoom.com/conversion-report?id=15130770000&time=26/05/2026',
+        'https://short.wwoom.com/conversion-report?id=15130770000&time=26/05/2026',
     )
 })
 
-test('buildUpstreamUrl points custom_link at the customlink shortlink root', () => {
+test('buildUpstreamUrl points custom_link at the short.wwoom.com shortlink root', () => {
     assert.equal(
         buildUpstreamUrl('custom_link', '?url=https://shopee.co.th/product/1/2&sub_id=abc'),
-        'https://customlink.wwoom.com/?url=https://shopee.co.th/product/1/2&sub_id=abc',
+        'https://short.wwoom.com/?url=https://shopee.co.th/product/1/2&sub_id=abc',
     )
 })
 
@@ -148,22 +148,22 @@ test('buildUpstreamUrl resolves the /link alias to the same shortlink root', () 
     assert.equal(target, 'custom_link')
     assert.equal(
         buildUpstreamUrl(target!, 'url=https://s.lazada.co.th/s.abc'),
-        'https://customlink.wwoom.com/?url=https://s.lazada.co.th/s.abc',
+        'https://short.wwoom.com/?url=https://s.lazada.co.th/s.abc',
     )
 })
 
 test('buildUpstreamUrl handles empty / null / undefined query strings', () => {
     assert.equal(
         buildUpstreamUrl('click', ''),
-        'https://customlink.wwoom.com/click-report',
+        'https://short.wwoom.com/click-report',
     )
     assert.equal(
         buildUpstreamUrl('conversion', null),
-        'https://customlink.wwoom.com/conversion-report',
+        'https://short.wwoom.com/conversion-report',
     )
     assert.equal(
         buildUpstreamUrl('custom_link', undefined),
-        'https://customlink.wwoom.com/',
+        'https://short.wwoom.com/',
     )
 })
 
@@ -221,7 +221,7 @@ test('handleReportProxyRequest proxies canonical GET /click to the click-report 
     assert.equal(response!.status, 200)
     assert.equal(
         observedUrl,
-        'https://customlink.wwoom.com/click-report?id=15130770000&time=25/05/2026',
+        'https://short.wwoom.com/click-report?id=15130770000&time=25/05/2026',
     )
     // Cookies, admin and auth headers must never be forwarded upstream.
     assert.equal(observedHeaders['cookie'], undefined)
@@ -257,7 +257,7 @@ test('handleReportProxyRequest proxies the custom_link shortlink bridge to the u
     assert.equal(response!.status, 200)
     assert.equal(
         observedUrl,
-        'https://customlink.wwoom.com/?url=https://shopee.co.th/product/1/2',
+        'https://short.wwoom.com/?url=https://shopee.co.th/product/1/2',
     )
     assert.equal(observedHeaders['cookie'], undefined)
     assert.equal(observedHeaders['x-admin-token'], undefined)
@@ -288,7 +288,7 @@ test('handleReportProxyRequest still serves the legacy /click_report alias uncha
     assert.equal(response!.status, 200)
     assert.equal(
         observedUrl,
-        'https://customlink.wwoom.com/click-report?id=15130770000&time=25/05/2026',
+        'https://short.wwoom.com/click-report?id=15130770000&time=25/05/2026',
     )
     assert.equal(observedHeaders['cookie'], undefined)
     assert.equal(observedHeaders['x-admin-token'], undefined)
@@ -306,7 +306,7 @@ test('handleReportProxyRequest proxies HEAD without body and preserves status', 
     )
     assert.ok(response)
     assert.equal(response!.status, 200)
-    assert.equal(observedUrl, 'https://customlink.wwoom.com/conversion-report')
+    assert.equal(observedUrl, 'https://short.wwoom.com/conversion-report')
     const text = await response!.text()
     assert.equal(text, '')
 })

@@ -356,8 +356,8 @@ export function normalizeRegistryOffset(raw: unknown): number {
 // expansion, D1) and call into these helpers.
 // ---------------------------------------------------------------------------
 
-// customlink.wwoom.com short-link service. id is the CHEARB affiliate account id.
-export const CUSTOMLINK_HOST = 'customlink.wwoom.com'
+// short.wwoom.com short-link service. id is the CHEARB affiliate account id.
+export const CUSTOMLINK_HOST = 'short.wwoom.com'
 export const CUSTOMLINK_DEFAULT_ID = '15130770000'
 
 // Workflow safety defaults (requirement: small batch, dry-run + stop-on-error on
@@ -658,7 +658,7 @@ export type CustomlinkRequestInput = {
     account?: string
 }
 
-// Build the customlink.wwoom.com GET URL that mints the new shortlink. The
+// Build the short.wwoom.com GET URL that mints the new shortlink. The
 // service returns JSON `{ shortLink }`; the caller fetches this URL (a side
 // effect that creates a shortlink) only in real run mode.
 export function buildCustomlinkRequestUrl(input: CustomlinkRequestInput): string {

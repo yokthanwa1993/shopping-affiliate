@@ -10037,7 +10037,7 @@ async function expandShortlinkFinalUrl(url: string): Promise<{ state: 'ok' | 'fa
     }
 }
 
-// Mint the new shortlink via customlink.wwoom.com (GET → { shortLink }). Only
+// Mint the new shortlink via short.wwoom.com (GET → { shortLink }). Only
 // called in real write mode — it is the one external side effect of a run.
 async function mintCustomlinkShortlink(requestUrl: string): Promise<{ ok: boolean; shortLink: string; error: string }> {
     const url = String(requestUrl || '').trim()
@@ -11547,7 +11547,7 @@ async function buildPagePostLinkPlan(
 }
 
 // 2) PREVIEW — read-only against Facebook. Mints a planned shortlink via
-//    customlink.wwoom.com (a non-Facebook side effect) and reports the planned
+//    short.wwoom.com (a non-Facebook side effect) and reports the planned
 //    target subs + actions. Comment action is edit; CTA action is update.
 app.post('/api/dashboard/page-post-link-rewrite/preview', async (c) => {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
@@ -35095,6 +35095,13 @@ async function shortenShopeeLinkForNamespace(params: {
         }
     }
 
+    if (isUsableShopeeLink(originalLink)) {
+        // If the source is already a valid Shopee shortlink/product link, do not block
+        // posting just because the optional re-minting service is temporarily down.
+        // This keeps cron posting alive while preserving the original affiliate link.
+        writeTrace({ utmSource: extractShopeeUtmSourceFromLink(originalLink) || null, status: 'disabled', error: lastError })
+        return originalLink
+    }
     writeTrace({ utmSource: null, status: 'fallback', error: lastError })
     if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(lastError || 'admin_shopee_shortlink_failed')
     return originalLink

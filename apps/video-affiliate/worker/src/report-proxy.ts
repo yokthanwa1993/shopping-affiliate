@@ -1,21 +1,21 @@
 // Public proxy aliases on api.pubilo.com (and legacy api.oomnn.com during
-// cutover) for the Shopee/Lazada APIs hosted at customlink.wwoom.com.
+// cutover) for the Shopee/Lazada APIs hosted at short.wwoom.com.
 //
 // Canonical Pubilo aliases (current public contract):
-//   /click[/]        -> https://customlink.wwoom.com/click-report
-//   /conversion[/]   -> https://customlink.wwoom.com/conversion-report
-//   /income[/]       -> https://customlink.wwoom.com/daily-income-report  (Shopee dashboard/detail summary)
-//   /custom_link[/]  -> https://customlink.wwoom.com/   (Shopee/Lazada shortlink JSON bridge)
-//   /customlink[/]   -> https://customlink.wwoom.com/
-//   /link[/]         -> https://customlink.wwoom.com/
+//   /click[/]        -> https://short.wwoom.com/click-report
+//   /conversion[/]   -> https://short.wwoom.com/conversion-report
+//   /income[/]       -> https://short.wwoom.com/daily-income-report  (Shopee dashboard/detail summary)
+//   /custom_link[/]  -> https://short.wwoom.com/   (Shopee/Lazada shortlink JSON bridge)
+//   /customlink[/]   -> https://short.wwoom.com/
+//   /link[/]         -> https://short.wwoom.com/
 //
 // Income aliases (all collapse to the one daily-income-report upstream):
 //   /income[/]         /income_report[/]
 //   /daily_income[/]   /daily-income[/]
 //
 // Legacy aliases (kept working exactly as before, side by side):
-//   /click_report[/]       -> https://customlink.wwoom.com/click-report
-//   /conversion_report[/]  -> https://customlink.wwoom.com/conversion-report
+//   /click_report[/]       -> https://short.wwoom.com/click-report
+//   /conversion_report[/]  -> https://short.wwoom.com/conversion-report
 //
 // Query string is forwarded verbatim. No cookies/auth/admin tokens are passed
 // upstream so this surface stays a truly public alias.
@@ -24,7 +24,7 @@
 // map to the same target (e.g. /click and the legacy /click_report).
 export type ProxyTarget = 'click' | 'conversion' | 'income' | 'custom_link'
 
-const UPSTREAM_HOST = 'https://customlink.wwoom.com'
+const UPSTREAM_HOST = 'https://short.wwoom.com'
 
 const UPSTREAM_PATH: Record<ProxyTarget, string> = {
     click: '/click-report',

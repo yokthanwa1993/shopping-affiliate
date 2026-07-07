@@ -179,7 +179,7 @@ export function isPageOwnedComment(comment: FacebookPageCommentLite | null | und
 }
 
 // Affiliate links we attach to a post card: Shopee (shopee.co.th / s.shopee.co.th
-// / shp.ee) or the customlink.wwoom.com wrapper. Other shortlinks are ignored
+// / shp.ee) or the short.wwoom.com wrapper. Other shortlinks are ignored
 // here on purpose — this is the narrow set the dashboard surfaces.
 export function isPageCommentAffiliateUrl(url: string): boolean {
     return isShopeeLink(url) || isCustomlinkLink(url)
