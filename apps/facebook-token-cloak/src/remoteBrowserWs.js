@@ -61,7 +61,13 @@ class ServerWebSocket extends EventEmitter {
     socket.setNoDelay(true);
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('close', () => this._onClose());
-    socket.on('error', (err) => { this.emit('error', err); this._onClose(); });
+    socket.on('error', (err) => {
+      // A tunnel/browser disconnect can raise EPIPE/ECONNRESET. Emitting an
+      // unhandled EventEmitter 'error' would crash the whole bridge service;
+      // close this websocket instead and let the LaunchAgent/server continue.
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+      this._onClose();
+    });
   }
 
   send(data) {

@@ -91,7 +91,7 @@
         // 'post-reels-token-ads' page sources. Set to the active facebook-token-cloak
         // bridge tunnel; posting fails closed if this is empty or points to the retired
         // Electron video-onecard tunnel.
-        "CLOAK_FB_BRIDGE_URL": "https://short.wwoom.com",
+        "CLOAK_FB_BRIDGE_URL": "https://shopee.oomnn.com",
         "ADS_POST_FIRST_ENABLED": "1",
         // DEPRECATED — retired Electron video-onecard bridge (port 3847). Removed; kept
         // empty only so the deprecated fallback never targets the dead tunnel.
