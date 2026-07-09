@@ -45020,9 +45020,11 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     cloakCommentTokenHint = 'cloak_session_bridge'
                 } else {
                     // Re-shorten with the post id FIRST so the commented link carries
-                    // sub2=post id / sub3=page id, then comment as the Page via the bridge
-                    // (fails closed). Mirrors the stored→cloak branch.
-                    let commentShopeeLink = normalizedShopeeLink
+                    // sub2=post id / sub3=page id. Do NOT fall back to /opaanlp or raw Shopee
+                    // bridge links in the public comment; if final shortlink minting is down,
+                    // publish the Reel but mark the comment failed for a later safe retry.
+                    let commentShopeeLink = ''
+                    let commentShortlinkError = ''
                     try {
                         const commentSubIds = buildPostingCommentShortlinkSubIds({
                             canonicalPostId: confirmedCanonicalPostId,
@@ -45039,23 +45041,32 @@ app.post('/api/pages/:id/force-post', async (c) => {
                             logPrefix: 'FORCE-POST CLOAK COMMENT-SHORTLINK',
                             ...commentSubIds,
                         })
-                        if (reshortened) commentShopeeLink = reshortened
+                        if (isDirectShopeeShortlink(reshortened || '')) commentShopeeLink = String(reshortened || '').trim()
+                        else commentShortlinkError = 'final_shopee_shortlink_required'
                     } catch (reshortenErr) {
-                        console.log(`[FORCE-POST CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                        commentShortlinkError = reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)
+                        console.log(`[FORCE-POST CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; comment suppressed: ${commentShortlinkError}`)
                     }
-                    cloakCommentShopeeLink = commentShopeeLink
-                    const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
-                    const bridged = await sendPageCommentViaCloakBridge({
-                        env,
-                        pageId: String(page.id || ''),
-                        storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
-                        message: cloakOverrideText,
-                        logPrefix: 'FORCE-POST CLOAK-COMMENT',
-                    })
-                    cloakCommentStatus = bridged.status
-                    cloakCommentFbId = bridged.id
-                    cloakCommentError = bridged.error
-                    cloakCommentTokenHint = 'cloak_session_bridge'
+                    cloakCommentShopeeLink = commentShopeeLink || normalizedShopeeLink
+                    if (!commentShopeeLink) {
+                        cloakCommentStatus = 'failed'
+                        cloakCommentFbId = null
+                        cloakCommentError = `comment_shortlink_failed:${String(commentShortlinkError || 'final_shopee_shortlink_required').slice(0, 180)}`
+                        cloakCommentTokenHint = 'cloak_session_bridge'
+                    } else {
+                        const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+                        const bridged = await sendPageCommentViaCloakBridge({
+                            env,
+                            pageId: String(page.id || ''),
+                            storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
+                            message: cloakOverrideText,
+                            logPrefix: 'FORCE-POST CLOAK-COMMENT',
+                        })
+                        cloakCommentStatus = bridged.status
+                        cloakCommentFbId = bridged.id
+                        cloakCommentError = bridged.error
+                        cloakCommentTokenHint = 'cloak_session_bridge'
+                    }
                 }
             } else {
                 // comment_token_source='stored_token': defer to the pending backlog, which
@@ -47835,9 +47846,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         cloakCommentTokenHint = 'cloak_session_bridge'
                     } else {
                         // Re-shorten with the post id FIRST so the commented link carries
-                        // sub2=post id / sub3=page id, then comment as the Page via the bridge
-                        // (fails closed). Mirrors the stored→cloak branch below.
-                        let commentShopeeLink = normalizedShopeeLink
+                        // sub2=post id / sub3=page id. Do NOT fall back to /opaanlp or raw Shopee
+                        // bridge links in the public comment; if final shortlink minting is down,
+                        // publish the Reel but mark the comment failed for a later safe retry.
+                        let commentShopeeLink = ''
+                        let commentShortlinkError = ''
                         try {
                             const commentSubIds = buildPostingCommentShortlinkSubIds({
                                 canonicalPostId: confirmedCanonicalPostId,
@@ -47854,23 +47867,32 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                                 logPrefix: `CRON ${page.name} CLOAK COMMENT-SHORTLINK`,
                                 ...commentSubIds,
                             })
-                            if (reshortened) commentShopeeLink = reshortened
+                            if (isDirectShopeeShortlink(reshortened || '')) commentShopeeLink = String(reshortened || '').trim()
+                            else commentShortlinkError = 'final_shopee_shortlink_required'
                         } catch (reshortenErr) {
-                            console.log(`[CRON ${page.name} CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                            commentShortlinkError = reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)
+                            console.log(`[CRON ${page.name} CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; comment suppressed: ${commentShortlinkError}`)
                         }
-                        cloakCommentShopeeLink = commentShopeeLink
-                        const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
-                        const bridged = await sendPageCommentViaCloakBridge({
-                            env,
-                            pageId: String(page.id || ''),
-                            storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
-                            message: cloakOverrideText,
-                            logPrefix: `CRON CLOAK-COMMENT ${page.name}`,
-                        })
-                        cloakCommentStatus = bridged.status
-                        cloakCommentFbId = bridged.id
-                        cloakCommentError = bridged.error
-                        cloakCommentTokenHint = 'cloak_session_bridge'
+                        cloakCommentShopeeLink = commentShopeeLink || normalizedShopeeLink
+                        if (!commentShopeeLink) {
+                            cloakCommentStatus = 'failed'
+                            cloakCommentFbId = null
+                            cloakCommentError = `comment_shortlink_failed:${String(commentShortlinkError || 'final_shopee_shortlink_required').slice(0, 180)}`
+                            cloakCommentTokenHint = 'cloak_session_bridge'
+                        } else {
+                            const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+                            const bridged = await sendPageCommentViaCloakBridge({
+                                env,
+                                pageId: String(page.id || ''),
+                                storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
+                                message: cloakOverrideText,
+                                logPrefix: `CRON CLOAK-COMMENT ${page.name}`,
+                            })
+                            cloakCommentStatus = bridged.status
+                            cloakCommentFbId = bridged.id
+                            cloakCommentError = bridged.error
+                            cloakCommentTokenHint = 'cloak_session_bridge'
+                        }
                     }
                 } else {
                     // comment_token_source='stored_token': defer to the pending backlog
