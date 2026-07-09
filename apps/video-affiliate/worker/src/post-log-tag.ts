@@ -94,16 +94,11 @@ export function isPostLogTagStampingEnabledForNamespace(params: {
     if (!ns || ns === 'default') return false
 
     const raw = String(params.enabledNamespaces ?? '').trim()
-    if (raw) {
-        const tokens = raw.split(/[\s,]+/).map((t) => t.trim().toLowerCase()).filter(Boolean)
-        if (tokens.includes('*') || tokens.includes('all')) return true
-        if (tokens.includes(ns.toLowerCase())) return true
-        // An allowlist that doesn't name this ns still falls through to the admin check
-        // below, so the admin namespace never silently loses its own tag.
-    }
+    if (!raw) return false
 
-    const admin = String(params.adminNamespaceId ?? '').trim()
-    return !!admin && ns === admin
+    const tokens = raw.split(/[\s,]+/).map((t) => t.trim().toLowerCase()).filter(Boolean)
+    if (tokens.includes('*') || tokens.includes('all')) return true
+    return tokens.includes(ns.toLowerCase())
 }
 
 // Return the code of the FIRST lone `#code` line in the caption, or null. This is the

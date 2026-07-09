@@ -26069,9 +26069,9 @@ function readPostLogTagNamespaceAllowlist(env: Env): string {
 }
 
 // Whether this namespace should get the visible `#code` debug hashtag + a new
-// facebook_post_log_tags row on a fresh post. Admin-only by default; see
-// isPostLogTagStampingEnabledForNamespace. Best-effort — resolution failure disables it
-// (fail closed to a clean caption) rather than blocking the post.
+// facebook_post_log_tags row on a fresh post. Disabled by default; set
+// POST_LOG_TAG_NAMESPACES/POST_LOG_TAG_ENABLED_NAMESPACES to opt in. Best-effort —
+// resolution failure disables it (fail closed to a clean caption) rather than blocking the post.
 async function isVisiblePostLogTagEnabledForNamespace(env: Env, namespaceId: string): Promise<boolean> {
     const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
     return isPostLogTagStampingEnabledForNamespace({
@@ -44508,8 +44508,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // post) because they all derive their published caption from `caption`. Idempotent —
         // never doubles if the caption already carries a lone log-tag line. Best-effort: a
         // failure here leaves the caption untagged rather than blocking the post.
-        // Admin-only affordance: only the primary admin namespace gets the visible `#code`
-        // hashtag (and a facebook_post_log_tags row). Member/tenant pages publish clean.
+        // Visible post-log hashtags are opt-in only. By default every page publishes clean.
         const captionBeforeLog = caption
         const postLogTagEnabled = await isVisiblePostLogTagEnabledForNamespace(env, botId)
         if (postLogTagEnabled) {
@@ -46916,7 +46915,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const shortlinkEnabledByNamespace = new Map<string, boolean>()
     const galleryVideosByNamespace = new Map<string, Array<Record<string, unknown>>>()
     const reconciledNamespaces = new Set<string>()
-    // Visible post-log `#code` hashtag is admin-only. Resolve the primary admin namespace +
+    // Visible post-log `#code` hashtag is disabled by default. Resolve the primary admin namespace +
     // optional env allowlist ONCE for the whole cron run; decide per page below.
     const cronAdminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
     const cronPostLogTagAllowlist = readPostLogTagNamespaceAllowlist(env)
@@ -47375,8 +47374,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         // Stamp a unique log hashtag onto this visible page post's caption (see force-post
         // for rationale). Applies to every cron posting route. Best-effort — never blocks.
         const cronCaptionBeforeLog = caption
-        // Admin-only affordance: only the primary admin namespace gets the visible `#code`
-        // hashtag (and a facebook_post_log_tags row). Member/tenant pages publish clean.
+        // Visible post-log hashtags are opt-in only. By default every page publishes clean.
         const cronPostLogTagEnabled = isPostLogTagStampingEnabledForNamespace({
             namespaceId: botId,
             adminNamespaceId: cronAdminNamespaceId,

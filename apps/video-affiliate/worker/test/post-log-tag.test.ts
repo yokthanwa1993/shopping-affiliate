@@ -142,9 +142,9 @@ test('extractExistingPostLogCode matches a lone tag line or final inline log tok
 // Namespace gate — visible log hashtag is admin-only by default
 // ---------------------------------------------------------------------------------------
 
-test('isPostLogTagStampingEnabledForNamespace enables only primary admin namespace by default', () => {
+test('isPostLogTagStampingEnabledForNamespace is disabled by default, including admin namespace', () => {
     const admin = '1774858894802785816'
-    assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: admin, adminNamespaceId: admin }), true)
+    assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: admin, adminNamespaceId: admin }), false)
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: '1775187092060317951', adminNamespaceId: admin }), false)
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: 'default', adminNamespaceId: admin }), false)
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: '', adminNamespaceId: admin }), false)
@@ -157,19 +157,24 @@ test('isPostLogTagStampingEnabledForNamespace can widen via explicit allowlist o
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: member, adminNamespaceId: admin, enabledNamespaces: '1779705687536764750,1778261517757841035' }), false)
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: member, adminNamespaceId: admin, enabledNamespaces: '*' }), true)
     assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: member, adminNamespaceId: admin, enabledNamespaces: 'all' }), true)
-    // Admin remains enabled even if the optional allowlist omits it.
-    assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: admin, adminNamespaceId: admin, enabledNamespaces: member }), true)
+    // Admin is not special anymore; it must be explicitly listed too.
+    assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: admin, adminNamespaceId: admin, enabledNamespaces: member }), false)
+    assert.equal(isPostLogTagStampingEnabledForNamespace({ namespaceId: admin, adminNamespaceId: admin, enabledNamespaces: admin }), true)
 })
 
 // ---------------------------------------------------------------------------------------
-// Namespace gating — the visible `#code` hashtag is ADMIN-ONLY
+// Namespace gating — the visible `#code` hashtag is OPT-IN ONLY
 // ---------------------------------------------------------------------------------------
 
 const ADMIN_NS = '1774858894802785816' // primary admin namespace (page เฉียบ), from live evidence
 
-test('admin namespace gets the post log tag stamped', () => {
+test('admin namespace does not get the post log tag unless explicitly allowlisted', () => {
     assert.equal(
         isPostLogTagStampingEnabledForNamespace({ namespaceId: ADMIN_NS, adminNamespaceId: ADMIN_NS }),
+        false,
+    )
+    assert.equal(
+        isPostLogTagStampingEnabledForNamespace({ namespaceId: ADMIN_NS, adminNamespaceId: ADMIN_NS, enabledNamespaces: ADMIN_NS }),
         true,
     )
     // Namespace ids are Discord/snowflake-sized strings; unsafe JS numbers lose precision
@@ -219,14 +224,14 @@ test('env allowlist can widen stamping, but only by explicit opt-in', () => {
         }),
         false,
     )
-    // Admin still gets its tag even if the allowlist omits it.
+    // Admin is not special; it stays disabled if the allowlist omits it.
     assert.equal(
         isPostLogTagStampingEnabledForNamespace({
             namespaceId: ADMIN_NS,
             adminNamespaceId: ADMIN_NS,
             enabledNamespaces: '61550488976801',
         }),
-        true,
+        false,
     )
     // `*` / `all` is a deliberate global opt-in.
     assert.equal(
