@@ -198,6 +198,12 @@ export type Env = {
     VIDEO_ONECARD_WORKER_URL?: string
     BROWSERSAVING_WORKER_URL?: string
     BROWSERSAVING_API_URL?: string
+    // Public Shopee affiliate shortlink bridge (verified). When both are configured,
+    // admin Shopee posting mints/verifies its shortlinks through this POST JSON API
+    // (url + sub1/sub2/sub3 → verified direct s.shopee.co.th shortLink + utm_content)
+    // instead of the legacy GET customlink template. Token is a Worker secret.
+    SHOPEE_BRIDGE_API_URL?: string
+    SHOPEE_BRIDGE_API_TOKEN?: string
     TAG_SYNC_PUSH_SECRET?: string
     LINE_CHANNEL_SECRET?: string
     LINE_CHANNEL_ACCESS_TOKEN?: string

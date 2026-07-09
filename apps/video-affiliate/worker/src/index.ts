@@ -35036,6 +35036,50 @@ async function shortenShopeeLinkForNamespace(params: {
     const effectiveSub4 = hasPostSubId4Override ? overriddenSub4 : subIds.sub4
     const effectiveSub5 = hasPostSubId4Override ? '' : subIds.sub5
     const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2, sub3: effectiveSub3, sub4: effectiveSub4, sub5: effectiveSub5 }
+
+    // Verified public Shopee bridge API takes precedence over the legacy GET
+    // customlink template whenever both the URL and token are configured. It
+    // accepts a POST JSON body { url, sub1, sub2, sub3 } and returns a verified
+    // direct s.shopee.co.th shortLink plus a utm_content we can assert against.
+    //   sub1 = campaign / effectiveSub1
+    //   sub2 = Facebook page id      (postSubId2 override at comment time, else settings)
+    //   sub3 = Facebook post/reel tail (postSubId3 override at comment time, else settings)
+    // Sub4/Sub5 are not carried by the bridge; utm_content ends `--` (both empty).
+    const bridgeApiUrl = String(params.env.SHOPEE_BRIDGE_API_URL || '').trim()
+    const bridgeApiToken = String(params.env.SHOPEE_BRIDGE_API_TOKEN || '').trim()
+    if (bridgeApiUrl && bridgeApiToken) {
+        const bridgeRetryDelaysMs = [0, 500, 2000, 4000, 8000]
+        const bridgeMaxAttempts = bridgeRetryDelaysMs.length
+        let bridgeLastError: string | null = null
+        for (let attempt = 1; attempt <= bridgeMaxAttempts; attempt += 1) {
+            try {
+                const delayMs = bridgeRetryDelaysMs[attempt - 1]
+                if (delayMs > 0) await waitMs(delayMs)
+                const cleanedShortLink = await mintShopeeShortlinkViaBridge({
+                    apiUrl: bridgeApiUrl,
+                    apiToken: bridgeApiToken,
+                    originalLink,
+                    sub1: effectiveSub1,
+                    sub2: effectiveSub2,
+                    sub3: effectiveSub3,
+                })
+                writeTrace({ utmSource: extractShopeeUtmSourceFromLink(cleanedShortLink) || null, status: 'shortened', error: null })
+                if (attempt > 1) console.log(`[${params.logPrefix}] Shopee bridge shortlink succeeded on attempt ${attempt}/${bridgeMaxAttempts}`)
+                return cleanedShortLink
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e)
+                bridgeLastError = msg
+                console.log(`[${params.logPrefix}] Shopee bridge shortlink attempt ${attempt}/${bridgeMaxAttempts} failed: ${msg}`)
+                if (attempt >= bridgeMaxAttempts) break
+            }
+        }
+        // Fail closed: the bridge path must NEVER emit a raw Shopee/product/redirect
+        // link as a public fallback. Trace the error and block admin posting.
+        writeTrace({ utmSource: null, status: 'fallback', error: bridgeLastError })
+        if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(bridgeLastError || 'admin_shopee_bridge_shortlink_failed')
+        return ''
+    }
+
     const urlTemplate = shortlinkSettings.urlTemplate
 
     // Priority: 1) URL template from settings  2) baseUrl derived from account
@@ -35116,6 +35160,71 @@ async function shortenShopeeLinkForNamespace(params: {
     writeTrace({ utmSource: null, status: 'fallback', error: lastError })
     if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(lastError || 'admin_shopee_shortlink_failed')
     return originalLink
+}
+
+// Validate a verified public Shopee bridge response and throw (fail closed) on any
+// mismatch. Requirements: ok:true, affiliateVerified:true, a direct s.shopee.co.th
+// shortLink, and — when all three sub ids are present (comment-time calls) — a
+// utm_content that is EXACTLY `${sub1}-${sub2}-${sub3}--` (sub4/sub5 empty). Never
+// accept a raw /opaanlp/product/redirect link as a fallback.
+function assertShopeeBridgeResponse(
+    data: Record<string, unknown>,
+    subs: { sub1: string; sub2: string; sub3: string }
+): string {
+    if (!data || data.ok !== true) {
+        const reason = String((data && (data.error || data.code)) || 'unknown')
+        throw new Error(`shopee_bridge_not_ok:${reason}`)
+    }
+    if (data.affiliateVerified !== true && data.affiliate_verified !== true) {
+        throw new Error('shopee_bridge_affiliate_unverified')
+    }
+    const shortLink = String(data.shortLink || data.shortlink || data.short_link || '').trim()
+    if (!isDirectShopeeShortlink(shortLink)) {
+        throw new Error('shopee_bridge_not_direct_shortlink')
+    }
+    // Only assert utm_content when the full sub1/sub2/sub3 triple is present, i.e.
+    // comment-time re-mints. Pre-posting calls may leave sub2/sub3 blank.
+    if (subs.sub1 && subs.sub2 && subs.sub3) {
+        const expected = `${subs.sub1}-${subs.sub2}-${subs.sub3}--`
+        const actual = String(data.utmContent || data.utm_content || '').trim()
+        if (actual !== expected) {
+            throw new Error(`shopee_bridge_utm_mismatch:${actual || 'empty'}!=${expected}`)
+        }
+    }
+    return shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
+}
+
+// Mint a single verified Shopee shortlink through the public bridge API. Sends the
+// token as both `Authorization: Bearer` and `X-Bridge-Token`, and a browser-like
+// User-Agent because Cloudflare answered plain urllib requests with a 1010 challenge.
+async function mintShopeeShortlinkViaBridge(args: {
+    apiUrl: string
+    apiToken: string
+    originalLink: string
+    sub1: string
+    sub2: string
+    sub3: string
+}): Promise<string> {
+    const payload: Record<string, string> = { url: args.originalLink, sub1: args.sub1 }
+    if (args.sub2) payload.sub2 = args.sub2
+    if (args.sub3) payload.sub3 = args.sub3
+    const resp = await fetchWithTimeout(args.apiUrl, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'accept': 'application/json',
+            'authorization': `Bearer ${args.apiToken}`,
+            'x-bridge-token': args.apiToken,
+            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+        body: JSON.stringify(payload),
+    }, 30000, 'shopee_bridge_shortlink')
+    if (!resp.ok) {
+        const errText = await resp.text().catch(() => '')
+        throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
+    }
+    const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+    return assertShopeeBridgeResponse(data, { sub1: args.sub1, sub2: args.sub2, sub3: args.sub3 })
 }
 
 function isManagedShortlinkTransientFailure(error: unknown): boolean {
