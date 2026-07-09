@@ -785,7 +785,7 @@ test('resolveFollowLaneTemplateAdset prefers body, then setting, then the correc
 })
 
 test('resolveFollowLaneCampaignSub1 falls back to the operator-confirmed campaign code', () => {
-    assert.equal(FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT, '16JUN26FBSPCAD')
+    assert.equal(FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT, '1JUL26FBSPCAD')
     assert.equal(resolveFollowLaneCampaignSub1('CUSTOM'), 'CUSTOM')
     assert.equal(resolveFollowLaneCampaignSub1(''), FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT)
     assert.equal(resolveFollowLaneCampaignSub1(undefined), FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT)
@@ -800,7 +800,7 @@ test('Follow shortlink carries EXACTLY two subs: sub1=campaign, sub2=page id, NO
     })
     const u = new URL(url)
     // sub1 = campaign code, sub2 = page id — even though the default template has NO {sub_id2} slot.
-    assert.equal(u.searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(u.searchParams.get('sub1'), '1JUL26FBSPCAD')
     assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
     // NO sub3/sub4/sub5 — the page id is NEVER repeated into a third sub (the page-page-page bug).
     assert.equal(u.searchParams.has('sub3'), false)
@@ -810,7 +810,7 @@ test('Follow shortlink carries EXACTLY two subs: sub1=campaign, sub2=page id, NO
     assert.equal(u.searchParams.get('url'), FOLLOW_SHOPEE)
     // The page id appears in exactly ONE sub slot (sub2), proving utm_content can't be page-page-page.
     const subVals = ['sub1', 'sub2', 'sub3', 'sub4', 'sub5'].map((k) => u.searchParams.get(k)).filter(Boolean)
-    assert.deepEqual(subVals, ['16JUN26FBSPCAD', FOLLOW_PAGE_ID])
+    assert.deepEqual(subVals, ['1JUL26FBSPCAD', FOLLOW_PAGE_ID])
     assert.equal(subVals.filter((v) => v === FOLLOW_PAGE_ID).length, 1)
 })
 
@@ -832,7 +832,7 @@ test('Follow shortlink uses the default campaign sub1 when none supplied', () =>
     const url = buildFollowLaneShortlinkRequestUrl({
         template: DEFAULT_TEMPLATE, shopeeLink: FOLLOW_SHOPEE, campaignSub1: '', pageId: FOLLOW_PAGE_ID,
     })
-    assert.equal(new URL(url).searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(new URL(url).searchParams.get('sub1'), '1JUL26FBSPCAD')
 })
 
 test('Follow creative message leads with the pin line `📌 พิกัด : <shortlink>` then the caption', () => {
@@ -891,7 +891,7 @@ test('Follow COMMENT shortlink carries THREE subs: sub1=campaign, sub2=page id, 
     })
     const u = new URL(url)
     // The comment-tracking link is THREE-sub even though the default template only carries `sub1=`.
-    assert.equal(u.searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(u.searchParams.get('sub1'), '1JUL26FBSPCAD')
     assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
     assert.equal(u.searchParams.get('sub3'), '987654321')
     // Never a fourth/fifth sub.
@@ -921,7 +921,7 @@ test('Follow COMMENT shortlink defaults sub1 to the operator campaign code when 
     const url = buildFollowLaneCommentShortlinkRequestUrl({
         template: DEFAULT_TEMPLATE, shopeeLink: FOLLOW_SHOPEE, campaignSub1: '', pageId: FOLLOW_PAGE_ID, postTail: '55',
     })
-    assert.equal(new URL(url).searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(new URL(url).searchParams.get('sub1'), '1JUL26FBSPCAD')
 })
 
 test('Follow COMMENT message is the final shortlink then the exact two-line Page comment template', () => {
@@ -977,7 +977,7 @@ test('buildFollowAutoPickBody defaults to non-spending paused with lane=follow b
     assert.equal(body.page_id, FOLLOW_PAGE_ID)
     assert.equal(body.system_video_id, 'sys-1')
     assert.equal(body.template_adset, '120248767074180263')
-    assert.equal(body.follow_campaign_sub1, '16JUN26FBSPCAD')
+    assert.equal(body.follow_campaign_sub1, '1JUL26FBSPCAD')
     assert.equal(body.daily_campaign_name, '25/Jun/2026')
     // paused never spends → no budget/run-hours fields.
     assert.equal(body.daily_budget_thb, undefined)
@@ -1366,7 +1366,7 @@ test('buildFollowAutoPickBody fixed-adset mode targets existing campaign/adset a
         mode: 'active',
         dailyCampaignName: '27/Jun/2026',
         templateAdset: '120248767074180263',
-        campaignSub1: '16JUN26FBSPCAD',
+        campaignSub1: '1JUL26FBSPCAD',
         fixedCampaignId: '120248151339120263',
         fixedAdsetId: '120248982540070263',
     })

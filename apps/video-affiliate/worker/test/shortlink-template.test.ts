@@ -199,14 +199,14 @@ test('buildPostingCommentShortlinkSubIds accepts a bare post id for sub3', () =>
 test('cron CloakBridge re-mint produces the expected utm_content tail shape (CHEARB live bug)', () => {
     // Regression for the cron stored-token→CloakBridge comment path: it used to comment
     // the pre-publish shortlink, whose request carried blank sub2/sub3, resolving to
-    // utm_content=16JUN26FBSPCAD---- (no post/page tail). After the fix the branch first
+    // utm_content=1JUL26FBSPCAD---- (no post/page tail). After the fix the branch first
     // re-mints with buildPostingCommentShortlinkSubIds(confirmedCanonicalPostId, pageId),
     // so the minted request carries sub2=page id / sub3=post id and the resolved
     // utm_content becomes <prefix>-<pageId>-<postId>--.
     const pageId = '1008898512617594'
     const fbPostId = '1305950258376336'
     const storyId = `${pageId}_${fbPostId}`
-    const campaignPrefix = '16JUN26FBSPCAD'
+    const campaignPrefix = '1JUL26FBSPCAD'
 
     const subs = buildPostingCommentShortlinkSubIds({
         canonicalPostId: storyId,

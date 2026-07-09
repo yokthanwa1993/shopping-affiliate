@@ -15269,7 +15269,7 @@ async function runFollowLaneCreateAdOnly(
         })
     }
 
-    // Mint the TWO-sub Follow shortlink: sub1 = campaign id (default 16JUN26FBSPCAD), sub2 = page id,
+    // Mint the TWO-sub Follow shortlink: sub1 = campaign id (default 1JUL26FBSPCAD), sub2 = page id,
     // NO sub3. The builder forces sub1=/sub2= as real query params (the default template only carries
     // sub1=) and strips sub3=/sub4=/sub5=, so the page id can never land in a third sub.
     const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
@@ -35018,9 +35018,16 @@ async function shortenShopeeLinkForNamespace(params: {
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
     const shortlinkSettings = await resolveEffectiveShortlinkSettings(params.env.DB, params.namespaceId, params.pageId)
 
-    // Load sub IDs + URL template (per-page override when enabled, else namespace)
+    // Load sub IDs + URL template (per-page override when enabled, else namespace).
+    // Posting pages also have the older dashboard `sub_id` setting; let that
+    // per-page campaign code win over a stale namespace-level sub_id1 so live
+    // posting follows the operator-selected campaign without requiring a full
+    // authenticated namespace settings save.
     const subIds = shortlinkSettings.subIds
-    const effectiveSub1 = subIds.sub1 || deriveShortlinkSub1(params.namespaceId)
+    const pageCampaignSub1 = params.pageId
+        ? normalizeShortlinkSubId(String((await getPageSetting(params.env.DB, params.pageId, 'sub_id').catch(() => null))?.value || ''))
+        : ''
+    const effectiveSub1 = pageCampaignSub1 || subIds.sub1 || deriveShortlinkSub1(params.namespaceId)
     // Posting-time callers may inject the Facebook post id as Sub ID 2 so the
     // affiliate report can attribute clicks back to the visible page post. Fall
     // back to the configured sub_id2 when no override is supplied.

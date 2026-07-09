@@ -1096,7 +1096,7 @@ export const FOLLOW_LANE_TEMPLATE_ADSET = '120248767074180263'
 
 // Default Follow shortlink campaign sub1 (the operator-confirmed campaign code). The Follow shortlink
 // carries EXACTLY two sub ids: sub1 = this campaign code, sub2 = page id.
-export const FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT = '16JUN26FBSPCAD'
+export const FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT = '1JUL26FBSPCAD'
 
 // The creative CTA the Follow lane relies on (supplied by the template creative; sent as a hint and
 // echoed for audit). The bridge already attaches a LIKE_PAGE button when the template creative's CTA
@@ -1346,7 +1346,7 @@ export function buildFollowLaneCreativeMessage(input: { caption?: string; shortl
 // Build the Follow lane COMMENT shortlink REQUEST url. This is the FINAL, post-specific tracking link
 // that goes into the Page COMMENT posted on the actual dark/ad story AFTER its story id is known. It is
 // SEPARATE from the two-sub creative-message link: it carries EXACTLY three sub ids —
-//   sub1 = campaign id (default 16JUN26FBSPCAD), sub2 = page id, sub3 = post/story tail —
+//   sub1 = campaign id (default 1JUL26FBSPCAD), sub2 = page id, sub3 = post/story tail —
 // and sub4/sub5 are always emptied/deleted. Robust to ANY template (the default carries only `sub1=`,
 // so sub2/sub3 are enforced as real query params even when the template has no {sub_id2}/{sub_id3}
 // placeholder). An empty postTail simply drops sub3 (never repeats sub2). Pure: no network.
