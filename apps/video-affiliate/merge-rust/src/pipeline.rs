@@ -1851,6 +1851,15 @@ fn should_retry_vertex_with_strict(variant: GeminiUploadVariant, err: &str) -> b
                 || normalized.contains("inline")))
 }
 
+/// Guard line that separates the (spoken) transcript from the (non-spoken) style
+/// direction inside the single TTS user turn. Kept as a stable marker so leakage
+/// guards in tests can assert the structure.
+const TTS_STYLE_GUARD_MARKER: &str = "[กำกับสไตล์เสียงเท่านั้น ห้ามอ่านข้อความส่วนนี้ออกเสียง]";
+/// Explicit transcript delimiter. Only the text below this header is meant to be
+/// spoken; the header itself and everything above it is delivery direction.
+const TTS_TRANSCRIPT_HEADER: &str =
+    "บทพากย์ (อ่านออกเสียงเฉพาะข้อความใต้บรรทัดนี้ ห้ามอ่านหัวข้อหรือคำสั่งด้านบน):";
+
 fn build_tts_payload(
     script: &str,
     voice_name: Option<&str>,
@@ -1867,22 +1876,30 @@ fn build_tts_payload(
         .or_else(|| extract_style_from_legacy_template(tts_prompt_template))
         .unwrap_or_default();
     let script_only = script.trim().to_string();
-    let mut payload = json!({
-        "contents": [{"role": "user", "parts": [{"text": script_only}]}],
+    // Vertex Gemini TTS for AUDIO responseModalities rejects a separate
+    // `systemInstruction` field with a generic INVALID_ARGUMENT on this model,
+    // so the style direction is delivered inside the single user turn instead.
+    // The direction is placed first and fenced off by a guard marker and an
+    // explicit transcript header so the model treats it as delivery control and
+    // speaks only the transcript below the header (never the direction itself).
+    let spoken_text = if style_text.is_empty() {
+        script_only
+    } else {
+        format!(
+            "{style}\n{guard}\n\n{header}\n{script}",
+            style = style_text,
+            guard = TTS_STYLE_GUARD_MARKER,
+            header = TTS_TRANSCRIPT_HEADER,
+            script = script_only
+        )
+    };
+    json!({
+        "contents": [{"role": "user", "parts": [{"text": spoken_text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
         }
-    });
-    if !style_text.is_empty() {
-        payload["systemInstruction"] = json!({
-            "parts": [{"text": format!(
-                "นี่คือคำสั่งกำกับสไตล์เสียงเท่านั้น ห้ามอ่านออกเสียง ห้ามใส่คำสั่งนี้ในเสียงพากย์ ให้พูดเฉพาะข้อความบทพากย์จากผู้ใช้เท่านั้น\n{}",
-                style_text
-            )}]
-        });
-    }
-    payload
+    })
 }
 
 fn extract_tts_audio_b64(json: &Value) -> Option<String> {
@@ -1900,8 +1917,8 @@ fn extract_tts_audio_b64(json: &Value) -> Option<String> {
 async fn vertex_gemini_tts(
     script: &str,
     voice_name: Option<&str>,
-    _tts_prompt_template: Option<&str>,
-    _tts_style_instructions: Option<&str>,
+    tts_prompt_template: Option<&str>,
+    tts_style_instructions: Option<&str>,
     request_project_id: Option<&str>,
     request_location: Option<&str>,
     request_model: Option<&str>,
@@ -1965,10 +1982,17 @@ async fn vertex_gemini_tts(
         "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
         endpoint, project_id, location, model
     );
-    // Vertex Gemini TTS currently rejects systemInstruction for AUDIO generation with
-    // a generic INVALID_ARGUMENT on some models. Keep the spoken payload script-only
-    // to prevent prompt leakage and keep production processing unblocked.
-    let payload = build_tts_payload(script, voice_name, None, None);
+    // Vertex Gemini TTS rejects a separate `systemInstruction` for AUDIO generation
+    // with a generic INVALID_ARGUMENT on this model. `build_tts_payload` therefore
+    // folds the style direction into the single user turn behind a guarded
+    // transcript delimiter (no `systemInstruction` emitted), so the delivery style
+    // reaches the model without leaking into the spoken transcript.
+    let payload = build_tts_payload(
+        script,
+        voice_name,
+        tts_prompt_template,
+        tts_style_instructions,
+    );
     let mut last_err = String::new();
     for attempt in 0..3 {
         println!(
@@ -2511,21 +2535,77 @@ mod tests {
     }
 
     #[test]
-    fn tts_payload_keeps_voice_direction_out_of_spoken_text() {
+    fn tts_payload_delivers_style_in_user_turn_without_system_instruction() {
         let payload = build_tts_payload(
             "พูดประโยคนี้เท่านั้น",
             Some("Kore"),
-            Some("พูดแบบสดใส\n\nบทพากย์:\n{{script}}"),
             None,
+            Some("พูดแบบสดใส เป็นกันเอง"),
+        );
+        // Vertex TTS rejects systemInstruction for AUDIO, so it must never be emitted.
+        assert!(payload.get("systemInstruction").is_none());
+        // Voice selection stays whatever was supplied.
+        assert_eq!(
+            payload["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"]
+                .as_str()
+                .unwrap(),
+            "Kore"
         );
         let spoken = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
-        assert_eq!(spoken, "พูดประโยคนี้เท่านั้น");
-        assert!(!spoken.contains("พูดแบบสดใส"));
+        // Style direction reaches the request...
+        assert!(spoken.contains("พูดแบบสดใส เป็นกันเอง"));
+        // ...fenced off from the transcript by the guard marker + explicit header...
+        assert!(spoken.contains(super::TTS_STYLE_GUARD_MARKER));
+        assert!(spoken.contains(super::TTS_TRANSCRIPT_HEADER));
+        // ...and the transcript stays verbatim, positioned strictly after the delimiter.
+        assert!(spoken.contains("พูดประโยคนี้เท่านั้น"));
+        let header_at = spoken.find(super::TTS_TRANSCRIPT_HEADER).unwrap();
+        let script_at = spoken.find("พูดประโยคนี้เท่านั้น").unwrap();
         assert!(
-            payload["systemInstruction"]["parts"][0]["text"]
+            script_at > header_at,
+            "transcript must appear after the transcript header delimiter"
+        );
+        // Style direction must sit above the transcript delimiter, never after it.
+        let style_at = spoken.find("พูดแบบสดใส เป็นกันเอง").unwrap();
+        assert!(style_at < header_at);
+    }
+
+    #[test]
+    fn tts_payload_reads_style_from_legacy_template_and_keeps_transcript_clean() {
+        let payload = build_tts_payload(
+            "อ่านเฉพาะบรรทัดนี้",
+            Some("Kore"),
+            Some("พูดแบบอบอุ่น\n\nบทพากย์:\n{{script}}"),
+            None,
+        );
+        assert!(payload.get("systemInstruction").is_none());
+        let spoken = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert!(spoken.contains("พูดแบบอบอุ่น"));
+        assert!(spoken.contains(super::TTS_TRANSCRIPT_HEADER));
+        // The transcript payload verbatim, delimited from the legacy style header.
+        assert!(spoken.ends_with("อ่านเฉพาะบรรทัดนี้"));
+    }
+
+    #[test]
+    fn tts_payload_without_style_stays_script_only() {
+        let payload = build_tts_payload("บทพากย์ล้วน ๆ", Some("Kore"), None, None);
+        assert!(payload.get("systemInstruction").is_none());
+        let spoken = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(spoken, "บทพากย์ล้วน ๆ");
+        assert!(!spoken.contains(super::TTS_TRANSCRIPT_HEADER));
+        assert!(!spoken.contains(super::TTS_STYLE_GUARD_MARKER));
+    }
+
+    #[test]
+    fn tts_payload_defaults_voice_when_absent() {
+        let payload = build_tts_payload("ทดสอบ", None, None, None);
+        assert_eq!(
+            payload["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"]
                 .as_str()
-                .unwrap()
-                .contains("พูดแบบสดใส")
+                .unwrap(),
+            "Puck"
         );
     }
 
@@ -3240,6 +3320,14 @@ fn convert_to_ass(srt: &str, vw: u32, vh: u32) -> String {
         ));
     }
     header + &events
+}
+
+fn pipeline_fonts_dir() -> String {
+    std::env::var("PIPELINE_FONTS_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/local/share/fonts".to_string())
 }
 
 // ==================== FFmpeg & Timing Core ====================
@@ -3974,8 +4062,9 @@ async fn rust_pipeline(
 
         // Step 2: Burn subtitles — re-encode video with libass, copy audio
         let vf = format!(
-            "ass={}:fontsdir=/usr/local/share/fonts",
-            ass_path.to_str().unwrap()
+            "ass={}:fontsdir={}",
+            ass_path.to_str().unwrap(),
+            pipeline_fonts_dir()
         );
         let mut burn_cmd = Command::new("ffmpeg");
         burn_cmd.kill_on_drop(true);
