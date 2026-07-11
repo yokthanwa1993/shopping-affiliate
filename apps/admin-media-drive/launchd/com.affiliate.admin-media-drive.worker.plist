@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.affiliate.admin-media-drive.worker</string>
+  <!-- Processing worker: polls queued jobs (one active job at a time),
+       enforces the fail-closed subtitle gate, and uploads verified output to
+       the processed Discord channel. The local merge-rust service is owned by
+       com.affiliate.admin-media-drive.merge-rust; the worker only spawns it as
+       a per-job fallback when that local service is down (empty or loopback
+       MERGE_RUST_URL). Secrets live only in the app's .env;
+       GOOGLE_APPLICATION_CREDENTIALS there must be a file PATH, never
+       embedded credential JSON. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec /Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive/scripts/launchd-run.sh worker</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/worker.err.log</string>
+</dict>
+</plist>

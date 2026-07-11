@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.affiliate.admin-media-drive.merge-rust</string>
+  <!-- Supervisor for the locally owned merge-rust pipeline service (loopback
+       MERGE_RUST_URL or the default 127.0.0.1:MERGE_RUST_PORT). Starts it at
+       boot so /api/processor/health is green and the worker never pays a
+       cargo start at job time; the worker keeps a per-job spawn fallback.
+       KeepAlive/SuccessfulExit=false: exits 0 (and stays stopped) when
+       MERGE_RUST_URL points at an external non-loopback service; any crash
+       exits 1 and launchd restarts it. Secrets live only in the app's .env
+       (dotenv); GOOGLE_APPLICATION_CREDENTIALS there must be a file PATH,
+       never embedded credential JSON. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec /Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive/scripts/launchd-run.sh merge-rust</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/merge-rust.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/merge-rust.err.log</string>
+</dict>
+</plist>

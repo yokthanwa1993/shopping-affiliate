@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.affiliate.admin-media-drive.api</string>
+  <!-- Loopback HTTP API on 127.0.0.1:3100. Secrets live only in the app's
+       .env (dotenv); GOOGLE_APPLICATION_CREDENTIALS there must be a file
+       PATH, never embedded credential JSON. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec /Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive/scripts/launchd-run.sh api</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/admin-media-drive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/admin-media-drive/api.err.log</string>
+</dict>
+</plist>

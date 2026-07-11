@@ -57,24 +57,31 @@ class FakeDiscord {
 }
 
 class FakeProcessor {
+  constructor() {
+    this.inputMode = 'url';
+    this.calls = [];
+  }
+
   async health() {
     return {
-      ffmpeg: { bin: 'ffmpeg', present: true, version: 'ffmpeg fake' },
-      ffprobe: { bin: 'ffprobe', present: true, version: 'ffprobe fake' },
-      encoder: {
-        preference: 'auto',
-        selected: 'libx264',
-        reason: 'fake',
-        h264VideotoolboxAvailable: false,
-        libx264Available: true,
+      mode: 'merge_rust',
+      mergeRust: {
+        ok: true,
+        status: 'ok',
+        pipeline_engine_version: 'test',
       },
+      queueProcessor: 'video-affiliate/merge-rust',
+      model: 'gemini-3-flash-preview',
+      vertexTtsModel: 'gemini-3.1-flash-tts-preview',
+      voiceName: 'Puck',
     };
   }
 
-  async processVideo({ outputPath }) {
+  async processVideo({ sourceUrl, outputPath }) {
+    this.calls.push({ sourceUrl, outputPath });
     await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
-    await fs.promises.writeFile(outputPath, Buffer.from('processed mp4'));
-    return { outputPath, encoder: 'libx264' };
+    await fs.promises.writeFile(outputPath, Buffer.from('processed by merge-rust'));
+    return { outputPath, pipeline: 'merge_rust' };
   }
 }
 
@@ -244,12 +251,15 @@ function buildServer({ cfgOverrides = {}, discord = new FakeDiscord() } = {}) {
     ...cfgOverrides,
   };
   const db = openDb(tempPath('injected.sqlite'));
+  const downloadCalls = [];
+  const fakeProcessor = new FakeProcessor();
   const { app } = createApp({
     cfg,
     discord,
     db,
-    processor: new FakeProcessor(),
-    downloadFile: async (_url, fullPath) => {
+    processor: fakeProcessor,
+    downloadFile: async (url, fullPath) => {
+      downloadCalls.push({ url, fullPath });
       await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
       await fs.promises.writeFile(fullPath, Buffer.from('source mp4'));
       return { path: fullPath, bytes: 10, skipped: false };
@@ -262,6 +272,8 @@ function buildServer({ cfgOverrides = {}, discord = new FakeDiscord() } = {}) {
     mediaRoot,
     db,
     discord,
+    processor: fakeProcessor,
+    downloadCalls,
     cfg,
   };
 }
@@ -332,17 +344,16 @@ test('discord mode: upload indexes metadata only, no permanent local file', asyn
     server.close();
   }
 });
-
-test('processor health reports local ffmpeg state, queue counts, and output-channel config', async () => {
+test('processor health reports merge-rust state, queue counts, and output-channel config', async () => {
   const { api, server } = await buildServer();
   try {
     const res = await api('/api/processor/health');
     const data = await res.json();
     assert.equal(res.status, 200);
     assert.equal(data.ok, true);
-    assert.equal(data.ffmpeg.present, true);
-    assert.equal(data.ffprobe.present, true);
-    assert.equal(data.encoder.selected, 'libx264');
+    assert.equal(data.mode, 'merge_rust');
+    assert.equal(data.mergeRust.ok, true);
+    assert.equal(data.vertexTtsModel, 'gemini-3.1-flash-tts-preview');
     assert.equal(data.counts, undefined, 'processor health stays concise');
     assert.equal(data.queue.queued, 0);
     assert.equal(data.processedChannelConfigured, true);
@@ -407,7 +418,7 @@ test('processor jobs can enqueue from a media item id and list recent jobs', asy
 
 test('processor run uploads processed mp4 to processed channel and indexes output metadata', async () => {
   const discord = new FakeDiscord();
-  const { api, server, db, mediaRoot } = await buildServer({
+  const { api, server, db, mediaRoot, processor, downloadCalls } = await buildServer({
     discord,
     cfgOverrides: {
       discord: {
@@ -444,6 +455,8 @@ test('processor run uploads processed mp4 to processed channel and indexes outpu
     assert.equal(discord.uploads.length, 1);
     assert.equal(discord.uploads[0].channelId, 'processed-channel');
     assert.equal(discord.uploads[0].mimetype, 'video/mp4');
+    assert.equal(downloadCalls.length, 0, 'merge-rust mode passes source URL directly');
+    assert.equal(processor.calls[0].sourceUrl, 'https://cdn.example/fresh/video1');
 
     const output = db.getById(data.job.output_media_item_id);
     assert.equal(output.content_type, 'video/mp4');
@@ -457,7 +470,7 @@ test('processor run uploads processed mp4 to processed channel and indexes outpu
   }
 });
 
-test('processor health reports binaries, encoder, queue counts, and channel config', async () => {
+test('processor health reports merge-rust queue counts and channel config', async () => {
   const { api, server } = await buildServer({
     cfgOverrides: {
       discord: {
@@ -474,9 +487,8 @@ test('processor health reports binaries, encoder, queue counts, and channel conf
     const data = await res.json();
     assert.equal(res.status, 200);
     assert.equal(data.ok, true);
-    assert.equal(data.ffmpeg.present, true);
-    assert.equal(data.ffprobe.present, true);
-    assert.equal(data.encoder.selected, 'libx264');
+    assert.equal(data.mode, 'merge_rust');
+    assert.equal(data.queueProcessor, 'video-affiliate/merge-rust');
     assert.equal(data.processedChannelConfigured, true);
     assert.equal(data.queue.queued, 0);
   } finally {
@@ -485,7 +497,7 @@ test('processor health reports binaries, encoder, queue counts, and channel conf
 });
 
 test('processor API enqueues and runs a video job through processed Discord upload', async () => {
-  const { api, server, mediaRoot, db, discord } = await buildServer({
+  const { api, server, mediaRoot, db, discord, processor, downloadCalls } = await buildServer({
     cfgOverrides: {
       discord: {
         botToken: 'x',
@@ -528,6 +540,8 @@ test('processor API enqueues and runs a video job through processed Discord uplo
     assert.equal(discord.uploads.length, 1);
     assert.equal(discord.uploads[0].channelId, 'c2');
     assert.equal(discord.uploads[0].mimetype, 'video/mp4');
+    assert.equal(downloadCalls.length, 0, 'merge-rust mode does not pre-download source');
+    assert.equal(processor.calls[0].sourceUrl, 'https://cdn.example/fresh/video-att1');
 
     const output = db.getById(runData.job.output_media_item_id);
     assert.equal(output.status, 'processed_discord_indexed');

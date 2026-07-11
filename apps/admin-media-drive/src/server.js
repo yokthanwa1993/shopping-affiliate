@@ -9,7 +9,8 @@ import multer from 'multer';
 import config, { defaultIndexStatus } from './config.js';
 import { openDb } from './db.js';
 import { DiscordService, isMediaUpload } from './discord.js';
-import { NativeFfmpegProcessor } from './processor.js';
+import { createProcessor } from './processor-factory.js';
+import { createSubtitleGate } from './subtitle-gate.js';
 import {
   ProcessingError,
   ProcessingService,
@@ -35,6 +36,7 @@ export function createApp({
   db,
   processor,
   processingService,
+  subtitleGate,
   downloadFile,
 } = {}) {
   const app = express();
@@ -45,12 +47,14 @@ export function createApp({
 
   const svc = discord || new DiscordService(cfg.discord);
   const index = db || openDb(cfg.dbPath);
-  const nativeProcessor = processor || new NativeFfmpegProcessor(cfg.processor);
+  const nativeProcessor = processor || createProcessor(cfg);
+  const gate = subtitleGate === undefined ? createSubtitleGate(cfg) : subtitleGate;
   const processorSvc = processingService || new ProcessingService({
     cfg,
     db: index,
     discord: svc,
     processor: nativeProcessor,
+    subtitleGate: gate,
     downloadFile,
   });
 
@@ -438,10 +442,42 @@ export function createApp({
         processedChannelConfigured: processedChannelConfigured(cfg),
         processedChannelId: cfg.discord.processedChannelId || null,
         defaultChannelId: cfg.discord.defaultChannelId || null,
+        sourceChannelConfigured: Boolean(cfg.discord.sourceChannelId),
+        subtitleGate: await processorSvc.gateHealth(),
         ...health,
       });
     } catch (error) {
       res.status(500).json({ error: error?.message || 'processor_health_failed' });
+    }
+  });
+
+  // --- Idempotent local-video submission (used by the MCP server) ----------
+  // Uploads a local video to the configured SOURCE channel, indexes it with
+  // its sha256, and enqueues exactly one processing job per distinct file.
+  app.post('/api/processor/submissions', (req, res, next) => {
+    upload.single('file')(req, res, (error) => {
+      if (!error) return next();
+      if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          error: 'submission_too_large',
+          maxUploadBytes: cfg.maxUploadBytes,
+        });
+      }
+      return res.status(400).json({ error: error?.message || 'invalid_submission' });
+    });
+  }, async (req, res) => {
+    if (!requireBot(res)) return;
+    try {
+      if (!req.file) return res.status(400).json({ error: 'submission_file_required' });
+      const rawKey = String(req.body?.idempotencyKey || '').trim();
+      const result = await processorSvc.submitVideo({
+        buffer: req.file.buffer,
+        filename: req.file.originalname,
+        idempotencyKey: rawKey || null,
+      });
+      return res.status(result.deduplicated ? 200 : 201).json(result);
+    } catch (error) {
+      return sendProcessingError(res, error);
     }
   });
 
@@ -477,6 +513,39 @@ export function createApp({
       });
     } catch (error) {
       res.status(500).json({ error: error?.message || 'processor_jobs_list_failed' });
+    }
+  });
+
+  // Single-job detail: raw row + output media item + parsed verification.
+  app.get('/api/processor/jobs/:id', (req, res) => {
+    try {
+      const job = index.getProcessingJob(req.params.id);
+      if (!job || job.namespace_id !== cfg.namespaceId) {
+        return res.status(404).json({ error: 'processing_job_not_found' });
+      }
+      let verification = null;
+      try {
+        verification = job.subtitle_verification_json
+          ? JSON.parse(job.subtitle_verification_json)
+          : null;
+      } catch {
+        verification = null;
+      }
+      const output = job.output_media_item_id ? index.getById(job.output_media_item_id) : null;
+      return res.json({ job, output, verification });
+    } catch (error) {
+      return res.status(500).json({ error: error?.message || 'processor_job_get_failed' });
+    }
+  });
+
+  // Deterministic re-verification of a processed job's Discord output.
+  app.post('/api/processor/jobs/:id/verify', async (req, res) => {
+    if (!requireBot(res)) return;
+    try {
+      const result = await processorSvc.reverifyJob(req.params.id);
+      res.json(result);
+    } catch (error) {
+      sendProcessingError(res, error);
     }
   });
 

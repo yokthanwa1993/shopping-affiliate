@@ -47,7 +47,7 @@ test('selectVideoEncoder uses libx264 when forced or hardware is unavailable', a
   assert.equal(unavailable.reason, 'videotoolbox_unavailable');
 });
 
-test('buildFfmpegArgs normalizes to MP4 H.264/AAC faststart without crop', () => {
+test('legacy ffmpeg fallback normalizes to MP4 H.264/AAC faststart without crop', () => {
   const args = buildFfmpegArgs({
     inputPath: '/tmp/in.mov',
     outputPath: '/tmp/out.mp4',
@@ -57,8 +57,8 @@ test('buildFfmpegArgs normalizes to MP4 H.264/AAC faststart without crop', () =>
   assert.deepEqual(args.slice(0, 4), ['-hide_banner', '-y', '-i', '/tmp/in.mov']);
   assert.ok(args.includes('-map'));
   assert.ok(args.includes('0:a:0?'), 'optional audio map keeps silent videos valid');
-  assert.ok(args.includes('-sn'), 'subtitles are dropped for MVP');
-  assert.ok(args.includes('-dn'), 'data streams are dropped for MVP');
+  assert.ok(args.includes('-sn'), 'legacy ffmpeg fallback drops existing subtitle streams');
+  assert.ok(args.includes('-dn'), 'legacy ffmpeg fallback drops data streams');
   assert.equal(args[args.indexOf('-vf') + 1], SCALE_FILTER);
   assert.equal(args[args.indexOf('-c:v') + 1], 'libx264');
   assert.equal(args[args.indexOf('-c:a') + 1], 'aac');
@@ -69,7 +69,7 @@ test('buildFfmpegArgs normalizes to MP4 H.264/AAC faststart without crop', () =>
   assert.equal(args.at(-1), '/tmp/out.mp4');
 });
 
-test('buildFfmpegArgs uses VideoToolbox-safe bitrate flags for hardware encode', () => {
+test('legacy ffmpeg fallback uses VideoToolbox-safe bitrate flags for hardware encode', () => {
   const args = buildFfmpegArgs({
     inputPath: '/tmp/in.mov',
     outputPath: '/tmp/out.mp4',

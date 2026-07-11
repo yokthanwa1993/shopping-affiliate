@@ -178,6 +178,7 @@ export class NativeFfmpegProcessor {
     this.videoEncoder = videoEncoder;
     this.execFileImpl = execFileImpl;
     this.platform = platform;
+    this.inputMode = 'file';
   }
 
   async health() {

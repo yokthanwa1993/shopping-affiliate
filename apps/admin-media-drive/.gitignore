@@ -6,6 +6,9 @@
 # dependencies
 node_modules/
 
+# managed Python venv for the subtitle gate (scripts/setup-python-venv.sh)
+.venv/
+
 # local media mirror / sqlite (in case someone points MEDIA_ROOT/DB_PATH inside the app dir)
 data/
 *.sqlite

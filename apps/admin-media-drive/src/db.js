@@ -67,17 +67,53 @@ export function openDb(dbPath) {
       ON processing_jobs (namespace_id, status, id);
     CREATE INDEX IF NOT EXISTS idx_processing_jobs_created
       ON processing_jobs (namespace_id, created_at DESC, id DESC);
+
+    CREATE TABLE IF NOT EXISTS media_submissions (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      namespace_id   TEXT NOT NULL DEFAULT 'admin',
+      idempotency_key TEXT,
+      source_sha256  TEXT NOT NULL,
+      media_item_id  INTEGER,
+      job_id         INTEGER,
+      original_name  TEXT,
+      size           INTEGER,
+      created_at     TEXT,
+      updated_at     TEXT,
+      UNIQUE (namespace_id, idempotency_key),
+      UNIQUE (namespace_id, source_sha256),
+      FOREIGN KEY (media_item_id) REFERENCES media_items(id) ON DELETE SET NULL,
+      FOREIGN KEY (job_id) REFERENCES processing_jobs(id) ON DELETE SET NULL
+    );
+  `);
+
+  // Additive migrations for databases created before these columns existed.
+  // SQLite has no ADD COLUMN IF NOT EXISTS, so guard with pragma table_info.
+  function ensureColumn(table, column, ddl) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name);
+    if (!cols.includes(column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
+  }
+  ensureColumn('media_items', 'source_sha256', 'source_sha256 TEXT');
+  ensureColumn('processing_jobs', 'error_category', 'error_category TEXT');
+  ensureColumn('processing_jobs', 'subtitles_required', 'subtitles_required INTEGER');
+  ensureColumn('processing_jobs', 'subtitles_verified', 'subtitles_verified INTEGER');
+  ensureColumn('processing_jobs', 'audio_changed', 'audio_changed INTEGER');
+  ensureColumn('processing_jobs', 'subtitle_verification_json', 'subtitle_verification_json TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_media_items_sha
+      ON media_items (namespace_id, source_sha256);
   `);
 
   const upsertStmt = db.prepare(`
     INSERT INTO media_items (
       namespace_id, channel_id, message_id, attachment_id,
       filename, content_type, size, local_path, discord_url, jump_url,
-      status, created_at, updated_at
+      status, source_sha256, created_at, updated_at
     ) VALUES (
       @namespace_id, @channel_id, @message_id, @attachment_id,
       @filename, @content_type, @size, @local_path, @discord_url, @jump_url,
-      @status, @created_at, @updated_at
+      @status, @source_sha256, @created_at, @updated_at
     )
     ON CONFLICT (namespace_id, attachment_id) DO UPDATE SET
       channel_id   = excluded.channel_id,
@@ -90,6 +126,8 @@ export function openDb(dbPath) {
       discord_url  = excluded.discord_url,
       jump_url     = excluded.jump_url,
       status       = excluded.status,
+      -- keep an existing content hash if the new row does not carry one
+      source_sha256 = COALESCE(excluded.source_sha256, media_items.source_sha256),
       created_at   = COALESCE(media_items.created_at, excluded.created_at),
       updated_at   = excluded.updated_at
     RETURNING *
@@ -138,11 +176,12 @@ export function openDb(dbPath) {
       input_path = @input_path,
       output_path = @output_path,
       error = NULL,
+      error_category = NULL,
       attempts = attempts + 1,
       started_at = COALESCE(started_at, @now),
       finished_at = NULL,
       updated_at = @now
-    WHERE id = @id
+    WHERE id = @id AND status IN ('queued', 'failed')
     RETURNING *
   `);
   const updateJobStepStmt = db.prepare(`
@@ -174,6 +213,7 @@ export function openDb(dbPath) {
       status = 'failed',
       step = @step,
       error = @error,
+      error_category = @error_category,
       finished_at = @now,
       updated_at = @now
     WHERE id = @id
@@ -184,10 +224,68 @@ export function openDb(dbPath) {
       status = 'queued',
       step = 'queued',
       error = NULL,
+      error_category = NULL,
       started_at = NULL,
       finished_at = NULL,
       updated_at = @now
     WHERE id = @id AND status = 'failed'
+    RETURNING *
+  `);
+  const verificationJobStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      subtitles_required = @subtitles_required,
+      subtitles_verified = @subtitles_verified,
+      audio_changed = @audio_changed,
+      subtitle_verification_json = @subtitle_verification_json,
+      updated_at = @now
+    WHERE id = @id
+    RETURNING *
+  `);
+  const staleJobsStmt = db.prepare(`
+    UPDATE processing_jobs SET
+      status = 'queued',
+      step = 'requeued_stale',
+      updated_at = @now
+    WHERE namespace_id = @namespace_id
+      AND status = 'processing'
+      AND updated_at < @cutoff
+    RETURNING id
+  `);
+  const latestJobForItemStmt = db.prepare(`
+    SELECT * FROM processing_jobs
+    WHERE namespace_id = ? AND source_media_item_id = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `);
+  const mediaItemByShaStmt = db.prepare(`
+    SELECT * FROM media_items
+    WHERE namespace_id = ? AND source_sha256 = ?
+    ORDER BY id ASC
+    LIMIT 1
+  `);
+  const submissionByKeyStmt = db.prepare(`
+    SELECT * FROM media_submissions
+    WHERE namespace_id = ? AND idempotency_key = ?
+  `);
+  const submissionByShaStmt = db.prepare(`
+    SELECT * FROM media_submissions
+    WHERE namespace_id = ? AND source_sha256 = ?
+  `);
+  const createSubmissionStmt = db.prepare(`
+    INSERT INTO media_submissions (
+      namespace_id, idempotency_key, source_sha256, media_item_id, job_id,
+      original_name, size, created_at, updated_at
+    ) VALUES (
+      @namespace_id, @idempotency_key, @source_sha256, @media_item_id, @job_id,
+      @original_name, @size, @created_at, @updated_at
+    )
+    RETURNING *
+  `);
+  const updateSubmissionJobStmt = db.prepare(`
+    UPDATE media_submissions SET
+      job_id = @job_id,
+      updated_at = @now
+    WHERE id = @id
     RETURNING *
   `);
 
@@ -212,9 +310,14 @@ export function openDb(dbPath) {
         discord_url: row.discord_url ?? null,
         jump_url: row.jump_url ?? null,
         status: row.status ?? 'indexed',
+        source_sha256: row.source_sha256 ?? null,
         created_at: row.created_at ?? now,
         updated_at: now,
       });
+    },
+
+    getBySourceSha256(namespaceId, sourceSha256) {
+      return mediaItemByShaStmt.get(namespaceId, sourceSha256);
     },
 
     getById(id) {
@@ -375,11 +478,17 @@ export function openDb(dbPath) {
       });
     },
 
-    markProcessingJobFailed(id, { step = 'failed', error }) {
+    markProcessingJobFailed(id, { step = 'failed', error, errorCategory = null }) {
+      const message = String(error || 'processing_failed').slice(0, 2000);
+      // A category must stay machine-readable; fall back to the message when
+      // it already looks like a sanitized snake_case category.
+      const category = errorCategory
+        || (/^[a-z0-9_]{1,64}$/.test(message) ? message : 'processing_failed');
       return failJobStmt.get({
         id: Number(id),
         step,
-        error: String(error || 'processing_failed').slice(0, 2000),
+        error: message,
+        error_category: category,
         now: nowIso(),
       });
     },
@@ -387,6 +496,78 @@ export function openDb(dbPath) {
     retryProcessingJob(id) {
       return retryJobStmt.get({
         id: Number(id),
+        now: nowIso(),
+      });
+    },
+
+    updateProcessingJobVerification(id, {
+      subtitlesRequired = null,
+      subtitlesVerified = null,
+      audioChanged = null,
+      verificationJson = null,
+    } = {}) {
+      const asFlag = (v) => (v === null || v === undefined ? null : (v ? 1 : 0));
+      return verificationJobStmt.get({
+        id: Number(id),
+        subtitles_required: asFlag(subtitlesRequired),
+        subtitles_verified: asFlag(subtitlesVerified),
+        audio_changed: asFlag(audioChanged),
+        subtitle_verification_json: verificationJson,
+        now: nowIso(),
+      });
+    },
+
+    // Re-queue jobs stuck in 'processing' (e.g. a crashed worker). Returns the
+    // number of recovered rows. `olderThanMs` guards against re-queuing a job
+    // that is still legitimately running in another process.
+    recoverStaleProcessingJobs(namespaceId, { olderThanMs = 2 * 60 * 60_000 } = {}) {
+      const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+      return staleJobsStmt.all({
+        namespace_id: namespaceId,
+        cutoff,
+        now: nowIso(),
+      }).length;
+    },
+
+    getLatestProcessingJobForMediaItem(namespaceId, mediaItemId) {
+      return latestJobForItemStmt.get(namespaceId, Number(mediaItemId));
+    },
+
+    findSubmissionByKey(namespaceId, idempotencyKey) {
+      return submissionByKeyStmt.get(namespaceId, idempotencyKey);
+    },
+
+    findSubmissionBySha(namespaceId, sourceSha256) {
+      return submissionByShaStmt.get(namespaceId, sourceSha256);
+    },
+
+    createSubmission({
+      namespaceId,
+      idempotencyKey = null,
+      sourceSha256,
+      mediaItemId = null,
+      jobId = null,
+      originalName = null,
+      size = null,
+    }) {
+      const now = nowIso();
+      return createSubmissionStmt.get({
+        namespace_id: namespaceId,
+        idempotency_key: idempotencyKey,
+        source_sha256: sourceSha256,
+        media_item_id: mediaItemId,
+        job_id: jobId,
+        original_name: originalName,
+        size,
+        created_at: now,
+        updated_at: now,
+      });
+    },
+
+    updateSubmissionJob(id, jobId) {
+      return updateSubmissionJobStmt.get({
+        id: Number(id),
+        job_id: jobId === null || jobId === undefined ? null : Number(jobId),
         now: nowIso(),
       });
     },
