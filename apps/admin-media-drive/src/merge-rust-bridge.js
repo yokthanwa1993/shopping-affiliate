@@ -5,6 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 
 import { ensureDir, fsp } from './storage.js';
+import { VertexCredentialsError, loadVertexServiceAccount } from './vertex-credentials.js';
 import {
   DEFAULT_TTS_PROMPT_TEMPLATE,
   DEFAULT_TTS_STYLE_INSTRUCTIONS,
@@ -19,6 +20,19 @@ const MAX_CALLBACK_BODY_BYTES = 512 * 1024 * 1024;
 
 function trimTrailingSlash(value) {
   return String(value || '').trim().replace(/\/+$/, '');
+}
+
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1', '[::1]'];
+
+/** True when `value` is a URL whose host is loopback. */
+export function isLoopbackUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || ''));
+  } catch {
+    return false;
+  }
+  return LOOPBACK_HOSTS.includes(parsed.hostname.toLowerCase());
 }
 
 function jsonResponse(res, statusCode, body) {
@@ -415,7 +429,7 @@ export class MergeRustProcessManager {
       return { local: false };
     }
     const host = parsed.hostname.toLowerCase();
-    if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(host)) {
+    if (!LOOPBACK_HOSTS.includes(host)) {
       return { local: false };
     }
     // A loopback URL without an explicit port falls back to MERGE_RUST_PORT;
@@ -641,14 +655,15 @@ export class MergeRustPipelineProcessor {
     callbackUrl,
     videoId,
     botId,
+    vertexCredentials = null,
   }) {
-    return {
+    const payload = {
       token,
       video_url: sourceUrl,
       chat_id: 0,
       model: this.cfg.geminiModel || 'gemini-3-flash-preview',
       vertex_tts_endpoint: this.cfg.vertexTtsEndpoint || 'https://aiplatform.googleapis.com',
-      vertex_tts_project_id: this.cfg.vertexTtsProjectId || undefined,
+      vertex_tts_project_id: this.cfg.vertexTtsProjectId || vertexCredentials?.projectId || undefined,
       vertex_tts_location: this.cfg.vertexTtsLocation || 'global',
       vertex_tts_model: this.cfg.vertexTtsModel || 'gemini-3.1-flash-tts-preview',
       script_prompt: this.cfg.scriptPrompt || DEFAULT_VOICE_SCRIPT_PROMPT,
@@ -660,6 +675,30 @@ export class MergeRustPipelineProcessor {
       video_id: videoId,
       bot_id: botId,
     };
+    // Attached only for a loopback target (resolveVertexCredentials): the
+    // credential travels solely inside this request body.
+    if (vertexCredentials?.serviceAccountJson) {
+      payload.vertex_tts_service_account_json = vertexCredentials.serviceAccountJson;
+    }
+    return payload;
+  }
+
+  // The service-account JSON is read lazily per job — only at dispatch time in
+  // the process that runs the job — and only for a loopback merge-rust target:
+  // the credential must never be sent to a non-loopback service, which
+  // authenticates from its own environment instead. Operators may also give
+  // merge-rust the credential directly via VERTEX_TTS_SERVICE_ACCOUNT_JSON in
+  // the shared environment; the worker never reads that value, it only skips
+  // injection when no file path is configured so that setup keeps working.
+  async resolveVertexCredentials(mergeRustUrl) {
+    if (!isLoopbackUrl(mergeRustUrl)) return null;
+    const credentialsPath = String(this.cfg.vertexTtsCredentialsPath || '').trim();
+    if (!credentialsPath && this.cfg.vertexTtsServiceAccountEnvSet) return null;
+    const credentials = await loadVertexServiceAccount(credentialsPath);
+    if (!String(this.cfg.vertexTtsProjectId || '').trim() && !credentials.projectId) {
+      throw new VertexCredentialsError('vertex_credentials_missing_project_id');
+    }
+    return credentials;
   }
 
   async processVideo({
@@ -684,12 +723,14 @@ export class MergeRustPipelineProcessor {
 
     try {
       const mergeRustUrl = await this.processManager.ensureStarted();
+      const vertexCredentials = await this.resolveVertexCredentials(mergeRustUrl);
       const payload = this.buildPipelinePayload({
         token,
         sourceUrl,
         callbackUrl: callback.url,
         videoId,
         botId,
+        vertexCredentials,
       });
       const resp = await fetchWithTimeout(this.fetchImpl, `${mergeRustUrl}/pipeline`, {
         method: 'POST',

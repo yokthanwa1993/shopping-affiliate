@@ -106,6 +106,15 @@ export const config = {
     finalUploadMaxBytes: num(process.env.PROCESSOR_FINAL_UPLOAD_MAX_BYTES, num(process.env.MAX_UPLOAD_BYTES, 10 * 1024 * 1024)),
     geminiModel: str(process.env.PROCESSOR_GEMINI_MODEL || process.env.GEMINI_MODEL, 'gemini-3-flash-preview'),
     vertexTtsEndpoint: str(process.env.VERTEX_TTS_ENDPOINT, 'https://aiplatform.googleapis.com'),
+    // Path only — never credential JSON. The worker reads the file lazily per
+    // job to inject vertex_tts_service_account_json into the loopback
+    // merge-rust /pipeline request (src/vertex-credentials.js).
+    vertexTtsCredentialsPath: str(process.env.GOOGLE_APPLICATION_CREDENTIALS, ''),
+    // Presence flag only (the value is never read into config): when
+    // merge-rust gets its credential from VERTEX_TTS_SERVICE_ACCOUNT_JSON in
+    // the shared environment and no file path is set, the worker skips
+    // injection instead of failing closed.
+    vertexTtsServiceAccountEnvSet: Boolean(str(process.env.VERTEX_TTS_SERVICE_ACCOUNT_JSON, '')),
     vertexTtsProjectId: str(process.env.VERTEX_TTS_PROJECT_ID, ''),
     vertexTtsLocation: str(process.env.VERTEX_TTS_LOCATION, 'global'),
     vertexTtsModel: str(process.env.VERTEX_TTS_MODEL, 'gemini-3.1-flash-tts-preview'),
