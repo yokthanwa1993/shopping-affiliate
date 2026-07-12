@@ -1,0 +1,12 @@
+# ฐานข้อมูลจริงอยู่นอก repo (Application Support) — กันเผลอ commit ถ้ามีในนี้
+*.db
+*.db-journal
+# ไฟล์วิดีโอ/output ไม่เข้า git (อยู่ Discord)
+*.mp4
+*.mov
+videos_*/
+# ผลลัพธ์ดึงข้อมูล
+posts_*.json
+links_*.json
+all_pages_ranked.*
+__pycache__/
