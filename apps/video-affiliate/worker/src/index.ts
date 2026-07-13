@@ -45109,6 +45109,11 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 pageId: String(page.id || ''),
                 videoUrl: postingVideoUrl,
                 message: publishDescription,
+                // Page-configured bridge profile (pages.posting_profile_uid). Without it the
+                // bridge selects its DEFAULT (Facebook Lite) session, whose /pages does not
+                // administer a Power-Editor-only page (e.g. CHEARB 1008898512617594) →
+                // session_bridge_page_not_authorized. Blank → bridge default, unchanged.
+                account: configuredPostingProfileUid,
                 websiteUrl: cloakOneCardWebsiteUrl,
                 cta: pageOneCardCta,
                 commentText: '',
@@ -45176,6 +45181,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                             pageId: String(page.id || ''),
                             storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
                             message: cloakOverrideText,
+                            // Same page-configured bridge profile as the publish above
+                            // (blank → bridge default session).
+                            account: configuredPostingProfileUid,
                             logPrefix: 'FORCE-POST CLOAK-COMMENT',
                         })
                         cloakCommentStatus = bridged.status
@@ -47939,6 +47947,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     pageId: String(page.id || ''),
                     videoUrl: postingVideoUrl,
                     message: publishDescription,
+                    // Page-configured bridge profile (pages.posting_profile_uid) — mirror of
+                    // the force-post cloak branch: the bridge default (Facebook Lite) session
+                    // does not administer a Power-Editor-only page → page_not_authorized.
+                    account: configuredPostingProfileUid,
                     websiteUrl: cloakOneCardWebsiteUrl,
                     cta: pageOneCardCta,
                     commentText: '',
@@ -48002,6 +48014,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                                 pageId: String(page.id || ''),
                                 storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
                                 message: cloakOverrideText,
+                                // Same page-configured bridge profile as the publish above
+                                // (blank → bridge default session).
+                                account: configuredPostingProfileUid,
                                 logPrefix: `CRON CLOAK-COMMENT ${page.name}`,
                             })
                             cloakCommentStatus = bridged.status

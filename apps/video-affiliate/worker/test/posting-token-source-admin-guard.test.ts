@@ -200,3 +200,84 @@ test('wiring: retry-failed-comments route is authenticated, namespace-scoped, dr
     assert.ok(/comment_status='pending', comment_error=NULL/.test(region), 'write mode must re-queue to pending and clear the error')
     assert.ok(/processPendingCommentBacklog\(c\.env\)/.test(region), 'write mode must run the backlog once for immediate repair')
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cloak bridge account threading (pages.posting_profile_uid).
+// Regression: CHEARB (1008898512617594) is cloak_browser-configured with
+// posting_profile_uid=100090320823561 (Power Editor). The bridge's DEFAULT
+// session is the Facebook Lite account, whose /pages does NOT administer that
+// page, so force-post/cron failed `session_bridge_page_not_authorized` because
+// the explicit cloak publish/comment calls omitted `account`. The configured
+// uid must be threaded into BOTH the publish and the page-comment bridge calls
+// at BOTH trigger sites. A blank posting_profile_uid keeps the default session
+// (sanitizePostingProfileUid returns '' → the helpers add no ?account=).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Slice one bridge call: logPrefix is the LAST property at every call site, so the
+// text between the nearest call opener and the logPrefix marker holds all its params.
+function bridgeCallParams(src: string, opener: string, logPrefixMarker: string): string {
+    const markerIdx = src.indexOf(logPrefixMarker)
+    assert.notEqual(markerIdx, -1, `bridge call marker must exist: ${logPrefixMarker}`)
+    const openerIdx = src.lastIndexOf(opener, markerIdx)
+    assert.notEqual(openerIdx, -1, `bridge call opener must precede the marker: ${opener}`)
+    return src.slice(openerIdx, markerIdx)
+}
+
+test('wiring: force-post cloak organic publish + comment thread the page-configured bridge account', () => {
+    const src = indexSrc()
+    const publish = bridgeCallParams(src, 'await publishReelViaSessionBridge({', "logPrefix: 'FORCE-POST CLOAK-BRIDGE'")
+    assert.ok(publish.includes('account: configuredPostingProfileUid'),
+        'force-post cloak publish must pass pages.posting_profile_uid as the bridge account')
+    const comment = bridgeCallParams(src, 'await sendPageCommentViaCloakBridge({', "logPrefix: 'FORCE-POST CLOAK-COMMENT'")
+    assert.ok(comment.includes('account: configuredPostingProfileUid'),
+        'force-post cloak comment must use the SAME configured bridge account as the publish')
+})
+
+test('wiring: cron cloak organic publish + comment thread the page-configured bridge account', () => {
+    const src = indexSrc()
+    const publish = bridgeCallParams(src, 'await publishReelViaSessionBridge({', 'logPrefix: `CRON CLOAK-BRIDGE ${page.name}`')
+    assert.ok(publish.includes('account: configuredPostingProfileUid'),
+        'cron cloak publish must pass pages.posting_profile_uid as the bridge account')
+    const comment = bridgeCallParams(src, 'await sendPageCommentViaCloakBridge({', 'logPrefix: `CRON CLOAK-COMMENT ${page.name}`')
+    assert.ok(comment.includes('account: configuredPostingProfileUid'),
+        'cron cloak comment must use the SAME configured bridge account as the publish')
+    // Both trigger sites derive the uid from the page row via the shared sanitizer.
+    const derivations = (src.match(/const configuredPostingProfileUid = sanitizePostingProfileUid\(/g) || []).length
+    assert.ok(derivations >= 2, `force-post + cron must derive configuredPostingProfileUid from the page row (found ${derivations})`)
+})
+
+test('wiring: the bridge helpers apply params.account to authorization and post/comment bodies', () => {
+    const src = indexSrc()
+    const pubStart = src.indexOf('async function publishReelViaSessionBridge')
+    assert.notEqual(pubStart, -1, 'publishReelViaSessionBridge must exist')
+    const pub = src.slice(pubStart, src.indexOf('function buildPageStoryId', pubStart))
+    // The /token + /pages preflight (where session_bridge_page_not_authorized comes from)
+    // must run against the SELECTED account, not the bridge default session.
+    assert.ok(pub.includes("const account = String(params.account || '').trim()"), 'publish must read params.account')
+    assert.ok(pub.includes('`${baseUrl}/token${accountQuery}`'), '/token preflight must carry ?account=')
+    assert.ok(pub.includes('`${baseUrl}/pages${accountQuery}`'), '/pages authorization must carry ?account=')
+    assert.ok(pub.includes('if (account) postBody.account = account'), '/post body must carry the account')
+
+    const comStart = src.indexOf('async function sendPageCommentViaCloakBridge')
+    assert.notEqual(comStart, -1, 'sendPageCommentViaCloakBridge must exist')
+    const com = src.slice(comStart, src.indexOf('async function sendStoredCommentBridgeFallback', comStart))
+    assert.ok(com.includes("{ account: String(params.account || '').trim() }"),
+        '/page-comment body must carry the account when provided')
+})
+
+test('wiring: the fix is scoped to the cloak organic lane — FB Lite comment + stored fallback keep their own account semantics', () => {
+    const src = indexSrc()
+    // The Facebook Lite bridge POST path keeps commenting through the account that created
+    // the post (facebookLiteBridgeAccount), never the cloak posting_profile_uid.
+    const liteComment = bridgeCallParams(src, 'await sendPageCommentViaCloakBridge({', "logPrefix: 'FORCE-POST FB-LITE-COMMENT'")
+    assert.ok(liteComment.includes('account: facebookLiteBridgeAccount'),
+        'FB Lite comment branch must keep threading facebookLiteBridgeAccount')
+    assert.ok(!liteComment.includes('configuredPostingProfileUid'),
+        'FB Lite comment branch must NOT switch to the cloak posting_profile_uid')
+    // The stored-token pending-comment bridge fallback stays on the bridge default session.
+    const fbStart = src.indexOf('async function sendStoredCommentBridgeFallback')
+    assert.notEqual(fbStart, -1, 'sendStoredCommentBridgeFallback must exist')
+    const fb = src.slice(fbStart, src.indexOf('async function loadPostingThumbnailAsset', fbStart))
+    assert.ok(fb.includes('sendPageCommentViaCloakBridge('), 'fallback still comments via the bridge helper')
+    assert.ok(!/\baccount\b\s*:/.test(fb), 'stored-comment bridge fallback must keep the bridge default session (no account override)')
+})
