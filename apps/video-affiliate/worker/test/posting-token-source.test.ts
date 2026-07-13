@@ -33,6 +33,8 @@ import {
     isPersistablePagePrimaryToken,
     prioritizeSyncedPageTokenPools,
     shouldFallbackToOrganicAfterOneCardFailure,
+    resolveSessionBridgePostingTokenHint,
+    isPersistedBridgeLaneHint,
 } from '../src/posting-token-source'
 
 test('normalize: only two modes — stored_token and cloak_browser', () => {
@@ -613,4 +615,60 @@ test('isPostingAuthCooldownActive: open while now<until, closed at/after until o
     assert.equal(isPostingAuthCooldownActive(1_000_000, 1_500_000), false)
     assert.equal(isPostingAuthCooldownActive(0, 1_000_000), false)
     assert.equal(isPostingAuthCooldownActive(undefined, 1_000_000), false)
+})
+
+// ---- Session-bridge /post response `source` → truthful persisted hint -----
+// Live regression (CHEARB force-post): the bridge /post response reported
+// source='facebook_lite_eaad6' (Facebook Lite EAAD6 lane) but post_history recorded
+// post_token_hint/comment_token_hint='cloak_session_bridge'. The hint resolver must
+// trust the bridge-reported source over the generic default — and only that exact
+// established source value, so no other routing/label contract moves.
+
+test('resolveSessionBridgePostingTokenHint: exact facebook_lite_eaad6 source wins over any caller hint/default', () => {
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite_eaad6', 'cloak_session_bridge'), 'facebook_lite_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite_eaad6', undefined), 'facebook_lite_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite_eaad6', ''), 'facebook_lite_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite_eaad6', 'facebook_lite_bridge'), 'facebook_lite_bridge')
+    // Whitespace-tolerant but otherwise EXACT — only the established bridge label counts.
+    assert.equal(resolveSessionBridgePostingTokenHint('  facebook_lite_eaad6  ', undefined), 'facebook_lite_bridge')
+})
+
+test('resolveSessionBridgePostingTokenHint: any other/absent source preserves the caller hint (default cloak_session_bridge)', () => {
+    // No source in the response → exact legacy behavior.
+    assert.equal(resolveSessionBridgePostingTokenHint(undefined, undefined), 'cloak_session_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('', ''), 'cloak_session_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint(null, '   '), 'cloak_session_bridge')
+    // A CloakBrowser-session response keeps the generic label.
+    assert.equal(resolveSessionBridgePostingTokenHint('browser_session', undefined), 'cloak_session_bridge')
+    // An explicit caller hint survives a non-Lite (or unknown) source untouched.
+    assert.equal(resolveSessionBridgePostingTokenHint('browser_session', 'facebook_lite_bridge'), 'facebook_lite_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint(undefined, 'facebook_lite_bridge'), 'facebook_lite_bridge')
+    // Near-miss labels must NOT upgrade (exact match only — never guess a lane).
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite', undefined), 'cloak_session_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('facebook_lite_bridge', undefined), 'cloak_session_bridge')
+    assert.equal(resolveSessionBridgePostingTokenHint('FACEBOOK_LITE_EAAD6', undefined), 'cloak_session_bridge')
+})
+
+test('isPersistedBridgeLaneHint: established lane labels pass through verbatim, tokens/near-misses do not', () => {
+    assert.equal(isPersistedBridgeLaneHint('facebook_lite_bridge'), true)
+    assert.equal(isPersistedBridgeLaneHint('cloak_session_bridge'), true)
+    assert.equal(isPersistedBridgeLaneHint('ads_publish'), true)
+    assert.equal(isPersistedBridgeLaneHint('onecard'), true)
+    assert.equal(isPersistedBridgeLaneHint(' facebook_lite_bridge '), true)
+    // Raw tokens and unknown values still go through the token redaction path.
+    assert.equal(isPersistedBridgeLaneHint('raw_token_like_value_123456'), false)
+    assert.equal(isPersistedBridgeLaneHint('not_a_lane_token_value'), false)
+    assert.equal(isPersistedBridgeLaneHint('facebook_lite'), false)
+    assert.equal(isPersistedBridgeLaneHint(''), false)
+    assert.equal(isPersistedBridgeLaneHint(undefined), false)
+    assert.equal(isPersistedBridgeLaneHint(null), false)
+})
+
+test('a facebook_lite_eaad6-served bridge publish yields the exact persistable facebook_lite_bridge hint', () => {
+    // End-to-end intent: the resolved hint must ALSO be recognized as a persisted lane label,
+    // so deriveCommentTokenHint-style token redaction can never corrupt it into 'facebo...idge'
+    // and history/comment classification receive 'facebook_lite_bridge' verbatim.
+    const hint = resolveSessionBridgePostingTokenHint('facebook_lite_eaad6', undefined)
+    assert.equal(hint, 'facebook_lite_bridge')
+    assert.equal(isPersistedBridgeLaneHint(hint), true)
 })

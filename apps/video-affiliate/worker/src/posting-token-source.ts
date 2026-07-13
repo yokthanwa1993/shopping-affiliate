@@ -172,6 +172,39 @@ export function isStoredCommentTokenAuthFailure(error: unknown): boolean {
     )
 }
 
+// ---- Bridge /post response `source` → truthful persisted lane hint ---------
+// The CloakBrowser / Token Bridge safe /post response reports WHICH backend actually
+// served the publish: `source: 'facebook_lite_eaad6'` (the only established Facebook
+// Lite source label, see apps/facebook-token-cloak/src/server.js) means the bridge
+// minted a fresh Facebook Lite EAAD6 page token and published the organic
+// /{page}/videos post with it — NOT the CloakBrowser session (the bridge's default
+// account can resolve to Facebook Lite). post_history must persist that lane
+// truthfully ('facebook_lite_bridge') or audits cannot tell which system really
+// posted. Only that exact source value upgrades the hint; anything else
+// (absent/unknown/browser_session) preserves the caller's explicit hint — or the
+// legacy 'cloak_session_bridge' default — so routing and every non-Lite contract
+// stay byte-identical.
+export function resolveSessionBridgePostingTokenHint(responseSource: unknown, fallbackHint?: unknown): string {
+    if (String(responseSource ?? '').trim() === 'facebook_lite_eaad6') return 'facebook_lite_bridge'
+    const fallback = String(fallbackHint ?? '').trim()
+    return fallback || 'cloak_session_bridge'
+}
+
+// The established post/comment token-hint LABELS persisted verbatim into post_history
+// (never renamed — that would force a data migration). index.ts deriveCommentTokenHint()
+// otherwise redacts long values like raw tokens, which would corrupt
+// 'facebook_lite_bridge' into 'facebo...idge' and break the exact-match hint
+// classifiers (e.g. isCloakBridgeCommentFallbackEligible) and history audits.
+export function isPersistedBridgeLaneHint(value: unknown): boolean {
+    const hint = String(value ?? '').trim()
+    return (
+        hint === 'facebook_lite_bridge' ||
+        hint === 'cloak_session_bridge' ||
+        hint === 'ads_publish' ||
+        hint === 'onecard'
+    )
+}
+
 // ---- Per-page posting Account UID (Accounts Bridge) ----------------------
 // Each page may pin WHICH Accounts Bridge account UID mints/syncs its Facebook
 // Lite (stored_token) posting token — e.g. 100077795357192. This is a public

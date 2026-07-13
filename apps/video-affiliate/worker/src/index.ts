@@ -247,6 +247,8 @@ import {
     restrictCloakToAdminNamespace,
     isCloakBridgeCommentFallbackEligible,
     isStoredCommentTokenAuthFailure,
+    resolveSessionBridgePostingTokenHint,
+    isPersistedBridgeLaneHint,
     shouldAttemptFacebookLiteRefresh,
     shouldAttemptFacebookLitePostingRefresh,
     buildFacebookLiteRefreshRequestBody,
@@ -38481,6 +38483,10 @@ async function postShopeeCommentWithFallback(params: {
 function deriveCommentTokenHint(token?: string | null): string | null {
     const normalized = String(token || '').trim()
     if (!normalized) return null
+    // Established bridge-lane labels ('facebook_lite_bridge', 'cloak_session_bridge', …)
+    // persist verbatim: token-style redaction would corrupt them ('facebo...idge') and
+    // break the exact-match hint classifiers/audits.
+    if (isPersistedBridgeLaneHint(normalized)) return normalized
     if (normalized.length <= 10) return normalized
     return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`
 }
@@ -40352,7 +40358,9 @@ async function publishReelViaSessionBridge(params: {
     const pageId = String(params.pageId || '').trim()
     const account = String(params.account || '').trim()
     const accountQuery = account ? `?account=${encodeURIComponent(account)}` : ''
-    const postingTokenHint = String(params.postingTokenHint || '').trim() || 'cloak_session_bridge'
+    // Caller-requested lane label (default: the legacy cloak label). The bridge /post
+    // response `source` below authoritatively overrides it when Facebook Lite served the post.
+    const requestedPostingTokenHint = String(params.postingTokenHint || '').trim() || 'cloak_session_bridge'
 
     // 1. Fail closed unless the bridge reports a live logged-in session. /token returns
     //    only booleans (accessToken/fbDtsg presence) — never the values.
@@ -40397,10 +40405,16 @@ async function publishReelViaSessionBridge(params: {
         video_id?: string
         story_id?: string
         post_url?: string
+        // Safe token-free backend report: 'facebook_lite_eaad6' = the bridge published via
+        // a fresh Facebook Lite EAAD6 page token, not the CloakBrowser session.
+        source?: string
     }
     if (!resp.ok || !data?.ok) {
         throw new Error(String(data?.step ? `${data.step}:${data.error || ''}` : (data?.error || `bridge_http_${resp.status}`)))
     }
+    // Persist the lane the bridge REPORTS: only the exact Facebook Lite source value
+    // upgrades the hint to 'facebook_lite_bridge'; anything else keeps the caller's hint.
+    const postingTokenHint = resolveSessionBridgePostingTokenHint(data.source, requestedPostingTokenHint)
 
     const storyId = String(data.story_id || '').trim()
     const postId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
@@ -45106,6 +45120,13 @@ app.post('/api/pages/:id/force-post', async (c) => {
             })
             fbVideoId = cloakResult.id
             postingTokenUsed = cloakResult.postingToken
+            // Truthful lane for THIS publish from the bridge response (via
+            // resolveSessionBridgePostingTokenHint): 'facebook_lite_bridge' when the bridge
+            // served it via Facebook Lite EAAD6, else the legacy 'cloak_session_bridge'
+            // label. History + the bridge comment hint below must record this lane, never
+            // assume the generic cloak label (the bridge default account can be Facebook Lite).
+            const cloakPostedViaFacebookLite = cloakResult.postingToken === 'facebook_lite_bridge'
+            const cloakPostTokenHint = cloakPostedViaFacebookLite ? 'facebook_lite_bridge' : 'cloak_session_bridge'
             const confirmedCanonicalPostId = String(cloakResult.postId || '').trim()
             const confirmedPostId = confirmedCanonicalPostId || fbVideoId
             const cloakCommentEligible = !!normalizedShopeeLink && !skipComment
@@ -45123,7 +45144,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     cloakCommentStatus = 'not_configured'
                     cloakCommentFbId = null
                     cloakCommentError = null
-                    cloakCommentTokenHint = 'cloak_session_bridge'
+                    cloakCommentTokenHint = cloakPostTokenHint
                 } else {
                     // Re-shorten with the post id FIRST so the commented link carries
                     // sub2=post id / sub3=page id. Do NOT fall back to /opaanlp or raw Shopee
@@ -45158,7 +45179,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         cloakCommentStatus = 'failed'
                         cloakCommentFbId = null
                         cloakCommentError = `comment_shortlink_failed:${String(commentShortlinkError || 'final_shopee_shortlink_required').slice(0, 180)}`
-                        cloakCommentTokenHint = 'cloak_session_bridge'
+                        cloakCommentTokenHint = cloakPostTokenHint
                     } else {
                         const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
                         const bridged = await sendPageCommentViaCloakBridge({
@@ -45171,7 +45192,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         cloakCommentStatus = bridged.status
                         cloakCommentFbId = bridged.id
                         cloakCommentError = bridged.error
-                        cloakCommentTokenHint = 'cloak_session_bridge'
+                        // Same bridge + same default-account resolution as the publish above,
+                        // so the comment rode the same reported lane.
+                        cloakCommentTokenHint = cloakPostTokenHint
                     }
                 }
             } else {
@@ -45198,8 +45221,13 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }
             const fbReelUrl = String(cloakResult.permalinkUrl || '').trim()
             if (forceHistoryId) {
+                // Persist the lane the bridge REPORTED for this publish. Both SQL literals
+                // stay verbatim — the persisted labels are never renamed (that would force
+                // a post_history data migration).
                 await env.DB.prepare(
-                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
+                    cloakPostedViaFacebookLite
+                        ? "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='facebook_lite_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
+                        : "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
                 ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, forceHistoryId).run().catch(() => { })
             }
             if (cloakCommentStatus === 'pending') {
@@ -47934,6 +47962,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     commentText: '',
                     logPrefix: `CRON CLOAK-BRIDGE ${page.name}`,
                 })
+                // Truthful lane for THIS publish from the bridge response — mirror of the
+                // force-post cloak branch ('facebook_lite_bridge' when the bridge served it
+                // via Facebook Lite EAAD6, else the legacy 'cloak_session_bridge' label).
+                const cloakPostedViaFacebookLite = cloakResult.postingToken === 'facebook_lite_bridge'
+                const cloakPostTokenHint = cloakPostedViaFacebookLite ? 'facebook_lite_bridge' : 'cloak_session_bridge'
                 const confirmedCanonicalPostId = String(cloakResult.postId || '').trim()
                 const confirmedPostId = confirmedCanonicalPostId || String(cloakResult.id || '').trim()
                 const fbReelUrl = String(cloakResult.permalinkUrl || '').trim()
@@ -47949,7 +47982,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         cloakCommentStatus = 'not_configured'
                         cloakCommentFbId = null
                         cloakCommentError = null
-                        cloakCommentTokenHint = 'cloak_session_bridge'
+                        cloakCommentTokenHint = cloakPostTokenHint
                     } else {
                         // Re-shorten with the post id FIRST so the commented link carries
                         // sub2=post id / sub3=page id. Do NOT fall back to /opaanlp or raw Shopee
@@ -47984,7 +48017,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             cloakCommentStatus = 'failed'
                             cloakCommentFbId = null
                             cloakCommentError = `comment_shortlink_failed:${String(commentShortlinkError || 'final_shopee_shortlink_required').slice(0, 180)}`
-                            cloakCommentTokenHint = 'cloak_session_bridge'
+                            cloakCommentTokenHint = cloakPostTokenHint
                         } else {
                             const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
                             const bridged = await sendPageCommentViaCloakBridge({
@@ -47997,7 +48030,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             cloakCommentStatus = bridged.status
                             cloakCommentFbId = bridged.id
                             cloakCommentError = bridged.error
-                            cloakCommentTokenHint = 'cloak_session_bridge'
+                            // Same bridge + same default-account resolution as the publish
+                            // above, so the comment rode the same reported lane.
+                            cloakCommentTokenHint = cloakPostTokenHint
                         }
                     }
                 } else {
@@ -48023,8 +48058,13 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     cloakCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
                 }
                 if (cronHistoryId) {
+                    // Persist the lane the bridge REPORTED for this publish. Both SQL literals
+                    // stay verbatim — the persisted labels are never renamed (that would force
+                    // a post_history data migration).
                     await env.DB.prepare(
-                        "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
+                        cloakPostedViaFacebookLite
+                            ? "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='facebook_lite_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
+                            : "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
                     ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, nowISO, cronHistoryId).run().catch(() => { })
                 }
                 if (cloakCommentStatus === 'pending') {

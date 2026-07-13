@@ -304,3 +304,72 @@ test('wiring: Facebook Lite lane untouched — posting_profile_uid still threads
     assert.ok(liteComment.includes('account: facebookLiteBridgeAccount'),
         'the FB Lite comment branch must keep threading facebookLiteBridgeAccount')
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Truthful bridge-lane audit hints (source-aware).
+// Live regression: a CHEARB force-post succeeded through the local bridge's
+// Facebook Lite EAAD6 lane (bridge /post response `source: 'facebook_lite_eaad6'`,
+// Graph readback confirms the Page post + comment), but post_history recorded
+// post_token_hint/comment_token_hint='cloak_session_bridge'. The Worker must
+// persist the lane the bridge RESPONSE reports — never assume the generic cloak
+// label — without changing any routing (CHEARB stays on the Facebook Lite
+// stored-token lane; nothing is promoted to Power Editor / cloak_browser).
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('wiring: publishReelViaSessionBridge resolves its returned postingToken from the bridge response source', () => {
+    const src = indexSrc()
+    const start = src.indexOf('async function publishReelViaSessionBridge')
+    assert.notEqual(start, -1, 'publishReelViaSessionBridge must exist')
+    const end = src.indexOf('\nfunction buildPageStoryId', start)
+    assert.notEqual(end, -1, 'function boundary (buildPageStoryId) must exist')
+    const fn = src.slice(start, end)
+    // The /post response parse includes the safe token-free `source` field…
+    assert.ok(/source\?: string/.test(fn), '/post response type must parse the safe source field')
+    // …and the returned hint resolves source-first, with the caller-requested hint as fallback
+    // (default cloak_session_bridge preserved for every non-Lite response).
+    assert.ok(/const requestedPostingTokenHint = String\(params\.postingTokenHint \|\| ''\)\.trim\(\) \|\| 'cloak_session_bridge'/.test(fn),
+        'caller hint/default resolution must be unchanged (fallback role only)')
+    assert.ok(/const postingTokenHint = resolveSessionBridgePostingTokenHint\(data\.source, requestedPostingTokenHint\)/.test(fn),
+        'returned hint must be resolved from the bridge-reported source')
+    assert.ok(fn.includes('postingToken: postingTokenHint'), 'return keeps the token-free hint field')
+})
+
+test('wiring: force-post + cron cloak branches persist the bridge-reported lane (history + comment hint)', () => {
+    const src = indexSrc()
+    const branches: Array<[string, string]> = [
+        ["logPrefix: 'FORCE-POST CLOAK-BRIDGE'", 'CLOAK-BRIDGE POST OK'],
+        ['logPrefix: `CRON CLOAK-BRIDGE ${page.name}`', 'CLOAK-BRIDGE POST OK'],
+    ]
+    for (const [callMarker, endMarker] of branches) {
+        const callIdx = src.indexOf(callMarker)
+        assert.notEqual(callIdx, -1, `bridge call marker must exist: ${callMarker}`)
+        const endIdx = src.indexOf(endMarker, callIdx)
+        assert.notEqual(endIdx, -1, `branch end marker must exist after ${callMarker}`)
+        const region = src.slice(callIdx, endIdx)
+        // The lane comes from the bridge response (cloakResult.postingToken), exact-match only.
+        assert.ok(region.includes("const cloakPostedViaFacebookLite = cloakResult.postingToken === 'facebook_lite_bridge'"),
+            `cloak branch must read the bridge-reported lane (${callMarker})`)
+        // Both persisted labels exist verbatim: Lite-served rows record facebook_lite_bridge,
+        // session-served rows keep the legacy cloak_session_bridge label (never renamed).
+        assert.ok(region.includes("post_token_hint='facebook_lite_bridge'"),
+            `lite-served publish must persist post_token_hint='facebook_lite_bridge' (${callMarker})`)
+        assert.ok(region.includes("post_token_hint='cloak_session_bridge'"),
+            `session-served publish must keep the legacy label (${callMarker})`)
+        // The bridge comment hint follows the SAME reported lane — never a hardcoded cloak label.
+        assert.ok(!region.includes("cloakCommentTokenHint = 'cloak_session_bridge'"),
+            `cloak comment hint must not be hardcoded to cloak_session_bridge (${callMarker})`)
+        assert.ok(region.includes('cloakCommentTokenHint = cloakPostTokenHint'),
+            `cloak comment hint must follow the bridge-reported lane (${callMarker})`)
+    }
+})
+
+test('wiring: deriveCommentTokenHint persists established lane labels verbatim (facebook_lite_bridge never redacts to facebo...idge)', () => {
+    const src = indexSrc()
+    const start = src.indexOf('function deriveCommentTokenHint')
+    assert.notEqual(start, -1, 'deriveCommentTokenHint must exist')
+    const fn = src.slice(start, start + 700)
+    assert.ok(/if \(isPersistedBridgeLaneHint\(normalized\)\) return normalized/.test(fn),
+        'lane labels must bypass token redaction so history + comment classification see the exact hint')
+    // The redaction path for RAW tokens is unchanged (still token-free in history).
+    assert.ok(fn.includes('normalized.slice(0, 6)'), 'raw tokens must still be redacted')
+})
