@@ -225,22 +225,15 @@ struct CredentialsView: View {
                 field("2FA Secret (base32)", $twoFA)
                 field("datr", $datr)
             }
-            Section {
-                Button {
-                    saveAll()
-                    store.syncCredentials(account.id)
-                } label: { Label("บันทึก + ส่งขึ้น bridge", systemImage: "arrow.up.circle.fill") }
-                Button {
-                    saveAll()
-                    store.reLogin(account.id)
-                } label: { Label("Re-login (mint FB Lite token)", systemImage: "arrow.triangle.2.circlepath") }
-                    .disabled(password.isEmpty)
-            }
         }
         .navigationTitle("ข้อมูล Login").navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button("บันทึก") { saveAll(); dismiss() }.bold()
+                Button("บันทึก") {
+                    saveAll()
+                    store.syncCredentials(account.id)   // เก็บ + ส่งขึ้น bridge; งานที่เหลือ bridge ทำเอง
+                    dismiss()
+                }.bold()
             }
         }
         .onAppear {
