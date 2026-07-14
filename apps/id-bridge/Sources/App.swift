@@ -158,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        for key in Site.order { loadAccounts(Site.all[key]!) }   // refresh บัญชีเงียบๆ ทุกครั้งที่เปิดเมนู
         menu.removeAllItems()
         var any = false
         for key in Site.order {
@@ -182,12 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let m = NSMenuItem(title: "ยังไม่มีบัญชี — login ที่มือถือ IDLogin ก่อน", action: nil, keyEquivalent: "")
             m.isEnabled = false; menu.addItem(m); menu.addItem(.separator())
         }
-        let refresh = NSMenuItem(title: "โหลดบัญชีใหม่", action: #selector(reload), keyEquivalent: "r")
-        refresh.target = self; menu.addItem(refresh)
         let quit = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self
         menu.addItem(quit)
     }
     @objc private func openAcct(_ s: NSMenuItem) { (s.representedObject as? Acct)?.open() }
-    @objc private func reload() { for key in Site.order { loadAccounts(Site.all[key]!) } }
     @objc private func quitApp() { NSApp.terminate(nil) }
 }
