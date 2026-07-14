@@ -1,0 +1,33 @@
+name: IdLogin
+options:
+  bundleIdPrefix: com.neezs
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  IdLogin:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: IdLogin
+        UILaunchScreen: {}
+        LSRequiresIPhoneOS: true
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: "ส่ง session ไปเครื่องบ้านผ่าน Tailscale"
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1,2"
+        PRODUCT_BUNDLE_IDENTIFIER: com.neezsapp.IdLogin
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: J6S4J2P49V      # Personal Team (ลงได้เลย) / Company=J6S4J2P49V ถ้ากด PLA แล้ว
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
