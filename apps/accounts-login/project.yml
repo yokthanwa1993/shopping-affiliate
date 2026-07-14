@@ -12,7 +12,7 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
-        CFBundleDisplayName: Higgsfield Login
+        CFBundleDisplayName: AccountsLogin
         UILaunchScreen: {}
         LSRequiresIPhoneOS: true
         UISupportedInterfaceOrientations~ipad:

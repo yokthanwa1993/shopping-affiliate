@@ -130,7 +130,11 @@ struct Account: Identifiable, Codable, Equatable {
     var accId: String = ""
     var pic: String = ""       // รูปโปรไฟล์จริง (FB)
     var label: String = ""     // ชื่อที่ผู้ใช้ตั้งเอง (เช่น อีเมล)
-    enum CodingKeys: String, CodingKey { case id, name, accId, pic, label }
+    // --- master credential (non-secret; ความลับ password/2FA/datr อยู่ Keychain) ---
+    var uid: String = ""       // UID (= c_user สำหรับ FB)
+    var email: String = ""
+    var phone: String = ""
+    enum CodingKeys: String, CodingKey { case id, name, accId, pic, label, uid, email, phone }
     init(id: UUID, name: String, accId: String = "", pic: String = "", label: String = "") {
         self.id = id; self.name = name; self.accId = accId; self.pic = pic; self.label = label
     }
@@ -141,7 +145,43 @@ struct Account: Identifiable, Codable, Equatable {
         accId = try c.decodeIfPresent(String.self, forKey: .accId) ?? ""
         pic = try c.decodeIfPresent(String.self, forKey: .pic) ?? ""
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        uid = try c.decodeIfPresent(String.self, forKey: .uid) ?? ""
+        email = try c.decodeIfPresent(String.self, forKey: .email) ?? ""
+        phone = try c.decodeIfPresent(String.self, forKey: .phone) ?? ""
     }
+}
+
+// MARK: - Keychain (เก็บความลับ: password / 2FA secret / datr)
+enum Keychain {
+    @discardableResult
+    static func set(_ value: String, _ key: String) -> Bool {
+        let data = Data(value.utf8)
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrAccount as String: key]
+        SecItemDelete(q as CFDictionary)
+        if value.isEmpty { return true }
+        var add = q; add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+    static func get(_ key: String) -> String {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrAccount as String: key,
+                                kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? Data else { return "" }
+        return String(data: d, encoding: .utf8) ?? ""
+    }
+}
+
+// ความลับ 1 บัญชี
+struct Secret: Equatable {
+    var password = ""
+    var twoFA = ""     // 2FA secret (TOTP base32)
+    var datr = ""
+    var isEmpty: Bool { password.isEmpty && twoFA.isEmpty && datr.isEmpty }
 }
 
 // MARK: - จัดการบัญชีของ 1 แพลตฟอร์ม (ใช้ร่วมทุกแพลตฟอร์ม)
@@ -334,6 +374,86 @@ final class SessionStore: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                     if self.currentID == nil { self.currentID = a.id }
                     self.saveAccounts()
                 }
+            }
+        }.resume()
+    }
+
+    // MARK: - master credential (Keychain + sync bridge)
+    private func secKey(_ id: UUID, _ f: String) -> String { "cred_\(platform.rawValue)_\(id.uuidString)_\(f)" }
+
+    func secret(for id: UUID) -> Secret {
+        Secret(password: Keychain.get(secKey(id, "password")),
+               twoFA:    Keychain.get(secKey(id, "twoFA")),
+               datr:     Keychain.get(secKey(id, "datr")))
+    }
+
+    // อ่าน datr จาก cookie ที่เก็บไว้ (ถ้ามี) เผื่อกรอกอัตโนมัติ
+    func datrFromCookie(_ id: UUID) -> String {
+        (UserDefaults.standard.dictionary(forKey: ckKey(id)) as? [String: String])?["datr"] ?? ""
+    }
+
+    func setInfo(_ id: UUID, uid: String, email: String, phone: String) {
+        guard let i = accounts.firstIndex(where: { $0.id == id }) else { return }
+        accounts[i].uid = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+        accounts[i].email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        accounts[i].phone = phone.trimmingCharacters(in: .whitespacesAndNewlines)
+        saveAccounts()
+    }
+
+    func setSecret(_ id: UUID, _ s: Secret) {
+        Keychain.set(s.password, secKey(id, "password"))
+        Keychain.set(s.twoFA, secKey(id, "twoFA"))
+        Keychain.set(s.datr, secKey(id, "datr"))
+    }
+
+    // ส่ง credential ครบชุดขึ้น bridge (mac mini) — bridge เก็บ + ใช้ mint FB Lite token
+    func syncCredentials(_ id: UUID, done: ((Bool) -> Void)? = nil) {
+        guard let a = accounts.first(where: { $0.id == id }),
+              let url = URL(string: Self.bridgeBase + "/fb-credentials") else { done?(false); return }
+        let s = secret(for: id)
+        let uid = a.uid.isEmpty ? a.accId : a.uid
+        let body: [String: Any] = [
+            "uid": uid, "email": a.email, "phone": a.phone,
+            "password": s.password, "twofa": s.twoFA, "datr": s.datr,
+            "label": a.label, "name": a.name,
+        ]
+        var req = URLRequest(url: url); req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(Self.token, forHTTPHeaderField: "X-Bridge-Token")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
+            Task { @MainActor in
+                let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+                self?.showToast(ok ? "✅ ส่งข้อมูล login ขึ้น bridge แล้ว" : "❌ ส่งไม่สำเร็จ (bridge)")
+                done?(ok)
+            }
+        }.resume()
+    }
+
+    // สั่ง bridge login FB Lite ใหม่จาก uid/password/2FA/datr → mint token (ตอน session หลุด)
+    func reLogin(_ id: UUID, done: ((Bool, String) -> Void)? = nil) {
+        guard let a = accounts.first(where: { $0.id == id }),
+              let url = URL(string: Self.bridgeBase + "/fb-relogin") else { done?(false, "no url"); return }
+        let s = secret(for: id)
+        let uid = a.uid.isEmpty ? a.accId : a.uid
+        let body: [String: Any] = ["uid": uid, "email": a.email, "phone": a.phone,
+                                   "password": s.password, "twofa": s.twoFA, "datr": s.datr]
+        var req = URLRequest(url: url); req.httpMethod = "POST"; req.timeoutInterval = 60
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(Self.token, forHTTPHeaderField: "X-Bridge-Token")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        showToast("🔄 กำลัง re-login FB Lite...")
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            Task { @MainActor in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                var msg = "HTTP \(code)"
+                if let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let e = j["error"] as? String { msg = e }
+                    else if j["access_token"] != nil || (j["ok"] as? Bool) == true { msg = "ได้ token แล้ว" }
+                }
+                let ok = code == 200
+                self?.showToast(ok ? "✅ re-login สำเร็จ (\(msg))" : "❌ re-login: \(msg)")
+                done?(ok, msg)
             }
         }.resume()
     }

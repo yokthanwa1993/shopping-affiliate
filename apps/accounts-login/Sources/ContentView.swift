@@ -77,6 +77,9 @@ struct AccountListView: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            NavigationLink { CredentialsView(store: store, account: a) } label: {
+                                Label("ใส่ user / pass / 2FA", systemImage: "key.fill")
+                            }
                             Button {
                                 renameTarget = a; renameText = a.label; showRename = true
                             } label: { Label("แก้ไขชื่อ", systemImage: "pencil") }
@@ -175,7 +178,10 @@ struct AccountWebView: View {
             .navigationTitle(account.accId.isEmpty ? store.platform.title : account.accId)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    NavigationLink { CredentialsView(store: store, account: account) } label: {
+                        Image(systemName: "key.fill")
+                    }
                     Button {
                         store.toast = "🔄 รีเฟรช + ส่ง session..."
                         store.webView(for: account.id).reload()
@@ -183,5 +189,84 @@ struct AccountWebView: View {
                 }
             }
             .onAppear { store.currentID = account.id }
+    }
+}
+
+// MARK: - หน้ากรอก user/pass/2FA (master credential)
+struct CredentialsView: View {
+    @ObservedObject var store: SessionStore
+    let account: Account
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var uid = ""
+    @State private var email = ""
+    @State private var phone = ""
+    @State private var password = ""
+    @State private var twoFA = ""
+    @State private var datr = ""
+    @State private var showPass = false
+    @State private var loaded = false
+
+    var body: some View {
+        Form {
+            Section {
+                Text("เก็บ user / pass / 2FA ไว้ในเครื่อง (Keychain) แล้วส่งขึ้น bridge — เวลา session หลุดตอนอยู่นอกบ้าน กดปุ่ม re-login ผ่านมือถือได้เลย")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("บัญชี") {
+                field("UID (c_user)", $uid, kb: .numberPad)
+                field("Email", $email, kb: .emailAddress)
+                field("เบอร์โทร", $phone, kb: .phonePad)
+            }
+            Section("ความลับ (Keychain)") {
+                HStack {
+                    if showPass { TextField("Password", text: $password) }
+                    else { SecureField("Password", text: $password) }
+                    Button { showPass.toggle() } label: {
+                        Image(systemName: showPass ? "eye.slash" : "eye").foregroundStyle(.secondary)
+                    }.buttonStyle(.plain)
+                }
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                field("2FA Secret (base32)", $twoFA)
+                field("datr", $datr)
+            }
+            Section {
+                Button {
+                    saveAll()
+                    store.syncCredentials(account.id)
+                } label: { Label("บันทึก + ส่งขึ้น bridge", systemImage: "arrow.up.circle.fill") }
+                Button {
+                    saveAll()
+                    store.reLogin(account.id)
+                } label: { Label("Re-login (mint FB Lite token)", systemImage: "arrow.triangle.2.circlepath") }
+                    .disabled(password.isEmpty)
+            }
+        }
+        .navigationTitle("ข้อมูล Login").navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("บันทึก") { saveAll(); dismiss() }.bold()
+            }
+        }
+        .onAppear {
+            guard !loaded else { return }
+            loaded = true
+            uid = account.uid.isEmpty ? account.accId : account.uid
+            email = account.email; phone = account.phone
+            let s = store.secret(for: account.id)
+            password = s.password; twoFA = s.twoFA
+            datr = s.datr.isEmpty ? store.datrFromCookie(account.id) : s.datr
+        }
+    }
+
+    private func field(_ label: String, _ text: Binding<String>, kb: UIKeyboardType = .default) -> some View {
+        TextField(label, text: text)
+            .keyboardType(kb)
+            .textInputAutocapitalization(.never).autocorrectionDisabled()
+    }
+
+    private func saveAll() {
+        store.setInfo(account.id, uid: uid, email: email, phone: phone)
+        store.setSecret(account.id, Secret(password: password, twoFA: twoFA, datr: datr))
     }
 }
