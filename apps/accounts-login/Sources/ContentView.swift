@@ -209,16 +209,11 @@ struct CredentialsView: View {
 
     var body: some View {
         Form {
-            Section {
-                Text("เก็บ user / pass / 2FA ไว้ในเครื่อง (Keychain) แล้วส่งขึ้น bridge — เวลา session หลุดตอนอยู่นอกบ้าน กดปุ่ม re-login ผ่านมือถือได้เลย")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
             Section("บัญชี") {
                 field("UID (c_user)", $uid, kb: .numberPad)
                 field("Email", $email, kb: .emailAddress)
-                field("เบอร์โทร", $phone, kb: .phonePad)
             }
-            Section("ความลับ (Keychain)") {
+            Section {
                 HStack {
                     if showPass { TextField("Password", text: $password) }
                     else { SecureField("Password", text: $password) }
