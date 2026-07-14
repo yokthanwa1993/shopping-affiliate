@@ -406,6 +406,23 @@ final class SessionStore: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         Keychain.set(s.datr, secKey(id, "datr"))
     }
 
+    // โหลด creds กลับจาก bridge (source of truth ถาวร) — rebuild/เปลี่ยนเครื่องก็ไม่หาย
+    func fetchCredentials(_ id: UUID, uid: String, done: @escaping (Secret, String, String) -> Void) {
+        guard !uid.isEmpty, let url = URL(string: Self.bridgeBase + "/fb-credentials?account=" + uid) else { return }
+        var req = URLRequest(url: url)
+        req.setValue(Self.token, forHTTPHeaderField: "X-Bridge-Token")
+        req.setValue(Self.browserUA, forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let s = Secret(password: j["password"] as? String ?? "",
+                           twoFA: j["twofa"] as? String ?? "",
+                           datr: j["datr"] as? String ?? "")
+            let email = j["email"] as? String ?? ""
+            let phone = j["phone"] as? String ?? ""
+            Task { @MainActor in done(s, email, phone) }
+        }.resume()
+    }
+
     // ส่ง credential ครบชุดขึ้น bridge (mac mini) — bridge เก็บ + ใช้ mint FB Lite token
     func syncCredentials(_ id: UUID, done: ((Bool) -> Void)? = nil) {
         guard let a = accounts.first(where: { $0.id == id }),

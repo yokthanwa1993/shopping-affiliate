@@ -244,6 +244,15 @@ struct CredentialsView: View {
             let s = store.secret(for: account.id)
             password = s.password; twoFA = s.twoFA
             datr = s.datr.isEmpty ? store.datrFromCookie(account.id) : s.datr
+            // โหลดจาก bridge (ถาวร) — เติมช่องที่ว่างหลัง rebuild/เปลี่ยนเครื่อง
+            store.fetchCredentials(account.id, uid: uid) { sec, em, ph in
+                if password.isEmpty { password = sec.password }
+                if twoFA.isEmpty { twoFA = sec.twoFA }
+                if datr.isEmpty { datr = sec.datr }
+                if email.isEmpty { email = em }
+                if phone.isEmpty { phone = ph }
+                store.setSecret(account.id, Secret(password: password, twoFA: twoFA, datr: datr))  // cache local
+            }
         }
     }
 
