@@ -8,7 +8,6 @@ const accountSelectors = require('./account-selectors');
 const accountsRegistry = require('./accounts-registry');
 const bridgeConfig = require('./bridge-config');
 const posting = require('./posting');
-const fbLiteTokenService = require('./fb-lite-token-service.cjs');
 const profileArchiveSync = require('./profileArchiveSync');
 const { createRemoteBrowserManager } = require('./remoteBrowser');
 const { attachRemoteBrowserUpgrade } = require('./remoteBrowserWs');
@@ -33,11 +32,6 @@ const DEFAULT_PORT = 8820;
 // Do NOT silently fall back to the retired pre-SALES template adset 120244361318490263.
 const DEFAULT_TEMPLATE_ADSET = '120248134990230263';
 const POST_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT || 'content_paiya';
-// Admin/user namespace that may receive a Facebook Lite bridge BULK page import (Thanwa's
-// namespace). The bulk /token/import-pages endpoint is fail-closed: it imports ONLY into this
-// namespace (plus any explicitly env-allowlisted ids). Other namespaces keep their existing
-// one-by-one manual add behavior — they are never touched by the bulk importer.
-const ADMIN_IMPORT_NAMESPACE_ID = process.env.FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE || '61550488976801';
 const POST_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_AD_ACCOUNT || 'act_1148837732288721';
 const ADS_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_AD_ACCOUNT || 'act_1030797047648459';
 const TEMPLATE_ADSET = process.env.FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET || DEFAULT_TEMPLATE_ADSET;
@@ -69,192 +63,21 @@ function wantsFacebookLiteBridge(account, body = {}) {
   return /^[0-9]{8,}$/.test(String(account || '').trim());
 }
 
-async function optionalSecret(fn) {
-  try { return await fn(); } catch { return null; }
+// Facebook Lite token minting/enumeration/auto-sync moved ENTIRELY to the IDLogin/IDBridge stack:
+// the receiver on 8799 mints from the iOS-Keychain credentials and profile-syncs page tokens to the
+// Worker. This service NO LONGER mints, enumerates, or auto-syncs Facebook Lite tokens. Any request
+// that targets the Facebook Lite path (numeric uid or an explicit facebook_lite flag) fails closed
+// here; Power Editor / Meta Ads / Accounts Bridge / CloakBrowser sessions are unaffected.
+function facebookLiteRemoved(res, extra = {}) {
+  return send(res, 410, {
+    ok: false,
+    error: 'facebook_lite_removed',
+    hint: 'Facebook Lite tokens are minted only by the IDLogin/IDBridge app (receiver /fb-relogin).',
+    ...extra
+  });
 }
 
-// The set of namespace ids the bulk Facebook Lite page importer is allowed to write into. Always
-// includes the admin namespace (ADMIN_IMPORT_NAMESPACE_ID); an operator may widen it via the
-// FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE_ALLOWLIST env (comma/space separated). Any namespace NOT
-// in this set is rejected (fail-closed) so the bulk path can never affect other tenants.
-function allowedImportNamespaceIds() {
-  const ids = new Set();
-  const admin = String(ADMIN_IMPORT_NAMESPACE_ID || '').trim();
-  if (admin) ids.add(admin);
-  for (const raw of String(process.env.FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE_ALLOWLIST || '').split(/[\s,]+/)) {
-    const id = String(raw || '').trim();
-    if (id) ids.add(id);
-  }
-  return ids;
-}
-
-// Parse a caller-supplied `accounts` value (array, or comma/space separated string) into a deduped
-// list of sanitized DISPLAY ids for the all-account import. Returns null when nothing usable was
-// supplied (the caller then falls back to scanning the local registry). Never returns secrets.
-function parseAccountList(raw) {
-  let items = [];
-  if (Array.isArray(raw)) items = raw;
-  else if (typeof raw === 'string' && raw.trim()) items = raw.split(/[\s,]+/);
-  else return null;
-  const seen = new Set();
-  const out = [];
-  for (const item of items) {
-    let s;
-    try { s = sanitizeAccount(item); } catch { continue; }
-    if (!s.display || seen.has(s.key)) continue;
-    seen.add(s.key);
-    out.push(s.display);
-  }
-  return out.length ? out : null;
-}
-
-// Parse an env-configured fallback mapping for the auto-sync recovery: a JSON object whose KEY is an
-// account uid (account→fallbacks map) or a page id (page→accounts map) and whose VALUE is an array or
-// comma/space separated string of account ids. Each value is sanitized into DISPLAY ids (same shape as
-// scanAccounts). Malformed input yields {} (never throws) so a bad env var can never break recovery.
-// Token-free: account ids / page ids are public identifiers, never secrets. Not hardcoded — the
-// mapping comes entirely from the operator-provided env var.
-function parseFallbackMapEnv(raw) {
-  if (!raw || typeof raw !== 'string' || !raw.trim()) return {};
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { return {}; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-  const out = {};
-  for (const [k, v] of Object.entries(parsed)) {
-    const key = String(k == null ? '' : k).trim();
-    if (!key) continue;
-    const list = parseAccountList(v); // sanitized DISPLAY ids, or null
-    if (list && list.length) out[key] = list;
-  }
-  return out;
-}
-
-// Build the ordered fallback-account chain (sanitized DISPLAY ids) for a recovery call: an explicit
-// per-call hint first, then the page→accounts mapping for the target page, then the account→fallbacks
-// mapping for the primary account. The primary account is excluded (it is always scanned first), and
-// the chain is deduped by sanitized key so the primary is never re-scanned via a fallback.
-function resolveFallbackChain({ explicit, pageId, primaryAccount, envAccountFallbacks, envPageFallbacks }) {
-  const seen = new Set();
-  const primaryKey = (() => { try { return primaryAccount ? sanitizeAccount(primaryAccount).key : ''; } catch { return ''; } })();
-  if (primaryKey) seen.add(primaryKey);
-  const out = [];
-  const push = (list) => {
-    for (const display of (list || [])) {
-      let key;
-      try { key = sanitizeAccount(display).key; } catch { continue; }
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(display);
-    }
-  };
-  push(explicit);
-  const pid = String(pageId == null ? '' : pageId).trim();
-  if (pid) push(envPageFallbacks && envPageFallbacks[pid]);
-  const pk = String(primaryAccount == null ? '' : primaryAccount).trim();
-  if (pk) push(envAccountFallbacks && envAccountFallbacks[pk]);
-  return out;
-}
-
-// Mint a FRESH Facebook Lite (EAAD6V) USER token straight from the stored Keychain credentials
-// (username/password + optional TOTP + datr), via the FB Lite login → auth.getSessionforApp(FB_LITE)
-// conversion. This is the ONLY success proof for a Facebook Lite account — a CloakBrowser/Power
-// Editor session is never used to vouch for it. The raw token stays inside the returned object and
-// is only ever handed to Graph (`graphFetch`); callers surface `prefix` (e.g. "EAAD6V") as a hint.
-async function resolveFacebookLiteEAAD6Session(deps, account) {
-  const { kc, fbLite, fetchImpl } = deps;
-  const safe = sanitizeAccount(account).display;
-  let credential;
-  try {
-    credential = await kc.retrieveCredential(account);
-  } catch (e) {
-    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_credential_unavailable' };
-  }
-  if (!credential || !credential.username || !credential.password) {
-    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_credential_missing' };
-  }
-  const twofa = await optionalSecret(() => kc.retrieveTotp(account));
-  const datr = await optionalSecret(() => kc.retrieveDatr(account));
-  let result;
-  try {
-    result = await fbLite.facebookLogin({
-      identifier: String(credential.username || safe).trim(),
-      password: String(credential.password || ''),
-      twofa: twofa || null,
-      datr: datr || null,
-      target_app: 'FB_LITE',
-      timeout_seconds: 45
-    });
-  } catch (e) {
-    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_token_error' };
-  }
-  if (!result || result.success !== true) {
-    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (result && (result.error_user_msg || result.error)) || 'fb_lite_token_login_failed' };
-  }
-  const token = String((result.converted_token && result.converted_token.access_token) || '').trim();
-  if (!token) return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_converted_token_missing' };
-  const prefix = fbLite.extractTokenPrefix(token);
-  // FB Lite (app 275254692598279) tokens are EAAD6V-style. Reject anything else so we fail closed
-  // rather than posting with a wrong-app token that the Worker would then cache as a bad EAAD6V.
-  if (!token.startsWith('EAAD6')) {
-    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_token_prefix_mismatch', prefix };
-  }
-  return { token, ok: true, source: 'facebook_lite_eaad6', prefix, account: safe, graphFetch: fetchImpl };
-}
-
-// Resolve the PAGE access token for `pageId` from a freshly minted Facebook Lite user token using
-// me/accounts semantics. The returned page token inherits the FB Lite app, so it is EAAD6V-style
-// too — exactly the token shape the Worker posts/comments with. Status ranks mirror the CloakBrowser
-// export path so a caller can compare/rank outcomes. No raw token is ever returned (pageToken stays
-// internal; only `prefix` is surfaced).
-async function resolveFacebookLitePageToken(deps, account, pageId) {
-  const lite = await resolveFacebookLiteEAAD6Session(deps, account);
-  const base = { source: 'facebook_lite_eaad6', prefix: lite.prefix || null, page_found: false, hasToken: false, pageToken: '', pageName: '' };
-  if (!lite.ok || !lite.token) {
-    return { ...base, status: 'fb_lite_token_not_ready', reason: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready') };
-  }
-  let info;
-  try {
-    info = await posting.resolvePageToken(lite.graphFetch, lite.token, pageId);
-  } catch (e) {
-    return { ...base, status: 'graph_pages_failed', reason: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') };
-  }
-  if (info && info.error) {
-    return { ...base, status: 'graph_pages_failed', reason: sanitizePublicReason(info.error, 'graph_pages_failed') };
-  }
-  if (!info || !info.found) return { ...base, status: 'page_not_found' };
-  if (!info.pageToken) return { ...base, status: 'page_token_unavailable', page_found: true, pageName: String(info.pageName || '') };
-  return { ...base, status: 'ok', page_found: true, hasToken: true, pageToken: info.pageToken, pageName: String(info.pageName || '') };
-}
-
-// Map a raw Graph token-validation error into a stable, sanitized public reason. A token minted
-// right after a password change / security reset comes back EAAD6V-shaped but Graph rejects it
-// ("The session has been invalidated because the user changed their password…") — surface that as
-// session_invalidated. An explicitly invalidated/expired/revoked/not-authorized token becomes
-// token_invalidated; anything else degrades to graph_token_invalid. NEVER echoes the raw token.
-function classifyGraphTokenError(raw) {
-  const text = String(raw || '').toLowerCase();
-  if (/password|changed the session|security reason/.test(text)) return 'session_invalidated';
-  if (/invalidat|expired|revoked|not authoriz|invalid oauth|malformed|session is invalid/.test(text)) return 'token_invalidated';
-  return 'graph_token_invalid';
-}
-
-// Validate a freshly-minted Facebook Lite token against the Graph API in REAL TIME. A token
-// string/prefix alone is NOT proof of usability — me/accounts is the SAME call the posting paths
-// use to resolve a PAGE token, so a pass here proves the token can actually drive Page operations
-// right now. Returns { ok, reason }; never returns the token. Gates GET /token + GET /pages
-// readiness so an EAAD6V token invalidated by a password/security reset never reads Ready.
-async function validateFacebookLiteGraphToken(lite) {
-  let result;
-  try {
-    result = await posting.listPagesPublic(lite.graphFetch, lite.token, false);
-  } catch (e) {
-    return { ok: false, reason: classifyGraphTokenError((e && (e.reason || e.code || e.message)) || 'graph_token_invalid') };
-  }
-  if (result && result.error) {
-    return { ok: false, reason: classifyGraphTokenError(result.error) };
-  }
-  return { ok: true, reason: null };
-}
+// (Facebook Lite mint helpers removed — minting now lives only in the IDLogin/IDBridge receiver.)
 
 function isLocalRequest(req) {
   const a = req.socket.remoteAddress;
@@ -718,7 +541,6 @@ function createHandler(deps = {}) {
   const registry = deps.accountsRegistry || accountsRegistry;
   const bridge = deps.bridgeConfig || bridgeConfig;
   const fetchImpl = deps.fetch || global.fetch;
-  const fbLite = deps.fbLiteTokenService || fbLiteTokenService;
   const downloadVideo = deps.downloadVideo;
   // Cloud Browser manager — opens/streams/drives a single visible page on this Mac's persistent
   // profile for the dashboard Accounts "Cloud Browser" feature. One instance per handler so its
@@ -730,20 +552,6 @@ function createHandler(deps = {}) {
   });
   // /remote-browser/* capability routes are gated by remoteBrowserAuthorized() (shared-secret header
   // injected by the dashboard proxy) since cloudflared makes tunnel traffic look like loopback.
-  // Shared dependency bundle for the Facebook Lite (EAAD6V) token path.
-  const liteDeps = { kc, fbLite, fetchImpl };
-  // Per-namespace backoff for LIVE /token/auto-sync. The Worker triggers recovery AUTOMATICALLY on a
-  // token-invalidated failure; a burst of such failures across pages/cron must not re-mint a fresh
-  // Facebook Lite session every time (that trips Facebook's login rate limiter). One live mint+scan
-  // per namespace per TTL window is enough — the scan refreshes EVERY administered page in the
-  // namespace at once, so siblings recover from a single call. Scoped to this handler instance.
-  const autoSyncLastLiveByNamespace = new Map();
-  const AUTO_SYNC_TTL_MS = (() => {
-    const raw = process.env.FACEBOOK_TOKEN_CLOAK_AUTOSYNC_TTL_MS;
-    if (raw == null || raw === '') return 60000;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : 60000;
-  })();
   return async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
@@ -1253,11 +1061,12 @@ function createHandler(deps = {}) {
         if (!account) return sendError(res, 400, 'Missing account');
         const { display } = sanitizeAccount(account);
         const wantDryRun = dryRun !== false;
-        // Facebook Lite accounts (numeric id or explicit flag) resolve the page token from a FRESH
-        // EAAD6V Lite login, never from the CloakBrowser session. The pushed token is tagged so the
-        // Worker records its source as facebook_lite_bridge (not cloak_session_bridge).
-        const liteExport = wantsFacebookLiteBridge(account, exportBody);
-        const tokenSource = liteExport ? 'facebook_lite_bridge' : 'cloak_session_bridge';
+        // Facebook Lite export moved ENTIRELY to the IDLogin/IDBridge stack (receiver 8799 mints from
+        // iOS-Keychain credentials and profile-syncs the page token). This route now serves ONLY the
+        // CloakBrowser/Power-Editor session export; a Facebook Lite request (numeric uid or explicit
+        // flag) fails closed here instead of minting.
+        if (wantsFacebookLiteBridge(account, exportBody)) return facebookLiteRemoved(res, { account: display });
+        const tokenSource = 'cloak_session_bridge';
 
         // SAFE default: a dry run performs no Cloudflare/D1 writes and resolves no token. It only
         // echoes back what a real export WOULD push, so the UI/Dev can preview without side effects.
@@ -1354,25 +1163,19 @@ function createHandler(deps = {}) {
           }
         };
 
-        let resolved;
         let effectiveAccount = display;
-        if (liteExport) {
-          // Facebook Lite: mint a fresh EAAD6V token and resolve the page token over me/accounts.
-          // NO CloakBrowser fallback — a Cloak session must never stand in as proof for a Lite page.
-          resolved = await resolveFacebookLitePageToken(liteDeps, account, pid);
-        } else {
-          resolved = await resolvePageForExport(account);
-          // SAFE fallback: only when the explicit account could not resolve a usable page token,
-          // retry once with the default configured posting account/session — it is proven to list
-          // every administered page. The default is tried only if it is a different account, and is
-          // adopted only when it gets strictly further than the explicit attempt. The response still
-          // never carries a token; it only names the effective account.
-          if (resolved.status !== 'ok' && String(account).trim() !== String(POST_ACCOUNT).trim()) {
-            const fb = await resolvePageForExport(POST_ACCOUNT);
-            if (exportRank(fb.status) > exportRank(resolved.status)) {
-              resolved = fb;
-              effectiveAccount = sanitizeAccount(POST_ACCOUNT).display;
-            }
+        // CloakBrowser/Power-Editor session export only (Facebook Lite already failed closed above).
+        let resolved = await resolvePageForExport(account);
+        // SAFE fallback: only when the explicit account could not resolve a usable page token,
+        // retry once with the default configured posting account/session — it is proven to list
+        // every administered page. The default is tried only if it is a different account, and is
+        // adopted only when it gets strictly further than the explicit attempt. The response still
+        // never carries a token; it only names the effective account.
+        if (resolved.status !== 'ok' && String(account).trim() !== String(POST_ACCOUNT).trim()) {
+          const fb = await resolvePageForExport(POST_ACCOUNT);
+          if (exportRank(fb.status) > exportRank(resolved.status)) {
+            resolved = fb;
+            effectiveAccount = sanitizeAccount(POST_ACCOUNT).display;
           }
         }
 
@@ -1453,751 +1256,17 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'POST' && url.pathname === '/token/import-pages') {
-        // Admin-only BULK page import. Lists every page the Facebook Lite account administers
-        // (me/accounts — the SAME semantics as GET /pages?facebook_lite=1) and stages each into ONE
-        // namespace's token pool through the Worker's secret-authed /api/pages/profile-sync, marked
-        // is_active=0 + import_mode=facebook_lite_bridge_import so the operator activates them later.
-        // Fail-closed to the admin namespace allowlist; local-only (it resolves Keychain creds and
-        // page tokens); dry-run by default; token-free in EVERY response (no raw token ever returned).
-        if (!isLocalRequest(req)) return sendError(res, 403, 'Bulk page import is local-only');
-        const importBody = await parseBody(req);
-        const { account, target = 'video-affiliate', workerUrl, dryRun = true } = importBody;
-        const ns = String(importBody.namespaceId || importBody.namespace_id || '').trim();
-        if (!ns) return sendError(res, 400, 'Missing namespaceId');
-        const wantDryRun = dryRun !== false;
-
-        // Mode detection. A SPECIFIC account id keeps the original one-account import untouched. The
-        // all-account (realtime cross-account fallback) mode triggers when `account` is omitted/empty/
-        // "all"/"*", OR an explicit `accounts` list is supplied. Explicit accounts are used verbatim
-        // (sanitized); otherwise every Bridge account in the local registry/status list is scanned now.
-        const explicitAccounts = parseAccountList(importBody.accounts);
-        const rawAccount = String(account == null ? '' : account).trim();
-        const allMode = (explicitAccounts && explicitAccounts.length > 0)
-          || rawAccount === '' || rawAccount.toLowerCase() === 'all' || rawAccount === '*';
-
-        // Fail closed: only the admin namespace (or an env-allowlisted id) may receive a bulk import.
-        // Every other namespace keeps its existing one-by-one manual add behavior, untouched. Enforced
-        // for BOTH the one-account and the all-account modes, BEFORE any token resolution.
-        const allowed = allowedImportNamespaceIds();
-        if (!allowed.has(ns)) {
-          return send(res, 403, {
-            ok: false, status: 'namespace_not_allowed', namespace_id: ns,
-            account: allMode ? 'all' : sanitizeAccount(account).display,
-            note: 'Bulk import is restricted to the admin namespace. Other namespaces keep manual add.'
-          });
-        }
-
-        // ── One-account import (UNCHANGED original behavior) ──────────────────────────────────────
-        if (!allMode) {
-        const { display } = sanitizeAccount(account);
-
-        // Mint a fresh Facebook Lite (EAAD6V) session and list administered pages WITH page tokens
-        // (local-safe). The page access_token stays INTERNAL — it only ever rides in the secret-authed
-        // profile-sync body below, never in this endpoint's response.
-        const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-        if (!lite.ok || !lite.token) {
-          return send(res, 200, {
-            ok: false, status: 'fb_lite_token_not_ready', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
-            error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'),
-            ...(lite.prefix ? { token_prefix: lite.prefix } : {})
-          });
-        }
-        let listed;
-        try {
-          listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
-        } catch (e) {
-          return send(res, 200, {
-            ok: false, status: 'graph_pages_failed', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
-            error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed')
-          });
-        }
-        if (listed && listed.error) {
-          return send(res, 200, {
-            ok: false, status: 'graph_pages_failed', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
-            error: sanitizePublicReason(listed.error, 'graph_pages_failed')
-          });
-        }
-        const pages = Array.isArray(listed.data) ? listed.data : [];
-        // Token-free candidate view: id/name/has_token only (access_token is NEVER surfaced).
-        const candidates = pages.map((p) => ({
-          page_id: p && p.id != null ? String(p.id) : null,
-          page_name: p && p.name != null ? String(p.name) : '',
-          has_token: !!(p && p.access_token)
-        }));
-
-        // SAFE default: a dry run lists the candidate pages + statuses and performs NO sync.
-        if (wantDryRun) {
-          return send(res, 200, {
-            ok: true, dryRun: true, status: 'dry_run_only', target,
-            namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
-            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
-            ...(lite.prefix ? { token_prefix: lite.prefix } : {}),
-            counts: { candidates: candidates.length, with_token: candidates.filter((c) => c.has_token).length },
-            candidates,
-            note: 'No Cloudflare/D1 writes performed. A real import stages each page is_active=0 (off) for the operator to activate later.'
-          });
-        }
-
-        // ── Real bulk import: push each page-scoped token through the secret-authed profile-sync ──
-        const syncSecret = String(
-          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
-          process.env.TAG_SYNC_PUSH_SECRET ||
-          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
-          ''
-        ).trim();
-        if (!syncSecret) {
-          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', namespace_id: ns, account: display });
-        }
-        const base = String(
-          workerUrl ||
-          process.env.VIDEO_AFFILIATE_WORKER_URL ||
-          process.env.WORKER_URL ||
-          'https://api.pubilo.com'
-        ).trim().replace(/\/+$/, '');
-        const syncUrl = `${base}/api/pages/profile-sync`;
-
-        const counts = { created: 0, updated: 0, moved: 0, imported: 0, skipped: 0, errors: 0 };
-        const results = [];
-        for (const p of pages) {
-          const pageId = p && p.id != null ? String(p.id) : '';
-          const pageName = p && p.name != null ? String(p.name) : '';
-          const pageToken = p && p.access_token ? String(p.access_token) : '';
-          if (!pageId || !pageToken) {
-            counts.skipped += 1;
-            results.push({ page_id: pageId || null, page_name: pageName, status: 'skipped_no_token' });
-            continue;
-          }
-          let workerStatus = 0;
-          let data = {};
-          try {
-            const resp = await fetchImpl(syncUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecret },
-              body: JSON.stringify({
-                namespace_id: ns,
-                page_id: pageId,
-                page_name: pageName,
-                access_token: pageToken,
-                comment_token: pageToken,
-                account: display,
-                token_source: 'facebook_lite_bridge',
-                // Stage imported pages OFF; the operator turns them on later.
-                is_active: 0,
-                import_mode: 'facebook_lite_bridge_import'
-              })
-            });
-            workerStatus = Number(resp && resp.status) || 0;
-            try { data = await resp.json(); } catch { data = {}; }
-          } catch (e) {
-            counts.errors += 1;
-            results.push({ page_id: pageId, page_name: pageName, status: 'worker_unreachable', reason: sanitizePublicReason((e && (e.code || e.message)) || 'worker_unreachable', 'worker_unreachable') });
-            continue;
-          }
-          const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
-          if (!success) {
-            counts.errors += 1;
-            results.push({ page_id: pageId, page_name: pageName, status: 'worker_rejected', worker_status: workerStatus });
-            continue;
-          }
-          counts.imported += 1;
-          if (data.created) counts.created += 1;
-          if (data.updated) counts.updated += 1;
-          if (data.moved) counts.moved += 1;
-          results.push({
-            page_id: pageId, page_name: pageName, status: 'imported',
-            created: !!data.created, updated: !!data.updated, moved: !!data.moved,
-            staged_inactive: data.staged_inactive !== false
-          });
-        }
-
-        return send(res, 200, {
-          ok: counts.errors === 0,
-          synced: counts.imported > 0,
-          status: counts.errors === 0 ? 'imported' : 'imported_with_errors',
-          target, namespace_id: ns, account: display,
-          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
-          import_mode: 'facebook_lite_bridge_import',
-          ...(lite.prefix ? { token_prefix: lite.prefix } : {}),
-          counts, results
-        });
-        } // ── end one-account import ──
-
-        // ── All-account realtime import (NEW) ─────────────────────────────────────────────────────
-        // Resolve which Bridge accounts to scan: an explicit `accounts` list verbatim, otherwise every
-        // FB-Lite-likely account from the local registry/status list (registered / credential / selector
-        // present). Each account is minted + me/accounts-listed in REAL TIME on this single call — there
-        // is no scheduled/background sync.
-        let scanAccounts = explicitAccounts;
-        if (!scanAccounts) {
-          let statuses = [];
-          try { statuses = await listAccountStatuses(kc, selectors, registry); } catch { statuses = []; }
-          const seen = new Set();
-          scanAccounts = [];
-          for (const s of statuses) {
-            if (!s || !s.account || seen.has(s.key)) continue;
-            const likelyLite = s.inRegistry || s.credentialPresent || s.selectorPresent;
-            if (!likelyLite) continue;
-            seen.add(s.key);
-            scanAccounts.push(s.account);
-          }
-        }
-
-        // page_id -> { page_id, page_name, primary_account, fallback_accounts[], tokens[] }
-        // De-dupe key is page_id: the FIRST account that administers a page becomes its PRIMARY; any
-        // other account that also administers it is a FALLBACK (no duplicate page row). The internal
-        // `tokens` pool (primary first, then fallbacks) is NEVER serialized into the response.
-        const pageMap = new Map();
-        const accountResults = [];
-        let accountsOk = 0;
-        let accountsFailed = 0;
-        for (const acct of scanAccounts) {
-          const accDisplay = sanitizeAccount(acct).display;
-          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, acct).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-          if (!lite.ok || !lite.token) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'fb_lite_token_not_ready', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
-            continue;
-          }
-          let listed;
-          try {
-            listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
-          } catch (e) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') });
-            continue;
-          }
-          if (listed && listed.error) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason(listed.error, 'graph_pages_failed') });
-            continue;
-          }
-          const pages = Array.isArray(listed.data) ? listed.data : [];
-          accountsOk += 1;
-          let withToken = 0;
-          for (const p of pages) {
-            const pageId = p && p.id != null ? String(p.id) : '';
-            if (!pageId) continue;
-            const pageName = p && p.name != null ? String(p.name) : '';
-            const pageToken = p && p.access_token ? String(p.access_token) : '';
-            if (pageToken) withToken += 1;
-            if (!pageMap.has(pageId)) {
-              pageMap.set(pageId, { page_id: pageId, page_name: pageName, primary_account: accDisplay, fallback_accounts: [], tokens: [] });
-            }
-            const entry = pageMap.get(pageId);
-            if (!entry.page_name && pageName) entry.page_name = pageName;
-            if (accDisplay !== entry.primary_account && !entry.fallback_accounts.includes(accDisplay)) {
-              entry.fallback_accounts.push(accDisplay);
-            }
-            if (pageToken) entry.tokens.push({ account: accDisplay, token: pageToken });
-          }
-          accountResults.push({ account: accDisplay, ok: true, page_count: pages.length, with_token: withToken, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
-        }
-
-        const uniquePages = [...pageMap.values()];
-        const candidateView = uniquePages.map((e) => ({
-          page_id: e.page_id, page_name: e.page_name,
-          primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
-          has_token: e.tokens.length > 0
-        }));
-
-        // SAFE default: a dry run lists the deduped candidate pages (primary + fallback accounts) and
-        // the per-account scan outcome, and performs NO Worker/D1 writes. Token-free.
-        if (wantDryRun) {
-          return send(res, 200, {
-            ok: true, dryRun: true, status: 'dry_run_only', mode: 'all_accounts', target,
-            namespace_id: ns, source: 'facebook_lite_eaad6',
-            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
-            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
-            accounts: accountResults,
-            counts: {
-              candidates: candidateView.length,
-              with_token: candidateView.filter((c) => c.has_token).length,
-              accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed
-            },
-            candidates: candidateView,
-            note: 'No Cloudflare/D1 writes performed. Duplicate pages across accounts are deduped by page_id (first account = primary, others = fallback). A real import stages each unique page is_active=0 (off).'
-          });
-        }
-
-        // ── Real all-account import: push each UNIQUE page once with its primary account's page token,
-        // automatically falling back to the next account that administers the page if the push fails. ──
-        const syncSecretAll = String(
-          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
-          process.env.TAG_SYNC_PUSH_SECRET ||
-          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
-          ''
-        ).trim();
-        if (!syncSecretAll) {
-          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: 'all_accounts', namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
-        }
-        const baseAll = String(
-          workerUrl ||
-          process.env.VIDEO_AFFILIATE_WORKER_URL ||
-          process.env.WORKER_URL ||
-          'https://api.pubilo.com'
-        ).trim().replace(/\/+$/, '');
-        const syncUrlAll = `${baseAll}/api/pages/profile-sync`;
-
-        const countsAll = { created: 0, updated: 0, moved: 0, imported: 0, skipped: 0, errors: 0, fallback_used: 0 };
-        const resultsAll = [];
-        for (const e of uniquePages) {
-          if (!e.tokens.length) {
-            countsAll.skipped += 1;
-            resultsAll.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'skipped_no_token' });
-            continue;
-          }
-          let pushed = null;
-          let usedAccount = null;
-          let lastStatus = 0;
-          let unreachable = false;
-          // Try the primary account's page token first, then each fallback account's token in turn.
-          for (const tk of e.tokens) {
-            let workerStatus = 0;
-            let data = {};
-            try {
-              const resp = await fetchImpl(syncUrlAll, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecretAll },
-                body: JSON.stringify({
-                  namespace_id: ns,
-                  page_id: e.page_id,
-                  page_name: e.page_name,
-                  access_token: tk.token,
-                  comment_token: tk.token,
-                  account: tk.account,
-                  token_source: 'facebook_lite_bridge',
-                  is_active: 0,
-                  import_mode: 'facebook_lite_bridge_import'
-                })
-              });
-              workerStatus = Number(resp && resp.status) || 0;
-              try { data = await resp.json(); } catch { data = {}; }
-            } catch (err) {
-              unreachable = true;
-              continue; // automatic fallback to the next account that administers this page
-            }
-            const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
-            lastStatus = workerStatus;
-            if (success) { pushed = data; usedAccount = tk.account; break; }
-          }
-          if (!pushed) {
-            countsAll.errors += 1;
-            resultsAll.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: unreachable ? 'worker_unreachable' : 'worker_rejected', worker_status: lastStatus, fallback_used: false });
-            continue;
-          }
-          const fallbackUsed = usedAccount !== e.primary_account;
-          countsAll.imported += 1;
-          if (pushed.created) countsAll.created += 1;
-          if (pushed.updated) countsAll.updated += 1;
-          if (pushed.moved) countsAll.moved += 1;
-          if (fallbackUsed) countsAll.fallback_used += 1;
-          resultsAll.push({
-            page_id: e.page_id, page_name: e.page_name,
-            primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
-            account: usedAccount, fallback_used: fallbackUsed,
-            ...(fallbackUsed ? { fallback_account: usedAccount } : {}),
-            status: 'imported',
-            created: !!pushed.created, updated: !!pushed.updated, moved: !!pushed.moved,
-            staged_inactive: pushed.staged_inactive !== false
-          });
-        }
-
-        return send(res, 200, {
-          ok: countsAll.errors === 0,
-          synced: countsAll.imported > 0,
-          status: countsAll.errors === 0 ? 'imported' : 'imported_with_errors',
-          mode: 'all_accounts', target, namespace_id: ns,
-          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
-          import_mode: 'facebook_lite_bridge_import',
-          accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
-          accounts: accountResults,
-          counts: { ...countsAll, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
-          results: resultsAll
-        });
+        // Facebook Lite bulk page import removed. Minting/enumeration/profile-sync now lives ONLY in
+        // the IDLogin/IDBridge stack (receiver 8799 mints from iOS-Keychain credentials and pushes
+        // page tokens to the Worker). Fail closed — this service no longer mints Facebook Lite.
+        return facebookLiteRemoved(res);
       }
 
       if (req.method === 'POST' && url.pathname === '/token/auto-sync') {
-        // TRUE-BRIDGE RECOVERY. After Facebook invalidates a session/token and the operator logs
-        // the bridge back in, this single call re-mints a FRESH Facebook Lite (EAAD6V) token,
-        // lists administered pages over REAL-TIME me/accounts, and refreshes the page token of
-        // EVERY matching page in the target namespace via the Worker's secret-authed
-        // /api/pages/profile-sync — so posting resumes automatically WITHOUT the Dev exporting
-        // page-by-page. Unlike /token/import-pages this is NOT admin-only: it is recovery for the
-        // production namespace's EXISTING pages. Safety is preserved by sending the same
-        // import_mode=facebook_lite_bridge_import marker the importer uses, so the Worker upsert:
-        //   • refreshes an EXISTING page's token (is_active untouched — an active page keeps posting,
-        //     a previously-staged inactive page is NEVER auto-activated),
-        //   • DECLINES to move/steal a page that already posts in another namespace (returns a
-        //     structured conflict), and
-        //   • stages any genuinely-new page inactive for the operator to enable later.
-        // Local-only for live writes (it resolves Keychain creds + page tokens); dry-run by default;
-        // token-free in EVERY response (no raw token ever returned or logged). Event-driven only —
-        // there is NO background polling/mint loop here; one call = one real-time scan + push.
-        const syncBody = await parseBody(req);
-        const { target = 'video-affiliate', workerUrl, dryRun = true } = syncBody;
-        // Namespace: explicit body value first, else an env-configured default so the operator/UI can
-        // trigger recovery without re-typing the production namespace each time. Never hardcoded.
-        const ns = String(
-          syncBody.namespaceId || syncBody.namespace_id ||
-          process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE || ''
-        ).trim();
-        if (!ns) return sendError(res, 400, 'Missing namespaceId');
-        const wantDryRun = dryRun !== false;
-
-        // Page-targeted recovery: when the caller names the SPECIFIC page whose token was invalidated,
-        // the scan is scoped to that page so the response distinguishes "refreshed it" from "no scanned
-        // account administers it" (page_not_found_for_all_accounts), instead of silently touching nothing.
-        const targetPageId = String(syncBody.pageId || syncBody.page_id || '').trim();
-        // Explicit fallback accounts (accepted under several field names) + env-configured mappings. The
-        // chain lets Chanalai → Thanwan work without hardcoding any uid: the bridge tries the primary
-        // account first, then each fallback, and only syncs from an account that actually lists the page.
-        const explicitFallbackAccounts = parseAccountList(
-          syncBody.fallbackAccounts || syncBody.accountFallbacks || syncBody.fallback_accounts
-        );
-        const envAccountFallbacks = parseFallbackMapEnv(process.env.FACEBOOK_TOKEN_CLOAK_ACCOUNT_FALLBACKS);
-        const envPageFallbacks = parseFallbackMapEnv(process.env.FACEBOOK_TOKEN_CLOAK_PAGE_FALLBACK_ACCOUNTS);
-
-        // Live writes resolve Keychain credentials + page tokens. INTERNAL machine-to-machine recovery:
-        // a LOCAL caller OR a caller presenting the shared bridge sync secret may drive a live recovery,
-        // so the remote Worker can trigger auto-sync over the cloudflared tunnel WITHOUT any operator/UI
-        // action. A non-local caller without the secret is rejected. The secret is never echoed/logged.
-        const autoSyncSecret = String(
-          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
-          process.env.TAG_SYNC_PUSH_SECRET ||
-          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
-          ''
-        ).trim();
-        const providedAutoSyncSecret = String(
-          (req.headers && (req.headers['x-bridge-sync-secret'] || req.headers['x-tag-sync-secret'])) || ''
-        ).trim();
-        const autoSyncSecretAuthorized = !!autoSyncSecret && providedAutoSyncSecret === autoSyncSecret;
-        if (!wantDryRun && !isLocalRequest(req) && !autoSyncSecretAuthorized) {
-          return sendError(res, 403, 'Live auto-sync requires localhost or a valid bridge sync secret');
-        }
-
-        // Account selection mirrors the all-account importer: an explicit `accounts` list verbatim,
-        // a SPECIFIC `account`, or all-mode (account omitted/empty/"all"/"*") which scans every
-        // FB-Lite-likely Bridge account from the local registry/status list in REAL TIME now.
-        const explicitAccounts = parseAccountList(syncBody.accounts);
-        const rawAccount = String(syncBody.account == null ? '' : syncBody.account).trim();
-        const allMode = (explicitAccounts && explicitAccounts.length > 0)
-          || rawAccount === '' || rawAccount.toLowerCase() === 'all' || rawAccount === '*';
-        let scanAccounts;
-        if (explicitAccounts && explicitAccounts.length > 0) {
-          scanAccounts = explicitAccounts;
-        } else if (!allMode) {
-          scanAccounts = [rawAccount];
-        } else {
-          let statuses = [];
-          try { statuses = await listAccountStatuses(kc, selectors, registry); } catch { statuses = []; }
-          const seen = new Set();
-          scanAccounts = [];
-          for (const s of statuses) {
-            if (!s || !s.account || seen.has(s.key)) continue;
-            const likelyLite = s.inRegistry || s.credentialPresent || s.selectorPresent;
-            if (!likelyLite) continue;
-            seen.add(s.key);
-            scanAccounts.push(s.account);
-          }
-        }
-        // Append the configured fallback chain AFTER the primary scan order so the primary account is
-        // always tried first; the chain is deduped against what is already scheduled to scan. The primary
-        // account for env-mapping lookup is the explicit account (single mode) or the first listed one.
-        const primaryAccountForFallback = !allMode
-          ? rawAccount
-          : ((explicitAccounts && explicitAccounts[0]) || '');
-        const fallbackChain = resolveFallbackChain({
-          explicit: explicitFallbackAccounts,
-          pageId: targetPageId,
-          primaryAccount: primaryAccountForFallback,
-          envAccountFallbacks,
-          envPageFallbacks
-        });
-        if (fallbackChain.length) {
-          const scheduled = new Set(scanAccounts.map((a) => { try { return sanitizeAccount(a).key; } catch { return String(a).toLowerCase(); } }));
-          for (const fb of fallbackChain) {
-            let key; try { key = sanitizeAccount(fb).key; } catch { continue; }
-            if (scheduled.has(key)) continue;
-            scheduled.add(key);
-            scanAccounts.push(fb);
-          }
-        }
-        // Mode label: a primary account with a configured fallback chain is its own mode (the recovery
-        // is targeted, not a blanket all-account scan, but it is no longer a single account either).
-        const modeLabel = allMode
-          ? 'all_accounts'
-          : (fallbackChain.length ? 'primary_with_fallback' : 'single_account');
-
-        if (!scanAccounts.length) {
-          return send(res, 200, {
-            ok: false, status: 'no_accounts_to_scan', namespace_id: ns, mode: modeLabel,
-            note: 'No Facebook Lite account resolved to scan. Pass an explicit account or register one.'
-          });
-        }
-
-        // LIVE backoff: skip a fresh mint/scan if this namespace was already recovered within the TTL
-        // window. The automatic Worker trigger fires per failing page; one live scan refreshes them all,
-        // so a repeat within the window is wasted Facebook logins. Dry-run previews are never throttled.
-        if (!wantDryRun && AUTO_SYNC_TTL_MS > 0) {
-          const lastLive = autoSyncLastLiveByNamespace.get(ns) || 0;
-          if (lastLive && (Date.now() - lastLive) < AUTO_SYNC_TTL_MS) {
-            return send(res, 200, {
-              ok: true, synced: false, status: 'throttled', skipped: true,
-              mode: modeLabel, namespace_id: ns,
-              note: 'A live auto-sync ran for this namespace within the backoff window; skipped to avoid Facebook login rate limits.'
-            });
-          }
-          // Stamp BEFORE the mint so even a failed attempt counts toward backoff (failures are exactly
-          // what we must avoid hammering Facebook with).
-          autoSyncLastLiveByNamespace.set(ns, Date.now());
-        }
-
-        // Mint + validate + list each account in REAL TIME, de-duping pages by page_id (first account
-        // = primary, others = fallback). A token that mints EAAD6V-shaped but is Graph-rejected (e.g.
-        // password/session reset, or a fresh rate-limit) is reported NOT ready with a sanitized reason
-        // and contributes no pages — Ready never lies. The internal token pool is never serialized.
-        const pageMap = new Map();
-        const accountResults = [];
-        let accountsOk = 0;
-        let accountsFailed = 0;
-        for (const acct of scanAccounts) {
-          const accDisplay = sanitizeAccount(acct).display;
-          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, acct).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-          if (!lite.ok || !lite.token) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'fb_lite_token_not_ready', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
-            continue;
-          }
-          // Real-time Graph validation BEFORE listing pages: a minted EAAD6V string is not proof of
-          // usability. If me/accounts is rejected (invalidated/rate-limited), report a sanitized
-          // reason and skip — never treat a Graph-rejected token as Ready.
-          const validation = await validateFacebookLiteGraphToken(lite);
-          if (!validation.ok) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'token_not_ready', error: validation.reason, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
-            continue;
-          }
-          let listed;
-          try {
-            listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
-          } catch (e) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') });
-            continue;
-          }
-          if (listed && listed.error) {
-            accountsFailed += 1;
-            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: classifyGraphTokenError(listed.error) });
-            continue;
-          }
-          const pages = Array.isArray(listed.data) ? listed.data : [];
-          accountsOk += 1;
-          let withToken = 0;
-          for (const p of pages) {
-            const pageId = p && p.id != null ? String(p.id) : '';
-            if (!pageId) continue;
-            const pageName = p && p.name != null ? String(p.name) : '';
-            const pageToken = p && p.access_token ? String(p.access_token) : '';
-            if (pageToken) withToken += 1;
-            if (!pageMap.has(pageId)) {
-              pageMap.set(pageId, { page_id: pageId, page_name: pageName, primary_account: accDisplay, fallback_accounts: [], tokens: [] });
-            }
-            const entry = pageMap.get(pageId);
-            if (!entry.page_name && pageName) entry.page_name = pageName;
-            if (accDisplay !== entry.primary_account && !entry.fallback_accounts.includes(accDisplay)) {
-              entry.fallback_accounts.push(accDisplay);
-            }
-            if (pageToken) entry.tokens.push({ account: accDisplay, token: pageToken });
-          }
-          accountResults.push({ account: accDisplay, ok: true, page_count: pages.length, with_token: withToken, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
-        }
-
-        const uniquePages = [...pageMap.values()];
-        // Page-targeted recovery scopes everything below to the single requested page. When the target
-        // page was not administered by ANY scanned account (primary OR fallback), fail CLOSED with a
-        // distinct, token-free reason — NEVER silently push nothing. `fallback_account_missing_page` =
-        // at least one scanned account WAS ready but did not list the page (e.g. Thanwan is logged in
-        // but is not an admin of the Chanalai page); `page_not_found_for_all_accounts` = no account was
-        // even ready to list pages.
-        const recoveryPages = targetPageId ? uniquePages.filter((e) => e.page_id === targetPageId) : uniquePages;
-        if (targetPageId && recoveryPages.length === 0) {
-          const someAccountReady = accountsOk > 0;
-          return send(res, 200, {
-            ok: false, synced: false,
-            ...(wantDryRun ? { dryRun: true } : {}),
-            status: 'page_not_found_for_all_accounts',
-            reason: someAccountReady ? 'fallback_account_missing_page' : 'page_not_found_for_all_accounts',
-            mode: modeLabel, target, namespace_id: ns, page_id: targetPageId,
-            selected_account: null, fallback_used: false, profile_sync_success: false,
-            source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
-            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
-            accounts: accountResults,
-            fallback_accounts_configured: fallbackChain,
-            counts: { candidates: 0, with_token: 0, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
-            candidates: [],
-            note: someAccountReady
-              ? 'The target page is not administered by any scanned/fallback account (a ready fallback account does not list it). Add/admin the page on a fallback account, then recovery can complete.'
-              : 'No scanned account could list pages (token not ready / rate-limited), so the target page could not be located.'
-          });
-        }
-        const candidateView = recoveryPages.map((e) => ({
-          page_id: e.page_id, page_name: e.page_name,
-          primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
-          has_token: e.tokens.length > 0
-        }));
-
-        // SAFE default: a dry run lists the deduped candidate pages + per-account scan outcomes and
-        // performs NO Worker/D1 writes. Token-free.
-        if (wantDryRun) {
-          return send(res, 200, {
-            ok: accountsOk > 0, dryRun: true, status: 'dry_run_only',
-            mode: modeLabel, target,
-            namespace_id: ns, source: 'facebook_lite_eaad6',
-            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
-            ...(targetPageId ? { page_id: targetPageId } : {}),
-            fallback_accounts_configured: fallbackChain,
-            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
-            accounts: accountResults,
-            counts: {
-              candidates: candidateView.length,
-              with_token: candidateView.filter((c) => c.has_token).length,
-              accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed
-            },
-            candidates: candidateView,
-            note: 'No Cloudflare/D1 writes performed. A live auto-sync refreshes each EXISTING page token (is_active untouched), skips pages owned by another namespace, and stages genuinely-new pages inactive.'
-          });
-        }
-
-        // ── Live auto-sync: refresh each unique page once via the secret-authed profile-sync, with
-        // automatic fallback to the next account that administers the page if a push fails. ──
-        const syncSecretAuto = String(
-          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
-          process.env.TAG_SYNC_PUSH_SECRET ||
-          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
-          ''
-        ).trim();
-        if (!syncSecretAuto) {
-          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: modeLabel, namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
-        }
-        const baseAuto = String(
-          workerUrl ||
-          process.env.VIDEO_AFFILIATE_WORKER_URL ||
-          process.env.WORKER_URL ||
-          'https://api.pubilo.com'
-        ).trim().replace(/\/+$/, '');
-        const syncUrlAuto = `${baseAuto}/api/pages/profile-sync`;
-
-        const countsAuto = { refreshed: 0, staged: 0, skipped: 0, errors: 0, no_token: 0, fallback_used: 0, synced: 0 };
-        const resultsAuto = [];
-        for (const e of recoveryPages) {
-          if (!e.tokens.length) {
-            countsAuto.no_token += 1;
-            resultsAuto.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'error', reason: 'page_token_unavailable' });
-            continue;
-          }
-          let pushed = null;
-          let usedAccount = null;
-          let lastStatus = 0;
-          let unreachable = false;
-          for (const tk of e.tokens) {
-            let workerStatus = 0;
-            let data = {};
-            try {
-              const resp = await fetchImpl(syncUrlAuto, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecretAuto },
-                body: JSON.stringify({
-                  namespace_id: ns,
-                  page_id: e.page_id,
-                  page_name: e.page_name,
-                  access_token: tk.token,
-                  comment_token: tk.token,
-                  account: tk.account,
-                  token_source: 'facebook_lite_bridge',
-                  // No-steal + no-surprise-activate: refresh existing rows, skip cross-namespace pages,
-                  // stage truly-new pages inactive. Existing rows' is_active is never changed.
-                  import_mode: 'facebook_lite_bridge_import'
-                })
-              });
-              workerStatus = Number(resp && resp.status) || 0;
-              try { data = await resp.json(); } catch { data = {}; }
-            } catch (err) {
-              unreachable = true;
-              continue; // automatic fallback to the next account that administers this page
-            }
-            const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
-            lastStatus = workerStatus;
-            if (success) { pushed = data; usedAccount = tk.account; break; }
-          }
-          if (!pushed) {
-            countsAuto.errors += 1;
-            resultsAuto.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'error', reason: unreachable ? 'worker_unreachable' : 'worker_rejected', worker_status: lastStatus, profile_sync_success: false });
-            continue;
-          }
-          const fallbackUsed = usedAccount !== e.primary_account;
-          if (fallbackUsed) countsAuto.fallback_used += 1;
-          // The Worker upsert reports skipped=true with a conflict_namespace_id when a staging refresh
-          // declined to move a page already owned by another namespace — surface it as SKIPPED, not synced.
-          if (pushed.skipped === true) {
-            countsAuto.skipped += 1;
-            resultsAuto.push({
-              page_id: e.page_id, page_name: e.page_name,
-              primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
-              account: usedAccount, fallback_used: fallbackUsed,
-              status: 'skipped', reason: 'conflict_other_namespace',
-              conflict_namespace_id: pushed.conflict_namespace_id || pushed.conflictNamespaceId || null,
-              profile_sync_success: true, worker_status: lastStatus
-            });
-            continue;
-          }
-          countsAuto.synced += 1;
-          const staged = !!pushed.created; // a new page was inserted (staged inactive)
-          if (staged) countsAuto.staged += 1; else countsAuto.refreshed += 1;
-          resultsAuto.push({
-            page_id: e.page_id, page_name: e.page_name,
-            primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
-            account: usedAccount, fallback_used: fallbackUsed,
-            ...(fallbackUsed ? { fallback_account: usedAccount } : {}),
-            status: staged ? 'staged' : 'synced',
-            created: !!pushed.created, updated: !!pushed.updated, moved: !!pushed.moved,
-            staged_inactive: staged ? (pushed.staged_inactive !== false) : false,
-            profile_sync_success: true, worker_status: lastStatus
-          });
-        }
-
-        // Page-targeted summary: surface the single page's outcome at the top level so the Worker can
-        // act on it directly (which account actually recovered it, whether a fallback was used). Here
-        // `fallback_used` is measured against the CONFIGURED primary account (the one named in the
-        // request / the head of the scan order), so a recovery via Thanwan for a Chanalai-primary page
-        // reads as fallback_used=true even when Chanalai's token was so dead it listed no pages at all.
-        const targetRow = targetPageId ? resultsAuto.find((r) => r.page_id === targetPageId) : null;
-        const selectedAccount = (targetRow && (targetRow.account || targetRow.primary_account)) || null;
-        const configuredPrimaryKey = (() => { try { return primaryAccountForFallback ? sanitizeAccount(primaryAccountForFallback).key : ''; } catch { return ''; } })();
-        const selectedKey = (() => { try { return selectedAccount ? sanitizeAccount(selectedAccount).key : ''; } catch { return ''; } })();
-        const targetFallbackUsed = configuredPrimaryKey && selectedKey
-          ? selectedKey !== configuredPrimaryKey
-          : !!(targetRow && targetRow.fallback_used);
-        const targetSummary = targetPageId ? {
-          page_id: targetPageId,
-          selected_account: selectedAccount,
-          fallback_used: targetFallbackUsed,
-          profile_sync_success: !!(targetRow && targetRow.profile_sync_success),
-        } : {};
-
-        return send(res, 200, {
-          ok: countsAuto.errors === 0 && accountsOk > 0,
-          synced: countsAuto.synced > 0,
-          status: countsAuto.errors === 0 ? 'synced' : 'synced_with_errors',
-          mode: modeLabel, target, namespace_id: ns,
-          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
-          import_mode: 'facebook_lite_bridge_import',
-          ...targetSummary,
-          fallback_accounts_configured: fallbackChain,
-          accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
-          accounts: accountResults,
-          counts: { ...countsAuto, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
-          results: resultsAuto
-        });
+        // Facebook Lite auto-sync/re-mint removed. A stale page token is recovered by the operator
+        // re-logging in through the IDLogin/IDBridge app (receiver 8799), which mints in-memory and
+        // profile-syncs a fresh token to the Worker. Fail closed — no machine re-mint from 8820.
+        return facebookLiteRemoved(res);
       }
 
       // ── Worker posting bridge routes (CloakBrowser) ──────────────────────────────────────
@@ -2208,27 +1277,8 @@ function createHandler(deps = {}) {
       if (req.method === 'GET' && url.pathname === '/token') {
         const account = url.searchParams.get('account') || POST_ACCOUNT;
         if (wantsFacebookLiteBridge(account, { facebook_lite: url.searchParams.get('facebook_lite') || url.searchParams.get('token_source') || '' })) {
-          const includeToken = ['1', 'true', 'yes'].includes(String(url.searchParams.get('includeToken') || '').trim().toLowerCase());
-          if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
-          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-          if (!lite.ok) return send(res, 200, { ok: false, accessToken: false, fbDtsg: false, source: 'facebook_lite_eaad6', account: sanitizeAccount(account).display, error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), tokenPrefix: lite.prefix || null });
-          // Real-time Graph validation gate: a minted EAAD6V string/prefix is NOT proof of usability.
-          // Confirm the token authorizes me/accounts (Page-token operations) NOW. A token invalidated
-          // by a password change / security reset is EAAD6V-shaped but Graph-rejected — it must report
-          // ok=false/accessToken=false here, never Ready.
-          const validation = await validateFacebookLiteGraphToken(lite);
-          if (!validation.ok) {
-            return send(res, 200, { ok: false, accessToken: false, fbDtsg: false, source: 'facebook_lite_eaad6', account: sanitizeAccount(account).display, error: validation.reason, tokenPrefix: lite.prefix || null });
-          }
-          const payload = { ok: true, accessToken: true, fbDtsg: false, source: 'facebook_lite_eaad6', tokenPrefix: lite.prefix, account: sanitizeAccount(account).display };
-          // Operator verification ONLY: reveal the raw EAAD6V token on an explicit local request
-          // (includeToken=1 from 127.0.0.1, e.g. the bundled UI's "Reveal token" button). Never on a
-          // remote/tunnel request, and never logged.
-          if (includeToken && isLocalRequest(req)) {
-            payload.token = lite.token;
-            payload.warning = 'Raw token included only because includeToken=1 on localhost. Do not log or share this response.';
-          }
-          return send(res, 200, payload);
+          // Facebook Lite token readiness moved to the IDLogin/IDBridge stack — fail closed here.
+          return facebookLiteRemoved(res, { account: sanitizeAccount(account).display });
         }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
@@ -2257,19 +1307,10 @@ function createHandler(deps = {}) {
         const account = url.searchParams.get('account') || POST_ACCOUNT;
         const includeToken = ['1', 'true', 'yes'].includes(String(url.searchParams.get('includeToken') || '').trim().toLowerCase());
         if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
-        // Facebook Lite account: list administered pages from the freshly-minted EAAD6V user token via
-        // me/accounts (NOT a CloakBrowser session). This is what the Worker's session-bridge organic
-        // publish path probes (/token + /pages) before posting, and what /pages?includeToken=1 reads.
+        // Facebook Lite page enumeration moved to the IDLogin/IDBridge stack (the receiver mints and
+        // profile-syncs page tokens directly to the Worker) — fail closed here for a Lite account.
         if (wantsFacebookLiteBridge(account, { facebook_lite: url.searchParams.get('facebook_lite') || url.searchParams.get('token_source') || '' })) {
-          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-          if (!lite.ok || !lite.token) return send(res, 200, { data: [], source: 'facebook_lite_eaad6', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready') });
-          const result = await posting.listPagesPublic(lite.graphFetch, lite.token, includeToken && isLocalRequest(req));
-          // Fail closed on a Graph token-validation error (e.g. password/session invalidated): return
-          // an empty list with a SANITIZED reason, never the raw Graph message and never source-ready.
-          if (result && result.error) {
-            return send(res, 200, { data: [], source: 'facebook_lite_eaad6', error: classifyGraphTokenError(result.error) });
-          }
-          return send(res, 200, { ...result, source: 'facebook_lite_eaad6' });
+          return facebookLiteRemoved(res, { account: sanitizeAccount(account).display });
         }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
@@ -2294,24 +1335,10 @@ function createHandler(deps = {}) {
       if (req.method === 'POST' && url.pathname === '/post') {
         const body = await parseBody(req);
         const account = body.account || POST_ACCOUNT;
+        // Organic Facebook Lite publishing moved to the IDLogin/IDBridge stack — the Worker now posts
+        // directly with its profile-synced Lite page token. Fail closed here for a Lite account.
         if (wantsFacebookLiteBridge(account, body)) {
-          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-          if (!lite.ok || !lite.token) return send(res, 200, { ok: false, step: 'facebook_lite_token', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), source: 'facebook_lite_eaad6', token_prefix: lite.prefix || null });
-          // A Facebook Lite (EAAD6V) PAGE token publishes an ORGANIC page video via /{page_id}/videos
-          // with the page token — it has NO ad-account access, so the OneCard/advideos path returns
-          // "(#10) Permission Denied". This is the organic /post the Worker's facebook_lite_bridge
-          // fallback calls; the Shopee link rides in the Page comment (/page-comment), not an ad CTA.
-          const result = await posting.publishPageVideoPost(lite.graphFetch, {
-            userToken: lite.token,
-            pageId: body.page_id,
-            videoUrl: body.video_url,
-            caption: body.message,
-            title: body.title,
-            adName: body.ad_name,
-            downloadVideo,
-            pollMs: POLL_MS
-          });
-          return send(res, postingStatus(result), { ...result, source: 'facebook_lite_eaad6', token_prefix: lite.prefix });
+          return facebookLiteRemoved(res, { account: sanitizeAccount(account).display });
         }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
@@ -2348,17 +1375,9 @@ function createHandler(deps = {}) {
           if (!key || tried.has(key)) return null;
           tried.add(key);
           if (allowLite && wantsFacebookLiteBridge(account, body)) {
-            const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
-            if (!lite.ok || !lite.token) return { ok: false, status: 200, step: 'facebook_lite_token', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), source: 'facebook_lite_eaad6', token_prefix: lite.prefix || null };
-            const result = await posting.pageComment(lite.graphFetch, {
-              userToken: lite.token,
-              pageId: body.page_id,
-              target: body.target,
-              storyId: body.story_id,
-              postId: body.post_id,
-              message: body.message
-            });
-            return { ...result, source: 'facebook_lite_eaad6', token_prefix: lite.prefix };
+            // Facebook Lite comment-token minting removed — the Worker comments directly with its
+            // profile-synced Lite page token. Fail closed (no EAAD6V mint here).
+            return { ok: false, status: 410, step: 'facebook_lite_removed', error: 'facebook_lite_removed', source: 'facebook_lite_eaad6' };
           }
           const session = await posting.resolveSessionToken({ browser: br, account });
           try {

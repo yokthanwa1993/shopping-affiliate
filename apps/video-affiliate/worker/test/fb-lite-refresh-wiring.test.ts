@@ -53,34 +53,25 @@ test('profile-sync accepts EITHER TAG_SYNC_PUSH_SECRET OR a dedicated BRIDGE_TOK
     assert.ok(/!!bridgeTokenSecret && providedSecret === bridgeTokenSecret/.test(body), 'bridge-token secret branch')
 })
 
-test('refresh helper posts to the BrowserSaving secret route via the authenticated base fetch', () => {
+test('BrowserSaving FB Lite mint helper is REMOVED — no 8820/BrowserSaving Facebook Lite mint call remains', () => {
     const src = readVideoAffiliateIndex()
-    const start = src.indexOf('async function postFacebookLiteRefresh')
-    assert.notEqual(start, -1, 'postFacebookLiteRefresh must exist')
+    // The BrowserSaving mint POST helper is gone entirely; minting moved to the IDLogin/IDBridge stack.
+    assert.equal(src.indexOf('async function postFacebookLiteRefresh'), -1, 'postFacebookLiteRefresh must be removed')
+    assert.ok(!src.includes("'/api/fb-lite/refresh-comment-token'"), 'no BrowserSaving FB Lite mint route call may remain')
+    // refreshFacebookLiteCommentTokenForPage is now a fail-closed stub.
+    const start = src.indexOf('async function refreshFacebookLiteCommentTokenForPage')
     const fn = src.slice(start, src.indexOf('async function probeFacebookLiteProfilesForPage', start))
-    assert.ok(fn.includes("'/api/fb-lite/refresh-comment-token'"), 'must call the BrowserSaving refresh route')
-    assert.ok(fn.includes('fetchFromBrowserSavingBase'), 'must use the authenticated cross-worker fetch (adds x-tag-sync-secret)')
-    assert.ok(fn.includes('buildFacebookLiteRefreshRequestBody'), 'must build the token-free request body')
-    assert.ok(fn.includes('parseFacebookLiteRefreshResponse'), 'must parse the token-free response')
-    // Token-free: the refresh helper must not log a token, only ids/booleans/redacted hints.
-    const refreshStart = src.indexOf('async function refreshFacebookLiteCommentTokenForPage')
-    const refreshFn = src.slice(refreshStart, src.indexOf('async function probeFacebookLiteProfilesForPage', refreshStart))
-    const logLine = refreshFn.split('\n').find((l) => l.includes('console.log')) || ''
-    assert.ok(!/token=\$\{/.test(logLine), 'refresh log must never interpolate a token value')
+    assert.ok(fn.includes("reason: 'idlogin_relogin_required'"), 'refresh helper must fail closed with idlogin_relogin_required')
+    assert.ok(!fn.includes('fetchFromBrowserSavingBase'), 'refresh helper must not call BrowserSaving')
 })
 
-test('refresh is auto-discovery first-class: no_linked_profile is NOT terminal', () => {
+test('refreshFacebookLiteCommentTokenForPage no longer mints/auto-discovers — fails closed', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function refreshFacebookLiteCommentTokenForPage')
     const fn = src.slice(start, src.indexOf('async function probeFacebookLiteProfilesForPage', start))
-    // The old terminal "no_linked_profile" early-return must be gone.
-    assert.ok(!fn.includes("'no_linked_profile'"), 'must not early-return no_linked_profile')
-    // Linked profiles are tried first, but a page-only auto-discovery request is always made
-    // when nothing synced (profile_id omitted → BrowserSaving discovers the owner).
-    assert.ok(fn.includes('buildFacebookLiteRefreshRequestBody({ profileId, pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateLoginIds: explicitCandidateLoginIds })'), 'linked profile attempt')
-    assert.ok(fn.includes('buildFacebookLiteRefreshRequestBody({ pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateProfileIds: linkedIds, candidateLoginIds: explicitCandidateLoginIds })'), 'page-only auto-discovery attempt')
-    // Owner-scoped discovery for multi-tenant safety.
-    assert.ok(fn.includes('resolveNamespaceOwnerEmails'), 'must scope discovery by namespace owner email')
+    assert.ok(fn.includes("return { refreshed: false, synced: false, profileCount: 0, reason: 'idlogin_relogin_required' }"), 'must fail closed')
+    assert.ok(!fn.includes('buildFacebookLiteRefreshRequestBody'), 'no BrowserSaving refresh request may be built')
+    assert.ok(!fn.includes('postFacebookLiteRefresh'), 'no BrowserSaving mint may be invoked')
 })
 
 test('refresh profile resolution prefers linked profiles, falls back to tag-derived', () => {
@@ -312,113 +303,77 @@ test('stuck comment_status=processing rows are reset by the general cron scan', 
 // and retry the publish ONCE. Token-free. (index.ts read as source; not importable.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('publish wrapper refreshes + retries once only on stored-token auth failure', () => {
+test('publish wrapper fails closed on a stored-token auth failure — no re-mint, no retry (idlogin_relogin_required)', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
-    assert.notEqual(start, -1, 'the stored-token publish+refresh wrapper must exist')
+    assert.notEqual(start, -1, 'the stored-token publish wrapper must exist')
     const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
-    // Happy path delegates to the existing fallback chain.
+    // Happy path still delegates to the existing publish chain.
     assert.ok(fn.includes('await publishReelWithCommentTokenPrimaryFallback('), 'must call the existing publish fallback chain')
-    // Refresh is gated by the pure posting predicate (auth-failure / missing token only).
-    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'refresh must be gated by the posting predicate')
-    // Non-auth failures are rethrown untouched (never masked).
-    assert.ok(/throw publishErr/.test(fn), 'a non-auth failure must rethrow the original publish error')
-    // Re-mint + reload + single retry.
-    assert.ok(fn.includes('refreshFacebookLitePostingTokenForPage('), 'must call the posting-token refresh helper')
-    assert.ok(fn.includes('params.reloadTokens()'), 'must reload the fresh token pool before retrying')
-    assert.ok(fn.includes('POST-REFRESH-RETRY'), 'the retry must be a single labeled re-publish')
-    // Only retries when a fresh token actually synced.
-    assert.ok(/if \(!refresh\.synced\)/.test(fn), 'must only retry when a fresh token was synced')
-    // Token-free: never interpolate a token into a log line.
-    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
-    assert.ok(logLines.every((l) => !/token=\$\{|accessToken|\.token\}/.test(l)), 'wrapper logs must never interpolate a token value')
+    // Auth failure is still classified, but there is NO re-mint / auto-sync / reload+retry.
+    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'auth failure is still classified')
+    assert.ok(!fn.includes('refreshFacebookLitePostingTokenForPage('), 'must NOT call the posting-token re-mint')
+    assert.ok(!fn.includes('params.reloadTokens()'), 'must NOT reload + retry after a re-mint')
+    assert.ok(!fn.includes('POST-REFRESH-RETRY'), 'no re-mint retry may remain')
+    assert.ok(fn.includes('idlogin_relogin_required:'), 'an auth/invalidation failure surfaces idlogin_relogin_required')
+    assert.ok(/throw publishErr/.test(fn), 'a non-auth failure rethrows the original error')
 })
 
-test('publish wrapper routes (#10) Permission Denied to the Facebook Lite bridge ORGANIC /post (distinct, fail-closed)', () => {
+test('publish wrapper does NOT fall back to the CloakBrowser bridge organic /post for a Facebook Lite page', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
     const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
-    // The gate now admits permission-denied (#10) in ADDITION to the auth-failure refresh predicate,
-    // so the ad-account "(#10) Permission Denied" no longer rethrows before the bridge fallback.
-    assert.ok(fn.includes('isFacebookLitePostingPermissionError('), '(#10) permission errors must be detected')
-    assert.ok(/if \(!authFailure && !permissionDenied\)/.test(fn), 'gate must enter the fallback on auth failure OR permission denied')
-    // The bridge ORGANIC /post is attempted (publishReelViaSessionBridge, facebook_lite_bridge hint).
-    assert.ok(fn.includes('publishReelViaSessionBridge('), 'must attempt the Facebook Lite bridge organic /post')
-    assert.ok(fn.includes("postingTokenHint: 'facebook_lite_bridge'"), 'bridge publish is tagged facebook_lite_bridge')
-    // Fail-closed with DISTINCT errors so Hermes can see which path was attempted.
-    assert.ok(fn.includes('facebook_lite_bridge_organic_post_failed:'), 'a failed bridge organic post surfaces a distinct error')
-    assert.ok(fn.includes('facebook_lite_permission_denied_no_bridge_account:'), 'permission denied + no bridge account surfaces distinctly')
+    // The bridge organic /post fallback is gone entirely from the wrapper.
+    assert.ok(!fn.includes('publishReelViaSessionBridge('), 'no CloakBrowser bridge organic /post fallback may remain')
+    assert.ok(!fn.includes('publishOrganicViaFacebookLiteBridge('), 'the FB Lite bridge organic helper is not called')
+    // A (#10) permission or auth failure fails closed with idlogin_relogin_required.
+    assert.ok(fn.includes('isFacebookLitePostingPermissionError('), 'permission errors are still classified')
+    assert.ok(fn.includes('idlogin_relogin_required:'), 'permission/auth failure fails closed to idlogin_relogin_required')
 })
 
-test('EAAD6V token publishes via direct /{page}/videos (is_reel OFF) as PRIMARY, never /video_reels; bridge organic /post is only the secondary', () => {
+test('EAAD6V token publishes via direct /{page}/videos (is_reel OFF) as the ONLY path — no bridge organic secondary', () => {
     const src = readVideoAffiliateIndex()
     const wrapStart = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
     const wrapFn = src.slice(wrapStart, src.indexOf('type PageOneCardLinkMode', wrapStart))
-    // Detect the Facebook Lite (EAAD6V) post token up front.
+    // Detect the Facebook Lite (EAAD6V) post token up front (PRESERVED).
     assert.ok(/isFacebookLitePageToken\(litePostTokens\[0\]/.test(wrapFn), 'must detect a Facebook Lite (EAAD6V) post token up front')
-    // PRIMARY: Worker-direct /{page}/videos multipart with is_reel:false (the confirmed working path).
-    const litePrimaryIdx = wrapFn.indexOf('publishReelViaVideosEndpointWithTokenFallback(')
-    assert.ok(litePrimaryIdx >= 0, 'EAAD6V lane publishes via the direct /videos endpoint helper')
+    // PRIMARY (and only) publish: Worker-direct /{page}/videos multipart with is_reel:false.
+    assert.ok(wrapFn.includes('publishReelViaVideosEndpointWithTokenFallback('), 'EAAD6V lane publishes via the direct /videos endpoint helper')
     assert.ok(/isReel: false/.test(wrapFn), 'the EAAD6V /videos publish must OMIT is_reel (is_reel: false)')
-    // It runs BEFORE the generic Worker-direct chain and is NOT the /video_reels resumable path.
-    const genericDirectIdx = wrapFn.indexOf('return await publishReelWithCommentTokenPrimaryFallback({')
-    assert.ok(litePrimaryIdx < genericDirectIdx, 'the EAAD6V /videos publish must precede the generic publish chain')
-    // SECONDARY only (after the direct /videos attempt throws): the bridge organic /post.
-    const bridgeIdx = wrapFn.indexOf('publishOrganicViaFacebookLiteBridge(')
-    assert.ok(bridgeIdx > litePrimaryIdx, 'the bridge organic /post is a SECONDARY fallback, not the primary')
-    assert.ok(/reason: 'eaad6_videos_direct_failed'/.test(wrapFn), 'the bridge secondary is reached only after the direct /videos attempt fails')
+    // The bridge organic /post secondary is GONE — a direct failure fails closed.
+    assert.ok(!wrapFn.includes('publishOrganicViaFacebookLiteBridge('), 'no bridge organic /post secondary may remain')
+    assert.ok(!/reason: 'eaad6_videos_direct_failed'/.test(wrapFn), 'the removed bridge secondary marker must be gone')
+    assert.ok(wrapFn.includes('idlogin_relogin_required: Facebook Lite direct /videos publish failed'), 'a direct /videos failure fails closed to idlogin_relogin_required')
 
-    // publishReelDirect omits is_reel when isReel===false (matches the confirmed curl: source + published only).
+    // publishReelDirect still omits is_reel when isReel===false (unchanged).
     const directStart = src.indexOf('async function publishReelDirect(')
     const directFn = src.slice(directStart, src.indexOf('async function applyPreferredVideoThumbnail', directStart))
     assert.ok(/if \(params\.isReel !== false\) formData\.append\('is_reel', 'true'\)/.test(directFn), 'is_reel is appended only when not explicitly disabled')
 
-    // The bridge helper still surfaces a distinct, token-free capability blocker.
-    const helperStart = src.indexOf('async function publishOrganicViaFacebookLiteBridge')
-    const helperFn = src.slice(helperStart, src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh', helperStart))
-    assert.ok(helperFn.includes('facebook_lite_publish_capability_blocked:'), 'no usable bridge → distinct capability blocker (not an endless (#10))')
+    // The removed bridge organic helper is gone entirely.
+    assert.equal(src.indexOf('async function publishOrganicViaFacebookLiteBridge'), -1, 'publishOrganicViaFacebookLiteBridge must be removed')
 })
 
-test('posting-token refresh prefers BrowserSaving, falls back to the Bridge Token /pages tunnel', () => {
+test('refreshFacebookLitePostingTokenForPage is a fail-closed stub — no BrowserSaving mint, no Bridge /pages, no auto-sync', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function refreshFacebookLitePostingTokenForPage')
-    assert.notEqual(start, -1, 'refreshFacebookLitePostingTokenForPage must exist')
+    assert.notEqual(start, -1, 'refreshFacebookLitePostingTokenForPage must exist (fail-closed stub)')
     const fn = src.slice(start, src.indexOf('async function initReelUploadWithPostingTokenAutoRecover', start))
-    // 1) BrowserSaving secret mint + profile-sync is tried first.
-    assert.ok(fn.includes('refreshFacebookLiteCommentTokenForPage('), 'must try the BrowserSaving secret refresh first')
-    assert.ok(/if \(bs\.synced\)/.test(fn), 'must short-circuit when BrowserSaving synced a fresh token')
-    assert.ok(fn.includes("via: 'browsersaving'"), 'BrowserSaving success path is labeled')
-    // 2) Bridge Token /pages fallback when BrowserSaving did not sync.
-    assert.ok(fn.includes('fetchFacebookLitePageTokenFromBridge('), 'must fall back to the Bridge Token /pages fetch')
-    assert.ok(fn.includes('upsertNamespacePageFromProfileSync('), 'must sync the bridge token into pages.access_token / pool')
-    assert.ok(fn.includes("via: 'bridge_token_pages'"), 'bridge fallback success path is labeled')
+    assert.ok(fn.includes("return { refreshed: false, synced: false, via: 'none', reason: 'idlogin_relogin_required' }"), 'must fail closed')
+    assert.ok(!fn.includes('refreshFacebookLiteCommentTokenForPage('), 'no BrowserSaving mint tier may remain')
+    assert.ok(!fn.includes('upsertNamespacePageFromProfileSync('), 'no Bridge /pages token upsert tier may remain')
+    assert.ok(!fn.includes('triggerBridgeAutoSyncForPage('), 'no auto-sync tier may remain')
 })
 
-test('bridge token fetch uses /pages?account=...&includeToken=1 and never logs the token', () => {
+test('fetchFacebookLitePageTokenFromBridge is a stub — no 8820 /pages token fetch', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function fetchFacebookLitePageTokenFromBridge')
-    assert.notEqual(start, -1, 'fetchFacebookLitePageTokenFromBridge must exist')
+    assert.notEqual(start, -1, 'fetchFacebookLitePageTokenFromBridge must exist (stub)')
     const fn = src.slice(start, src.indexOf('async function refreshFacebookLitePostingTokenForPage', start))
-    // Resolves the Bridge Token base from env (CLOAK_FB_BRIDGE_URL = https://short.wwoom.com).
-    assert.ok(fn.includes('resolveCloakFbBridgeBaseUrl('), 'must resolve the bridge base from env (CLOAK_FB_BRIDGE_URL)')
-    // Hits the /pages route with includeToken and an optional account= candidate login id.
-    assert.ok(fn.includes('buildBridgeTokenPagesUrl('), 'must build the /pages lookup url')
-    assert.ok(/includeToken:\s*true/.test(fn), 'must request the raw token via includeToken=1')
-    assert.ok(fn.includes('candidateLoginIds'), 'must try candidate login ids as account= first')
-    // REGRESSION GUARD: the default-session sentinel ('') must be appended AFTER uniqueTokens —
-    // uniqueTokens() drops blanks, so folding '' into the dedupe silently skips the no-account
-    // default-session lookup, which is the LIVE production path (force-post/retry/cron pass no
-    // candidate ids; the tool's default session lists every administered page, e.g. CHEARB).
-    const flat = fn.replace(/\s+/g, ' ')
-    // The candidates must be SPREAD out of uniqueTokens (`...uniqueTokens(...)`) with '' as a
-    // sibling element — NOT `uniqueTokens([..., ''])`, which would drop the sentinel.
-    assert.ok(/\.\.\.\s*uniqueTokens\(/.test(fn), 'candidate ids must be spread out of uniqueTokens so the sentinel stays a sibling')
-    assert.ok(/\.\.\. ?uniqueTokens\(.+?\), ''/.test(flat), "default-session sentinel ('') must be appended after uniqueTokens, not deduped away")
-    assert.ok(fn.includes('extractBridgeTokenPageAccessToken('), 'must extract the matching page access_token')
-    // Token-free logging: only a presence flag is logged.
-    assert.ok(fn.includes('token_present=true'), 'logs token presence, not the value')
-    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
-    assert.ok(logLines.every((l) => !/\$\{[^}]*token[^}]*\}/i.test(l) || /token_present/.test(l)), 'must never interpolate a raw token into logs')
+    assert.ok(fn.includes("return { token: '', account: '' }"), 'must return no token (no 8820 contact)')
+    assert.ok(!fn.includes('buildBridgeTokenPagesUrl('), 'no /pages lookup url may be built')
+    assert.ok(!fn.includes('extractBridgeTokenPageAccessToken('), 'no page token extraction may remain')
+    assert.ok(!fn.includes('fetchWithTimeout('), 'no bridge fetch may remain')
 })
 
 test('profile-sync upsert accepts an EAAD6 Facebook Lite token as the lead post token (not dropped)', () => {
@@ -569,73 +524,36 @@ test('EAAD6V tokens NEVER enter the OneCard/ad-account lane — OneCard is skipp
 // (index.ts read as source; not importable under node:test.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-test('triggerBridgeAutoSyncForPage: secret-authed machine-to-machine call to the bridge /token/auto-sync, fails closed, token-free, backed off', () => {
+test('triggerBridgeAutoSyncForPage is a fail-closed stub — no bridge /token/auto-sync POST', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function triggerBridgeAutoSyncForPage')
-    assert.notEqual(start, -1, 'triggerBridgeAutoSyncForPage must exist')
+    assert.notEqual(start, -1, 'triggerBridgeAutoSyncForPage must exist (stub)')
     const fn = src.slice(start, src.indexOf('async function refreshFacebookLitePostingTokenForPage', start))
-    // Resolves the bridge base URL from configured env (CLOAK_FB_BRIDGE_URL) and the shared secret.
-    assert.ok(fn.includes('resolveCloakFbBridgeBaseUrl(params.env)'), 'must resolve the bridge base url from env')
-    assert.ok(fn.includes('getBridgeTokenSyncSecret(params.env)'), 'must resolve the shared bridge sync secret from env')
-    // Fail closed (no recovery marked) when the bridge URL or secret is missing.
-    assert.ok(/return \{ ok: false, synced: false, reason: 'bridge_not_configured' \}/.test(fn), 'must fail closed when the bridge url is missing')
-    assert.ok(/return \{ ok: false, synced: false, reason: 'sync_secret_missing' \}/.test(fn), 'must fail closed when the secret is missing')
-    // Sends the secret as a machine-to-machine header (NOT a UI/local-only path).
-    assert.ok(fn.includes("'x-bridge-sync-secret': secret") || fn.includes('x-bridge-sync-secret'), 'must send the bridge sync secret header')
-    // Uses the pure helpers to build the URL/body and parse the response.
-    assert.ok(fn.includes('buildBridgeAutoSyncUrl('), 'must build the auto-sync url via the pure helper')
-    assert.ok(fn.includes('buildBridgeAutoSyncRequestBody('), 'must build the request body via the pure helper')
-    assert.ok(fn.includes('parseBridgeAutoSyncResponse('), 'must parse the response via the pure helper')
-    // Page-targeted account fallback (Chanalai → Thanwan): the body carries the failing page id and a
-    // resolved fallback-account chain (per-call hint merged with the env-configured mapping).
-    assert.ok(fn.includes('resolveBridgeFallbackAccounts('), 'must resolve the fallback-account chain (env + per-call hint)')
-    assert.ok(fn.includes('pageId: params.pageId'), 'must scope the recovery to the failing page id')
-    assert.ok(fn.includes('fallbackAccounts'), 'must pass the resolved fallback accounts to the bridge')
-    // Rate-limit backoff: one live trigger per namespace per TTL window (anti Facebook login spam).
-    assert.ok(fn.includes('isBridgeAutoSyncAllowed('), 'must gate on the backoff predicate')
-    assert.ok(fn.includes('bridgeAutoSyncLastAttemptByNamespace'), 'must track the per-namespace last attempt for backoff')
-    assert.ok(/reason: 'auto_sync_throttled'/.test(fn), 'a throttled trigger must report a distinct reason and skip')
-    // Token-free: dryRun is never true (would resolve no token) and no token is ever interpolated in logs.
-    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
-    assert.ok(logLines.every((l) => !/token=\$\{|accessToken|\.token\}/.test(l)), 'auto-sync logs must never interpolate a token value')
+    assert.ok(fn.includes("return { ok: false, synced: false, reason: 'idlogin_relogin_required' }"), 'must fail closed')
+    assert.ok(!fn.includes('buildBridgeAutoSyncUrl('), 'no auto-sync url may be built')
+    assert.ok(!fn.includes('buildBridgeAutoSyncRequestBody('), 'no auto-sync request may be built')
+    assert.ok(!fn.includes('x-bridge-sync-secret'), 'no machine-to-machine auto-sync call may remain')
+    assert.ok(!fn.includes('fetchWithTimeout('), 'no bridge fetch may remain')
 })
 
-test('refreshFacebookLitePostingTokenForPage falls through to the bridge auto-sync as the final automatic tier', () => {
+test('refreshFacebookLitePostingTokenForPage has NO recovery tiers (BrowserSaving / Bridge /pages / auto-sync all removed)', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function refreshFacebookLitePostingTokenForPage')
-    assert.notEqual(start, -1, 'refreshFacebookLitePostingTokenForPage must exist')
     const fn = src.slice(start, src.indexOf('async function initReelUploadWithPostingTokenAutoRecover', start))
-    // Tier 3: after BrowserSaving (tier 1) and Bridge /pages (tier 2), the bridge true-recovery runs.
-    assert.ok(fn.includes('triggerBridgeAutoSyncForPage('), 'must call the bridge auto-sync as the last tier')
-    assert.ok(/if \(autoSync\.synced\)/.test(fn), 'must only mark recovered when the auto-sync actually synced a token')
-    assert.ok(fn.includes("via: 'bridge_auto_sync'"), 'the auto-sync success path is labeled')
-    // The last tier is page-targeted with the env-resolved fallback chain so a dead primary account
-    // (Chanalai) hands off to a configured fallback (Thanwan) that still administers the page.
-    assert.ok(fn.includes('pageId: params.pageId'), 'auto-sync tier must scope to the failing page id')
-    assert.ok(fn.includes('resolveFacebookLiteFallbackAccounts('), 'auto-sync tier must pass the env-resolved fallback accounts')
-    // Ordering: BrowserSaving → Bridge /pages → auto-sync.
-    const bsIdx = fn.indexOf('refreshFacebookLiteCommentTokenForPage(')
-    const pagesIdx = fn.indexOf('fetchFacebookLitePageTokenFromBridge(')
-    const autoIdx = fn.indexOf('triggerBridgeAutoSyncForPage(')
-    assert.ok(bsIdx >= 0 && pagesIdx > bsIdx && autoIdx > pagesIdx, 'auto-sync must be the LAST recovery tier')
+    assert.ok(!fn.includes('triggerBridgeAutoSyncForPage('), 'no auto-sync tier may remain')
+    assert.ok(!fn.includes("via: 'bridge_auto_sync'"), 'no auto-sync success label may remain')
+    assert.ok(!fn.includes("via: 'browsersaving'"), 'no BrowserSaving success label may remain')
+    assert.ok(!fn.includes("via: 'bridge_token_pages'"), 'no Bridge /pages success label may remain')
+    assert.ok(fn.includes("reason: 'idlogin_relogin_required'"), 'the stub fails closed to idlogin_relogin_required')
 })
 
-test('publish wrapper reaches the auto-sync (via the refresh helper) ONLY on an auth failure, never on a (#10) permission error', () => {
+test('publish wrapper never triggers a re-mint / auto-sync — an auth failure fails closed', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
     const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
-    // The refresh helper (which contains the auto-sync tier) is invoked on the auth-failure path.
-    const refreshIdx = fn.indexOf('refreshFacebookLitePostingTokenForPage(')
-    assert.ok(refreshIdx >= 0, 'the wrapper must call the refresh helper (which triggers auto-sync)')
-    // A permission-denied-without-auth-failure path throws BEFORE the refresh helper, so a (#10) error
-    // can never drive a token re-mint / auto-sync loop.
-    const permThrowIdx = fn.indexOf('facebook_lite_permission_denied_no_bridge_account:')
-    assert.ok(permThrowIdx >= 0 && permThrowIdx < refreshIdx, 'a permission-only error must throw before reaching the refresh/auto-sync helper')
-    // The refresh helper itself is gated by the auth-only predicate (no permission match).
-    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'refresh/auto-sync must be gated by the auth-only predicate')
-    // Single bounded retry after a successful refresh.
-    assert.ok(/if \(!refresh\.synced\)/.test(fn), 'must only retry when a fresh token was synced')
-    assert.ok(fn.includes('POST-REFRESH-RETRY'), 'the retry must be a single labeled re-publish')
+    assert.ok(!fn.includes('refreshFacebookLitePostingTokenForPage('), 'the wrapper must not call the (removed) re-mint helper')
+    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'auth failure is still classified (to fail closed)')
+    assert.ok(fn.includes('idlogin_relogin_required:'), 'an auth failure surfaces idlogin_relogin_required')
 })
 
 test('pending-comment backlog: bridge auto-sync runs when BrowserSaving cannot re-mint, then reloads the fresh token (still one-shot, gated, no permission loop)', () => {

@@ -15,7 +15,15 @@ const { PROFILE_ROOT, profileDirFor } = require('./browser');
 
 const ARCHIVE_MAGIC = Buffer.from('ABENC1', 'ascii');
 const DEFAULT_WORKER_URL = 'https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev';
-const NATIVE_ACCOUNTS_JSON = path.join(os.homedir(), 'Library', 'Application Support', 'fb-lite-token-tool', 'accounts.json');
+// IDBridge-owned non-secret FB role metadata (FB Lite vs Power Editor). IDBridge writes/owns
+// this file; the FBGetToken app is being retired. Env override kept for tests/ops.
+const IDBRIDGE_FB_ROLE_METADATA = process.env.FACEBOOK_TOKEN_CLOAK_FB_ROLE_METADATA
+  || path.join(os.homedir(), 'Library', 'Application Support', 'IDBridge', 'fb-accounts.json');
+// PHASE 1 TEMP FALLBACK — REMOVE IN PHASE 2. Legacy FBGetToken (fb-lite-token-tool) accounts.json.
+// Only consulted when the IDBridge-owned file is missing or does not yet list the account, so the
+// cutover cannot regress Power Editor classification before IDBridge has fully taken ownership.
+const LEGACY_FBGETTOKEN_ACCOUNTS_JSON = process.env.FACEBOOK_TOKEN_CLOAK_LEGACY_FB_ROLE_METADATA
+  || path.join(os.homedir(), 'Library', 'Application Support', 'fb-lite-token-tool', 'accounts.json');
 
 // Same intent as BrowserSaving's browser-data tarball, restricted to Chromium state paths.
 const ESSENTIAL_PROFILE_PATHS = [
@@ -93,13 +101,26 @@ function configured() {
   const enabled = process.env.ACCOUNTS_BRIDGE_PROFILE_SYNC !== '0';
   return { enabled, baseUrl, apiKey, secretPresent: !!secret, configured: enabled && !!baseUrl && !!apiKey && !!secret };
 }
+// Read a role classification for `key` from one non-secret metadata file.
+// Returns 'ads_power_editor' / 'page_posting_facebook_lite' when the account is listed,
+// or null when the file is missing/unreadable or does not list this account (→ try next source).
+function readRoleFromMetadata(file, key) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const row = Array.isArray(data) ? data.find((a) => String(a.facebookUID || '').trim().toLowerCase() === key) : null;
+    if (row) return row.facebookAccountType === 'ads_power_editor' ? 'ads_power_editor' : 'page_posting_facebook_lite';
+  } catch {}
+  return null;
+}
 function roleForAccount(rawAccount) {
   const { key } = sanitizeAccount(rawAccount);
-  try {
-    const data = JSON.parse(fs.readFileSync(NATIVE_ACCOUNTS_JSON, 'utf8'));
-    const row = Array.isArray(data) ? data.find((a) => String(a.facebookUID || '').trim().toLowerCase() === key) : null;
-    if (row && row.facebookAccountType === 'ads_power_editor') return 'ads_power_editor';
-  } catch {}
+  // Primary: IDBridge-owned metadata is authoritative for any account it lists.
+  const owned = readRoleFromMetadata(IDBRIDGE_FB_ROLE_METADATA, key);
+  if (owned) return owned;
+  // PHASE 1 TEMP FALLBACK (remove in Phase 2): consult legacy FBGetToken metadata only when the
+  // IDBridge-owned file is missing or does not yet list this account.
+  const legacy = readRoleFromMetadata(LEGACY_FBGETTOKEN_ACCOUNTS_JSON, key);
+  if (legacy) return legacy;
   return 'page_posting_facebook_lite';
 }
 function archiveUrl(baseUrl, role, account, action) {

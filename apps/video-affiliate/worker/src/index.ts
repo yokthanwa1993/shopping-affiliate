@@ -33083,43 +33083,13 @@ async function resolveNamespaceOwnerEmails(db: D1Database, namespaceId: string):
     }
 }
 
-// POST helper to BrowserSaving's FB Lite refresh route; tries each base, parses the token-free
-// outcome. Returns null only when every base threw (transport error).
-async function postFacebookLiteRefresh(
-    env: Env,
-    bases: string[],
-    requestBody: FacebookLiteRefreshRequestBody,
-    onTransportError: (reason: string) => void,
-): Promise<FacebookLiteRefreshOutcome | null> {
-    const body = JSON.stringify(requestBody)
-    let outcome: FacebookLiteRefreshOutcome | null = null
-    for (const base of bases) {
-        try {
-            const response = await fetchFromBrowserSavingBase(env, base, '/api/fb-lite/refresh-comment-token', {
-                method: 'POST',
-                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-                body,
-            })
-            const data = await response.json().catch(() => ({}))
-            outcome = parseFacebookLiteRefreshResponse(response.ok, data)
-            // Stop probing other bases on success or any definite (non-5xx) answer.
-            if (outcome.ok || response.status < 500) break
-        } catch (e) {
-            onTransportError(e instanceof Error ? e.message : String(e))
-        }
-    }
-    return outcome
-}
+// (postFacebookLiteRefresh removed — the Worker no longer calls BrowserSaving's FB Lite mint route;
+// minting lives only in the IDLogin/IDBridge receiver.)
 
-// On-demand Facebook Lite (FB GET Token) refresh for a page's stored comment token. NO manual
-// linking/tagging is required: BrowserSaving re-mints a fresh page token from the stored
-// Account Manager credentials (uid/password/TOTP/datr) and pushes it into this namespace's
-// token pool via profile-sync. We try operator-LINKED profiles first (optimization), then ask
-// BrowserSaving to AUTO-DISCOVER the profile that owns/admins the page (page_id only, scoped by
-// the namespace owner email). On return the pool holds the fresh token, so the caller re-reads
-// it (resolveFacebookCommentToken) and retries. Best-effort: any failure returns
-// refreshed:false and the caller keeps its bridge-fallback / fail behavior. Token-free — the
-// Worker never logs a token; BrowserSaving returns only booleans + redacted hints + ids.
+// REMOVED: on-demand Facebook Lite comment-token minting. Minting moved ENTIRELY to the IDLogin/
+// IDBridge stack (receiver 8799 mints from iOS-Keychain credentials and profile-syncs a fresh page
+// token). Kept as a fail-closed stub so callers surface idlogin_relogin_required instead of
+// re-minting through 8820 / BrowserSaving.
 async function refreshFacebookLiteCommentTokenForPage(params: {
     env: Env
     db: D1Database
@@ -33130,75 +33100,14 @@ async function refreshFacebookLiteCommentTokenForPage(params: {
     candidateLoginIds?: string[]
     logPrefix: string
 }): Promise<{ refreshed: boolean; synced: boolean; profileCount: number; reason: string }> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    const pageId = String(params.pageId || '').trim()
-    if (!namespaceId || !pageId) {
-        return { refreshed: false, synced: false, profileCount: 0, reason: 'invalid_namespace_or_page' }
-    }
-
-    const bases = buildBrowserSavingProfileBaseUrls(params.env)
-    if (bases.length === 0) {
-        return { refreshed: false, synced: false, profileCount: 0, reason: 'browsersaving_not_configured' }
-    }
-
-    const explicitCandidateIds = normalizeHiddenTaggedProfileIds(params.candidateProfileIds || [])
-    const explicitCandidateLoginIds = uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim()).filter(Boolean))
-    const linkedIds = normalizeHiddenTaggedProfileIds([
-        ...explicitCandidateIds,
-        ...await resolveFacebookLiteRefreshProfileIdsForPage({
-            env: params.env,
-            db: params.db,
-            namespaceId,
-            pageId,
-            pageName: params.pageName,
-        }),
-    ])
-    const ownerEmails = await resolveNamespaceOwnerEmails(params.db, namespaceId)
-
-    let refreshed = false
-    let synced = false
-    let lastReason = 'refresh_failed'
-    const onTransportError = (reason: string) => { lastReason = reason }
-
-    const applyOutcome = (outcome: FacebookLiteRefreshOutcome | null): boolean => {
-        if (outcome?.refreshed) {
-            refreshed = true
-            lastReason = outcome.reason
-            if (outcome.synced) { synced = true; return true }
-        } else if (outcome) {
-            lastReason = outcome.reason
-        }
-        return false
-    }
-
-    // 1) Operator-linked profiles first (fast path when a page is explicitly linked).
-    for (const profileId of linkedIds) {
-        const outcome = await postFacebookLiteRefresh(
-            params.env, bases,
-            buildFacebookLiteRefreshRequestBody({ profileId, pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateLoginIds: explicitCandidateLoginIds }),
-            onTransportError,
-        )
-        if (applyOutcome(outcome)) break // one synced profile is enough
-    }
-
-    // 2) Auto-discover by page when no linked profile synchronized a fresh token. This is the
-    // key behavior: a credentialed Account Manager profile that owns the page is found and used
-    // even though it was never manually linked/tagged ("no_linked_profile" is NOT terminal).
-    if (!synced) {
-        const outcome = await postFacebookLiteRefresh(
-            params.env, bases,
-            buildFacebookLiteRefreshRequestBody({ pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateProfileIds: linkedIds, candidateLoginIds: explicitCandidateLoginIds }),
-            onTransportError,
-        )
-        applyOutcome(outcome)
-    }
-
-    console.log(`[${params.logPrefix}] fb-lite refresh ns=${namespaceId} page=${pageId} linked=${linkedIds.length} owners=${ownerEmails.length} refreshed=${refreshed} synced=${synced} reason=${lastReason}`)
-    return { refreshed, synced, profileCount: linkedIds.length, reason: lastReason }
+    // Facebook Lite comment-token minting/auto-sync REMOVED — minting lives ONLY in the IDLogin/
+    // IDBridge stack (receiver 8799 mints from iOS-Keychain creds + profile-syncs the page token).
+    // No 8820 / BrowserSaving mint here. Fail closed: caller keeps its synced token or surfaces
+    // idlogin_relogin_required.
+    return { refreshed: false, synced: false, profileCount: 0, reason: 'idlogin_relogin_required' }
 }
 
-// Read-only probe (no mint) for the dry-run maintenance path: ask BrowserSaving whether a
-// stored Account Manager profile owns/admins the page and could be refreshed. Token-free.
+// REMOVED: the BrowserSaving profile probe. Fail-closed stub (minting moved to IDLogin/IDBridge).
 async function probeFacebookLiteProfilesForPage(params: {
     env: Env
     db: D1Database
@@ -33208,100 +33117,21 @@ async function probeFacebookLiteProfilesForPage(params: {
     candidateProfileIds?: string[]
     candidateLoginIds?: string[]
 }): Promise<{ ok: boolean; wouldRefresh: boolean; profileFound: boolean; credentialedCount: number; linkedCount: number; reason: string }> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    const pageId = String(params.pageId || '').trim()
-    const explicitCandidateIds = normalizeHiddenTaggedProfileIds(params.candidateProfileIds || [])
-    const explicitCandidateLoginIds = uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim()).filter(Boolean))
-    const linkedIds = normalizeHiddenTaggedProfileIds([
-        ...explicitCandidateIds,
-        ...await resolveFacebookLiteRefreshProfileIdsForPage({
-            env: params.env,
-            db: params.db,
-            namespaceId,
-            pageId,
-            pageName: params.pageName,
-        }),
-    ])
-    const ownerEmails = await resolveNamespaceOwnerEmails(params.db, namespaceId)
-    const bases = buildBrowserSavingProfileBaseUrls(params.env)
-    if (bases.length === 0) {
-        return { ok: false, wouldRefresh: linkedIds.length > 0, profileFound: false, credentialedCount: 0, linkedCount: linkedIds.length, reason: 'browsersaving_not_configured' }
-    }
-    const body = JSON.stringify({
-        page_id: pageId,
-        namespace_id: namespaceId,
-        page_name: params.pageName,
-        owner_emails: ownerEmails,
-        candidate_profile_ids: linkedIds,
-        candidate_login_ids: explicitCandidateLoginIds,
-    })
-    for (const base of bases) {
-        try {
-            const response = await fetchFromBrowserSavingBase(params.env, base, '/api/fb-lite/profiles-for-page', {
-                method: 'POST',
-                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-                body,
-            })
-            const data = await response.json().catch(() => ({})) as Record<string, unknown>
-            if (response.ok && data?.ok === true) {
-                return {
-                    ok: true,
-                    wouldRefresh: data.would_refresh === true,
-                    profileFound: data.profile_found === true,
-                    credentialedCount: Number(data.credentialed_count || 0),
-                    linkedCount: linkedIds.length,
-                    reason: String(data.via || (data.profile_found ? 'owner_found' : '')).slice(0, 120),
-                }
-            }
-            if (response.status < 500) break
-        } catch { /* try next base */ }
-    }
-    return { ok: false, wouldRefresh: linkedIds.length > 0, profileFound: false, credentialedCount: 0, linkedCount: linkedIds.length, reason: 'probe_failed' }
+    // Facebook Lite profile probe REMOVED (minting moved to IDLogin/IDBridge). Fail closed.
+    return { ok: false, wouldRefresh: false, profileFound: false, credentialedCount: 0, linkedCount: 0, reason: 'idlogin_relogin_required' }
 }
 
-// Bridge Token (Facebook Lite / Power Editor) fallback page-token fetch. Pulls a fresh
-// page-scoped access token directly from the Bridge Token local tool's `/pages?...&includeToken=1`
-// route via the production tunnel (CLOAK_FB_BRIDGE_URL = https://short.wwoom.com). Used ONLY when
-// the BrowserSaving secret refresh route did not sync a fresh token (e.g. it returned "Not found").
-// Tries each candidate login id first, then the tool's default logged-in session (no account),
-// which lists every administered page. The returned token is held IN MEMORY by the caller and is
-// NEVER logged or returned to a client — only its presence is logged.
+// REMOVED: the 8820 Bridge Token `/pages?...&includeToken=1` page-token mint. Fail-closed stub
+// (returns no token) — Facebook Lite page tokens are profile-synced by the IDLogin/IDBridge receiver.
 async function fetchFacebookLitePageTokenFromBridge(params: {
     env: Env
     pageId: string
     candidateLoginIds?: string[]
     logPrefix: string
 }): Promise<{ token: string; account: string }> {
-    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
-    const pageId = String(params.pageId || '').trim()
-    if (!baseUrl || !pageId) return { token: '', account: '' }
-    // Candidate login ids first (multi-account bridge), THEN the default session (''). The ''
-    // sentinel must be appended AFTER de-duping the non-empty candidates — uniqueTokens() drops
-    // blanks, so folding it into the dedupe would silently skip the default-session lookup, which
-    // is the live production path (no candidate ids are passed by force-post/retry/cron, and the
-    // tool's default session lists every administered page, e.g. CHEARB).
-    const accounts = [
-        ...uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim())),
-        '',
-    ]
-    for (const account of accounts) {
-        const url = buildBridgeTokenPagesUrl({ baseUrl, account, includeToken: true })
-        if (!url) continue
-        try {
-            const resp = await fetchWithTimeout(url, {
-                method: 'GET',
-                headers: { Accept: 'application/json' },
-            }, 30000, 'bridge_token_pages')
-            const data = await resp.json().catch(() => ({}))
-            const lookup = extractBridgeTokenPageAccessToken(data, pageId)
-            if (lookup.found && lookup.accessToken) {
-                console.log(`[${params.logPrefix}] bridge token /pages lookup ok page=${pageId} account=${account ? 'candidate' : 'default'} token_present=true`)
-                return { token: lookup.accessToken, account }
-            }
-        } catch (e) {
-            console.warn(`[${params.logPrefix}] bridge token /pages lookup failed (${e instanceof Error ? e.message : String(e)})`)
-        }
-    }
+    // Bridge Token /pages?includeToken=1 mint REMOVED — the Worker no longer pulls a Facebook Lite
+    // page token from 8820. Minting lives ONLY in the IDLogin/IDBridge receiver, which profile-syncs
+    // page tokens directly into the pool. Return no token (no 8820 contact).
     return { token: '', account: '' }
 }
 
@@ -33394,13 +33224,9 @@ function clearPostingAuthCircuit(namespaceId: string, pageId: string): void {
     postingAuthCircuitByPage.delete(postingAuthCircuitKey(namespaceId, pageId))
 }
 
-// AUTOMATIC true-bridge recovery. When a stored/Facebook Lite token has been invalidated (190 /
-// "session has been invalidated"), the Worker asks the local Facebook Lite bridge to re-mint a fresh
-// token from the stored credentials/session and refresh every matching page token in this namespace's
-// pool — NO operator action, button, or manual export. This is the machine-to-machine counterpart of
-// the (now removed) UI sync: the bridge endpoint is secret-authenticated. Fails CLOSED with a
-// sanitized reason (and does NOT mark anything recovered) when the bridge URL or secret is missing.
-// Rate-limit-backed off to one live attempt per namespace per TTL. Token-free everywhere.
+// REMOVED: the automatic bridge /token/auto-sync re-mint. Fail-closed stub — there is no machine
+// re-mint from 8820. A stale token is recovered by the operator re-logging in through IDLogin/IDBridge
+// (receiver 8799 mints in-memory and profile-syncs a fresh token).
 async function triggerBridgeAutoSyncForPage(params: {
     env: Env
     namespaceId: string
@@ -33413,72 +33239,15 @@ async function triggerBridgeAutoSyncForPage(params: {
     logPrefix: string
     nowMs?: number
 }): Promise<{ ok: boolean; synced: boolean; reason: string; skipped?: boolean }> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    if (!namespaceId) return { ok: false, synced: false, reason: 'invalid_namespace' }
-    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
-    if (!baseUrl) return { ok: false, synced: false, reason: 'bridge_not_configured' }
-    const secret = getBridgeTokenSyncSecret(params.env)
-    if (!secret) return { ok: false, synced: false, reason: 'sync_secret_missing' }
-
-    const now = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now()
-    const last = bridgeAutoSyncLastAttemptByNamespace.get(namespaceId)
-    if (!isBridgeAutoSyncAllowed(last, now, BRIDGE_AUTO_SYNC_TTL_MS)) {
-        console.log(`[${params.logPrefix}] bridge auto-sync throttled ns=${namespaceId} (recent attempt within ttl)`)
-        return { ok: false, synced: false, reason: 'auto_sync_throttled', skipped: true }
-    }
-    bridgeAutoSyncLastAttemptByNamespace.set(namespaceId, now)
-
-    const url = buildBridgeAutoSyncUrl(baseUrl)
-    if (!url) return { ok: false, synced: false, reason: 'bridge_not_configured' }
-    // Merge per-call fallback hints with the env-configured mapping for this page/account, so a
-    // page-targeted recovery (Chanalai → Thanwan) works even when the caller only knows the page id.
-    const fallbackAccounts = resolveBridgeFallbackAccounts({
-        primaryAccount: (params.candidateLoginIds ?? [])[0],
-        pageId: params.pageId,
-        explicit: params.fallbackAccounts,
-        pageFallbackMap: parseAccountFallbackMap((params.env as Env & { FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS?: string }).FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS),
-        accountFallbackMap: parseAccountFallbackMap((params.env as Env & { FACEBOOK_LITE_ACCOUNT_FALLBACKS?: string }).FACEBOOK_LITE_ACCOUNT_FALLBACKS),
-    })
-    const body = buildBridgeAutoSyncRequestBody({
-        namespaceId,
-        candidateLoginIds: params.candidateLoginIds,
-        pageId: params.pageId,
-        fallbackAccounts,
-    })
-    try {
-        const resp = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Accept: 'application/json',
-                // Machine-to-machine auth so the remote Worker (over the cloudflared tunnel) can drive
-                // a LIVE recovery without the local-only UI. Both header names are accepted by the bridge.
-                'x-bridge-sync-secret': secret,
-                'x-tag-sync-secret': secret,
-            },
-            body: JSON.stringify(body),
-        }, 60000, 'bridge_token_auto_sync')
-        const data = await resp.json().catch(() => ({}))
-        const outcome = parseBridgeAutoSyncResponse(resp.ok !== false && resp.status >= 200 && resp.status < 300, data)
-        console.log(`[${params.logPrefix}] bridge auto-sync ns=${namespaceId} status=${resp.status} ok=${outcome.ok} synced=${outcome.synced} reason=${outcome.reason}`)
-        return outcome
-    } catch (e) {
-        const reason = (e instanceof Error ? e.message : String(e)).slice(0, 120)
-        console.warn(`[${params.logPrefix}] bridge auto-sync failed ns=${namespaceId} (${reason})`)
-        return { ok: false, synced: false, reason: 'bridge_auto_sync_unreachable' }
-    }
+    // Bridge /token/auto-sync re-mint REMOVED — no machine re-mint from 8820. A stale token is
+    // recovered by the operator re-logging in through IDLogin/IDBridge (receiver 8799), which mints
+    // in-memory and profile-syncs a fresh token. Fail closed.
+    return { ok: false, synced: false, reason: 'idlogin_relogin_required' }
 }
 
-// On-demand Facebook Lite (FB GET Token) refresh for a stored-token page's POSTING token. There is
-// no permanent "token expired" state for a Facebook Lite page: this re-mints a fresh page token and
-// syncs it into this namespace's pool so the caller can re-read it and retry publishing.
-//   1) Preferred — the BrowserSaving secret route re-mints from stored Account Manager credentials
-//      and pushes the fresh token back via profile-sync (token-free, auto-discovers by page_id).
-//   2) Fallback — if that route did NOT sync (unavailable / "Not found"), pull a fresh page token
-//      straight from the Bridge Token tool's /pages route and upsert it into the pool ourselves.
-//   3) Last resort — trigger the bridge's own /token/auto-sync TRUE-RECOVERY (it re-mints from the
-//      stored bridge session/credentials and refreshes every administered page in this namespace).
-// Best-effort and token-free in logs: the Worker never logs a raw token value.
+// REMOVED: the three-tier Facebook Lite posting-token re-mint (BrowserSaving -> Bridge /pages ->
+// bridge /token/auto-sync). Minting moved ENTIRELY to the IDLogin/IDBridge stack. Kept as a
+// fail-closed stub so the caller surfaces idlogin_relogin_required instead of re-minting via 8820.
 async function refreshFacebookLitePostingTokenForPage(params: {
     env: Env
     db: D1Database
@@ -33497,108 +33266,11 @@ async function refreshFacebookLitePostingTokenForPage(params: {
     nowMs?: number
     logPrefix: string
 }): Promise<{ refreshed: boolean; synced: boolean; via: string; reason: string }> {
-    const now = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now()
-    // Circuit breaker: if a recent recovery for this page already failed after reaching Facebook,
-    // skip EVERY re-mint tier (BrowserSaving login, bridge /pages, auto-sync) until the cooldown
-    // expires. This is the anti-automation guard — it stops the ~30-min cron from re-logging-in on a
-    // checkpointed/invalidated account. Returns a sanitized reason; no Facebook contact whatsoever.
-    const circuit = getPostingAuthCircuit(params.namespaceId, params.pageId, now)
-    if (circuit.open) {
-        console.log(`[${params.logPrefix}] posting-token refresh skipped page=${params.pageId} (auth_failure_cooldown active until=${new Date(circuit.until).toISOString()} reason=${circuit.reason})`)
-        return { refreshed: false, synced: false, via: 'auth_cooldown', reason: 'auth_failure_cooldown' }
-    }
-    const configuredProfileUid = sanitizePostingProfileUid(params.configuredPostingProfileUid)
-    // Prepend the configured UID so it is tried first as both an explicit candidate profile id and a
-    // candidate login id, without discarding any caller-supplied candidates. Blank → no override.
-    const candidateProfileIds = configuredProfileUid ? [configuredProfileUid] : undefined
-    const candidateLoginIds = configuredProfileUid
-        ? [configuredProfileUid, ...(params.candidateLoginIds ?? [])]
-        : params.candidateLoginIds
-    // 1) BrowserSaving secret mint + profile-sync (the fresh page token lands in the post pool).
-    const bs = await refreshFacebookLiteCommentTokenForPage({
-        env: params.env,
-        db: params.db,
-        namespaceId: params.namespaceId,
-        pageId: params.pageId,
-        pageName: params.pageName,
-        candidateProfileIds,
-        candidateLoginIds,
-        logPrefix: `${params.logPrefix} POST-REFRESH`,
-    }).catch((e) => ({ refreshed: false, synced: false, profileCount: 0, reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
-    if (bs.synced) {
-        clearPostingAuthCircuit(params.namespaceId, params.pageId)
-        return { refreshed: true, synced: true, via: 'browsersaving', reason: bs.reason }
-    }
-
-    // 2) Bridge Token /pages fallback when BrowserSaving did not sync a token.
-    const bridge = await fetchFacebookLitePageTokenFromBridge({
-        env: params.env,
-        pageId: params.pageId,
-        candidateLoginIds,
-        logPrefix: `${params.logPrefix} BRIDGE-TOKEN`,
-    })
-    if (bridge.token) {
-        try {
-            await upsertNamespacePageFromProfileSync(params.env, {
-                namespaceId: params.namespaceId,
-                pageId: params.pageId,
-                pageName: params.pageName,
-                accessToken: bridge.token,
-                commentToken: bridge.token,
-                // Token REFRESH must never materialize a brand-new active page — only refresh the token
-                // of a row that already exists in this namespace. If the page is gone, skip (no create).
-                updateOnly: true,
-            })
-            console.log(`[${params.logPrefix}] bridge token synced into pool page=${params.pageId} via=bridge_token_pages`)
-            clearPostingAuthCircuit(params.namespaceId, params.pageId)
-            return { refreshed: true, synced: true, via: 'bridge_token_pages', reason: 'bridge_token_synced' }
-        } catch (e) {
-            const reason = (e instanceof Error ? e.message : String(e)).slice(0, 120)
-            console.warn(`[${params.logPrefix}] bridge token sync into pool failed (${reason})`)
-            return { refreshed: true, synced: false, via: 'bridge_token_pages', reason }
-        }
-    }
-
-    // 3) Bridge /token/auto-sync TRUE-RECOVERY as the last automatic tier: the bridge re-mints from
-    // its stored session/credentials and refreshes every administered page in this namespace's pool.
-    // Fully automatic — no operator action — and bounded by the per-namespace backoff inside it.
-    const autoSync = await triggerBridgeAutoSyncForPage({
-        env: params.env,
-        namespaceId: params.namespaceId,
-        candidateLoginIds,
-        // Page-targeted true-recovery: scope the bridge to the exact failing page and pass the
-        // env-configured fallback chain (e.g. Chanalai → Thanwan) so an account that lost the page
-        // hands off to one that still administers it.
-        pageId: params.pageId,
-        fallbackAccounts: resolveFacebookLiteFallbackAccounts(params.env, {
-            pageId: params.pageId,
-            primaryAccount: (candidateLoginIds ?? [])[0],
-        }),
-        logPrefix: `${params.logPrefix} BRIDGE-AUTOSYNC`,
-    })
-    if (autoSync.synced) {
-        clearPostingAuthCircuit(params.namespaceId, params.pageId)
-        return { refreshed: true, synced: true, via: 'bridge_auto_sync', reason: autoSync.reason }
-    }
-
-    // Every recovery tier failed. Arm the circuit breaker so the next ~30-min cron pass backs off
-    // instead of re-minting (re-logging-in) again — UNLESS the failure never reached Facebook
-    // (bridge unreachable / not configured / throttled), in which case cooling down would only block
-    // recovery without preventing any hammering. A checkpoint/automation signal in the original
-    // publish error (or the recovery reason) earns the much longer cooldown.
-    const failureReason = autoSync.reason || bs.reason
-    if (shouldArmPostingAuthCooldown(failureReason)) {
-        const checkpoint =
-            isFacebookCheckpointOrAutomationFailure(params.originalError) ||
-            isFacebookCheckpointOrAutomationFailure(autoSync.reason) ||
-            isFacebookCheckpointOrAutomationFailure(bs.reason)
-        const until = armPostingAuthCircuit(params.namespaceId, params.pageId, { checkpoint, reason: checkpoint ? 'checkpoint' : 'auth', nowMs: now })
-        if (until > 0) {
-            console.warn(`[${params.logPrefix}] posting-token recovery failed page=${params.pageId} — armed auth_failure_cooldown (${checkpoint ? 'checkpoint' : 'auth'}) until=${new Date(until).toISOString()}`)
-        }
-    }
-
-    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: failureReason }
+    // Facebook Lite posting-token re-mint/auto-sync REMOVED (all three 8820/BrowserSaving tiers).
+    // Minting now lives ONLY in the IDLogin/IDBridge stack: the operator re-logs in via IDLogin and
+    // the receiver (8799) mints in-memory + profile-syncs a fresh page token into this pool. When the
+    // stored token is invalid there is no automatic re-mint — fail closed with idlogin_relogin_required.
+    return { refreshed: false, synced: false, via: 'none', reason: 'idlogin_relogin_required' }
 }
 
 async function initReelUploadWithPostingTokenAutoRecover(params: {
@@ -40007,56 +39679,9 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
 // Token /pages tunnel), reload the page's token pool, and retry the publish ONCE. Any non-auth
 // failure (transient FB error, video issue, etc.) is rethrown untouched so it is never masked.
 // Token-free: it logs only ids/booleans/redacted hints, never a raw token.
-// Publish a REAL organic Page video through the local Facebook Lite bridge's logged-in session
-// (bridge organic /post → classic /{page_id}/videos with the EAAD6V page token). This is the publish
-// method that WORKS for Facebook Lite tokens, which cannot use Worker-direct /video_reels (verified:
-// upload_phase=start returns "(#10) Permission Denied"). Fails closed with a DISTINCT, token-free
-// capability-blocker error so the operator/Hermes can see exactly which path was attempted.
-async function publishOrganicViaFacebookLiteBridge(params: {
-    env: Env
-    pageId: string
-    videoUrl: string
-    description: string
-    candidateLoginIds?: string[]
-    logPrefix: string
-    reason: string
-    graphMessage?: string
-}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    const videoUrl = String(params.videoUrl || '').trim()
-    const graphSuffix = params.graphMessage ? ` | graph=${params.graphMessage}` : ''
-    if (!videoUrl) {
-        throw new Error(`facebook_lite_publish_capability_blocked: no_video_url (${params.reason})${graphSuffix}`)
-    }
-    const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
-        || (DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT)
-    const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
-        env: params.env,
-        pageId: params.pageId,
-        candidateLoginIds: accountHint ? [accountHint] : params.candidateLoginIds,
-        logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
-    }).catch(() => ({ token: '', account: accountHint }))
-    const account = String(bridgeLookup.account || accountHint || '').trim()
-    if (!account) {
-        throw new Error(`facebook_lite_publish_capability_blocked: no_bridge_account (${params.reason})${graphSuffix}`)
-    }
-    console.log(`[${params.logPrefix}] publishing via Facebook Lite bridge ORGANIC /post (account=candidate, reason=${params.reason})`)
-    try {
-        const bridged = await publishReelViaSessionBridge({
-            env: params.env,
-            pageId: params.pageId,
-            videoUrl,
-            message: params.description,
-            account,
-            postingTokenHint: 'facebook_lite_bridge',
-            commentText: '',
-            logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
-        })
-        return { id: bridged.id, postId: bridged.postId, permalinkUrl: bridged.permalinkUrl, postingToken: bridged.postingToken }
-    } catch (bridgeErr) {
-        const bridgeMsg = parseFacebookErrorLike(bridgeErr)?.message || (bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr))
-        throw new Error(`facebook_lite_bridge_organic_post_failed: ${bridgeMsg}${graphSuffix}`)
-    }
-}
+// (publishOrganicViaFacebookLiteBridge removed — a Facebook Lite page no longer falls back to the
+// CloakBrowser/Power-Editor bridge organic /post. Its synced page token publishes direct via
+// /{page}/videos, and a failure fails closed to idlogin_relogin_required.)
 
 async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: {
     env: Env
@@ -40101,23 +39726,12 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
                 logPrefix: `${params.logPrefix} FB-LITE-VIDEOS`,
             })
         } catch (liteDirectErr) {
+            // Facebook Lite (EAAD6V) pages publish ONLY via the profile-synced page token + direct
+            // /{page}/videos. No CloakBrowser/Power-Editor bridge fallback and no 8820 re-mint — when the
+            // synced token cannot publish, fail closed so the operator re-logs in through IDLogin/IDBridge
+            // (which mints a fresh token in-memory and profile-syncs it into this pool).
             const liteMsg = parseFacebookErrorLike(liteDirectErr)?.message || (liteDirectErr instanceof Error ? liteDirectErr.message : String(liteDirectErr))
-            // Secondary (still organic /{page}/videos, NEVER ad account): the local Facebook Lite
-            // bridge session. Surfaces a distinct capability blocker if even that cannot publish.
-            if (String(params.videoUrl || '').trim()) {
-                console.warn(`[${params.logPrefix}] EAAD6V direct /videos publish failed (${liteMsg}); trying Facebook Lite bridge organic /post`)
-                return await publishOrganicViaFacebookLiteBridge({
-                    env: params.env,
-                    pageId: params.pageId,
-                    videoUrl: String(params.videoUrl || ''),
-                    description: params.description,
-                    candidateLoginIds: params.candidateLoginIds,
-                    logPrefix: params.logPrefix,
-                    reason: 'eaad6_videos_direct_failed',
-                    graphMessage: liteMsg,
-                })
-            }
-            throw liteDirectErr
+            throw new Error(`idlogin_relogin_required: Facebook Lite direct /videos publish failed (${liteMsg})`)
         }
     }
     try {
@@ -40133,93 +39747,18 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             preferVideoReelsFirst: params.preferVideoReelsFirst,
         })
     } catch (publishErr) {
+        // Stored-token publish failed. Facebook Lite re-mint/auto-sync AND the CloakBrowser bridge
+        // organic /post fallback were REMOVED — minting lives ONLY in the IDLogin/IDBridge stack. No
+        // recovery here: an auth/invalidation/permission failure surfaces idlogin_relogin_required so the
+        // operator re-logs in through IDLogin (the receiver mints in-memory + profile-syncs a fresh
+        // token into this pool); any other error propagates unchanged.
         const message = parseFacebookErrorLike(publishErr)?.message || (publishErr instanceof Error ? publishErr.message : String(publishErr))
         const tokenMissing = !normalizePostTokenPool(params.postTokens || []).length
         const authFailure = shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing, error: message })
-        // (#10) Permission Denied: the stored EAAD6V page token cannot publish via the Worker Graph
-        // app/ad account, but the local Facebook Lite bridge's logged-in session CAN post the organic
-        // Page reel. Treat it like an auth failure so it reaches the bridge organic /post fallback
-        // below (token refresh would not help — it is a permission, not a 190/invalidated, error).
-        const permissionDenied = isFacebookLitePostingPermissionError(message)
-        if (!authFailure && !permissionDenied) {
-            throw publishErr
+        if (authFailure || isFacebookLitePostingPermissionError(message)) {
+            throw new Error(`idlogin_relogin_required: stored Facebook Lite token rejected (${message})`)
         }
-        const videoUrl = String(params.videoUrl || '').trim()
-        if (videoUrl) {
-            const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
-                || (DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT)
-            const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
-                env: params.env,
-                pageId: params.pageId,
-                candidateLoginIds: accountHint ? [accountHint] : params.candidateLoginIds,
-                logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
-            }).catch(() => ({ token: '', account: accountHint }))
-            const account = String(bridgeLookup.account || accountHint || '').trim()
-            if (account) {
-                console.log(`[${params.logPrefix}] stored-token Graph publish failed (${message}); attempting Facebook Lite bridge ORGANIC /post (account=candidate, reason=${permissionDenied ? 'permission_denied' : 'auth_failure'})`)
-                try {
-                    const bridged = await publishReelViaSessionBridge({
-                        env: params.env,
-                        pageId: params.pageId,
-                        videoUrl,
-                        message: params.description,
-                        account,
-                        postingTokenHint: 'facebook_lite_bridge',
-                        commentText: '',
-                        logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
-                    })
-                    return {
-                        id: bridged.id,
-                        postId: bridged.postId,
-                        permalinkUrl: bridged.permalinkUrl,
-                        postingToken: bridged.postingToken,
-                    }
-                } catch (bridgeErr) {
-                    // Fail closed, but with a DISTINCT error so Hermes can see the bridge organic /post
-                    // path WAS attempted (and why it failed) instead of the original Graph (#10).
-                    const bridgeMsg = parseFacebookErrorLike(bridgeErr)?.message || (bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr))
-                    throw new Error(`facebook_lite_bridge_organic_post_failed: ${bridgeMsg} | graph=${message}`)
-                }
-            }
-            // Permission denied with NO resolvable Facebook Lite bridge account → token refresh
-            // cannot help (not an auth error); surface distinctly rather than masking as auth.
-            if (permissionDenied && !authFailure) {
-                throw new Error(`facebook_lite_permission_denied_no_bridge_account: ${message}`)
-            }
-        } else if (permissionDenied && !authFailure) {
-            throw new Error(`facebook_lite_permission_denied_no_video_url: ${message}`)
-        }
-        console.log(`[${params.logPrefix}] stored-token publish auth failure — attempting Facebook Lite page-token refresh`)
-        const refresh = await refreshFacebookLitePostingTokenForPage({
-            env: params.env,
-            db: params.db,
-            namespaceId: params.namespaceId,
-            pageId: params.pageId,
-            pageName: params.pageName,
-            candidateLoginIds: params.candidateLoginIds,
-            configuredPostingProfileUid: params.configuredPostingProfileUid,
-            // Forward the sanitized publish error so the breaker can tell a checkpoint/automation block
-            // (long cooldown) from a plain invalidated token (short cooldown).
-            originalError: message,
-            logPrefix: params.logPrefix,
-        }).catch((e) => ({ refreshed: false, synced: false, via: 'error', reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
-        if (!refresh.synced) {
-            console.warn(`[${params.logPrefix}] Facebook Lite refresh did not sync a fresh token (via=${refresh.via} reason=${refresh.reason}); surfacing original publish error`)
-            throw publishErr
-        }
-        const reloaded = await params.reloadTokens().catch(() => ({ commentTokens: params.commentTokens, postTokens: params.postTokens }))
-        console.log(`[${params.logPrefix}] retrying publish once with refreshed token (via=${refresh.via})`)
-        return await publishReelWithCommentTokenPrimaryFallback({
-            pageId: params.pageId,
-            commentTokens: reloaded.commentTokens,
-            postTokens: reloaded.postTokens,
-            videoBuffer: params.videoBuffer,
-            thumbnailBuffer: params.thumbnailBuffer,
-            thumbnailContentType: params.thumbnailContentType,
-            description: params.description,
-            logPrefix: `${params.logPrefix} POST-REFRESH-RETRY`,
-            preferVideoReelsFirst: params.preferVideoReelsFirst,
-        })
+        throw publishErr
     }
 }
 

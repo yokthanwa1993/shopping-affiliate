@@ -17,6 +17,50 @@ function freshModule(profileRoot) {
   return require('../src/profileArchiveSync');
 }
 
+// --- FB role metadata source (cutover): IDBridge-owned primary + Phase-1 legacy fallback ---
+
+function freshModuleWithRoleMetadata(ownedPath, legacyPath) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-role-'));
+  process.env.FACEBOOK_TOKEN_CLOAK_PROFILE_ROOT = root;
+  if (ownedPath === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_FB_ROLE_METADATA;
+  else process.env.FACEBOOK_TOKEN_CLOAK_FB_ROLE_METADATA = ownedPath;
+  if (legacyPath === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_LEGACY_FB_ROLE_METADATA;
+  else process.env.FACEBOOK_TOKEN_CLOAK_LEGACY_FB_ROLE_METADATA = legacyPath;
+  delete require.cache[require.resolve('../src/browser')];
+  delete require.cache[require.resolve('../src/profileArchiveSync')];
+  return require('../src/profileArchiveSync');
+}
+function writeRoleFile(rows) {
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ab-rolefile-')), 'accounts.json');
+  fs.writeFileSync(p, JSON.stringify(rows));
+  return p;
+}
+
+test('roleForAccount: IDBridge-owned metadata classifies Power Editor', () => {
+  const owned = writeRoleFile([{ facebookUID: '100090320823561', facebookAccountType: 'ads_power_editor' }]);
+  const sync = freshModuleWithRoleMetadata(owned, '/nonexistent/legacy.json');
+  assert.equal(sync.roleForAccount('100090320823561'), 'ads_power_editor');
+});
+
+test('roleForAccount: IDBridge-owned lite is authoritative (no legacy fallback even if legacy says PE)', () => {
+  const owned = writeRoleFile([{ facebookUID: '100090320823561', facebookAccountType: 'page_posting' }]);
+  const legacy = writeRoleFile([{ facebookUID: '100090320823561', facebookAccountType: 'ads_power_editor' }]);
+  const sync = freshModuleWithRoleMetadata(owned, legacy);
+  assert.equal(sync.roleForAccount('100090320823561'), 'page_posting_facebook_lite');
+});
+
+test('roleForAccount: Phase-1 fallback to legacy FBGetToken when owned file omits the account', () => {
+  const owned = writeRoleFile([{ facebookUID: '999', facebookAccountType: 'ads_power_editor' }]);
+  const legacy = writeRoleFile([{ facebookUID: '100090320823561', facebookAccountType: 'ads_power_editor' }]);
+  const sync = freshModuleWithRoleMetadata(owned, legacy);
+  assert.equal(sync.roleForAccount('100090320823561'), 'ads_power_editor');
+});
+
+test('roleForAccount: defaults to Facebook Lite when neither source lists the account', () => {
+  const sync = freshModuleWithRoleMetadata('/nonexistent/owned.json', '/nonexistent/legacy.json');
+  assert.equal(sync.roleForAccount('100090320823561'), 'page_posting_facebook_lite');
+});
+
 test('seal/unseal uses ABENC1 envelope and hides plaintext', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-sync-'));
   const sync = freshModule(root);

@@ -2,6 +2,17 @@
 
 Side-by-side local Facebook token bridge for CloakBrowser + macOS Keychain.
 
+> **Facebook Lite token generation was removed from this service (2026-07-17 cutover).**
+> Facebook Lite (EAAD6V) token minting now lives ONLY in the IDLogin/IDBridge stack: the IDLogin
+> app stores credentials in the iOS Keychain and the receiver (port 8799) mints in-memory and
+> profile-syncs page tokens to the video-affiliate Worker. This service no longer mints, enumerates,
+> or auto-syncs Facebook Lite tokens. The Facebook Lite mint routes (`/token/auto-sync`,
+> `/token/import-pages`) and the Facebook Lite branches of `/token/export`, `GET /token`, `GET /pages`,
+> `POST /post`, `POST /page-comment` now **fail closed with `410 facebook_lite_removed`**. Everything
+> below is preserved for **Power Editor / Meta Ads / Accounts Bridge / CloakBrowser browser sessions**
+> only. The `page_posting_facebook_lite` role name is retained (it labels Accounts-Bridge config and
+> the profile archive path); it no longer implies this service mints a Facebook Lite token.
+
 - Binds only to `127.0.0.1`.
 - Default port: `8820`.
 - Profile root: `~/.facebook-token-cloak/profiles`.
@@ -95,12 +106,14 @@ Sections:
 2. **Add / edit account** — alias/namespace, username/email/phone, and the
    write-only secret fields (password and 2FA seed/code).
 3. **Account roles (status / config)** — map which saved account plays each
-   Facebook role (page posting via Facebook Lite / Token Bridge, ad creation via
-   Power Editor). Saving a role is config only; "Check roles (dry run)" is
-   token-free and opens no browser.
-4. **Status** — Save shows only redacted status. The UI never requests raw token
-   output by default (`includeToken` is sent only by the explicit local-only
-   Facebook Lite token reveal) and has no token export or datr tools.
+   Facebook role. Role names are retained (`page_posting_facebook_lite`,
+   `ads_power_editor`) but this service only serves the Power Editor / Ads /
+   browser-session side; Facebook Lite token minting moved to IDLogin/IDBridge.
+   Saving a role is config only; "Check roles (dry run)" is token-free and opens
+   no browser.
+4. **Status** — Save shows only redacted status. There is no Facebook Lite token
+   reveal/export here anymore (a Facebook Lite request fails closed with
+   `410 facebook_lite_removed`) and no datr tools.
 
 ### Safety model
 
