@@ -384,7 +384,7 @@ test('active ad-only comment falls back to the DEFAULT template when the namespa
 test('create-ad-only records ad-story comment evidence or a skipped/failed reason', () => {
     const routeSource = getCreateAdOnlyRouteSource()
     const finalizationIdx = routeSource.indexOf('// 5. Finalize the ads-only story')
-    const pageCommentIdx = routeSource.indexOf("`${baseUrl}/page-comment`")
+    const pageCommentIdx = routeSource.indexOf("fetchIdBridge(c.env, '/page-comment'")
     const successIdx = routeSource.indexOf('// 6. Success')
 
     assert.ok(finalizationIdx >= 0, 'create-ad-only must have an ads-only finalization block')
@@ -410,7 +410,7 @@ test('create-ad-only bridge body creates an ads-only dark story and never publis
     assert.doesNotMatch(routeSource, /skip_ad: true/)
     assert.doesNotMatch(routeSource, /publish_as_page_video: true/)
     assert.doesNotMatch(routeSource, /`\$\{baseUrl\}\/promote`/)
-    assert.match(routeSource, /`\$\{baseUrl\}\/update-cta`/, 'when Meta repairs to a new dark story, update that story CTA before commenting')
+    assert.match(routeSource, /fetchIdBridge\(c\.env, '\/update-cta'/, 'when Meta repairs to a new dark story, update that story CTA before commenting')
     assert.match(routeSource, /resolveGalleryVideoForRepost/)
     assert.match(routeSource, /system_video_unresolved/)
 })

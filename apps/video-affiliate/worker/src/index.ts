@@ -242,6 +242,7 @@ import {
     resolvePostingRoute,
     postingSourceHint,
     resolveCloakFbBridgeBaseUrl,
+    fetchCloakFbBridgeAuthenticated,
     normalizePageCommentTokenSource,
     defaultCommentSourceForRoute,
     restrictCloakToAdminNamespace,
@@ -253,12 +254,6 @@ import {
     shouldAttemptFacebookLitePostingRefresh,
     buildFacebookLiteRefreshRequestBody,
     parseFacebookLiteRefreshResponse,
-    buildBridgeTokenPagesUrl,
-    extractBridgeTokenPageAccessToken,
-    buildBridgeAutoSyncUrl,
-    buildBridgeAutoSyncRequestBody,
-    parseBridgeAutoSyncResponse,
-    isBridgeAutoSyncAllowed,
     isFacebookCheckpointOrAutomationFailure,
     shouldArmPostingAuthCooldown,
     resolvePostingAuthCooldownMs,
@@ -329,7 +324,6 @@ import {
     buildProcessedVideoAssetFileUrl,
     hasResolvedMetaSource,
     mapProcessedVideoAssetLibraryItem,
-    normalizeMetaVideoStatus,
     parseProcessedVideoR2Key,
     projectResolvedMetaVideoFields,
     sanitizeMetaGraphError,
@@ -4656,8 +4650,7 @@ async function uploadProcessedVideoToMetaAssetLibraryViaBridge(params: {
     adAccount: string
     fileUrl: string
 }): Promise<{ ok: boolean; advideoId?: string; advideoStatus?: string; error?: string }> {
-    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
-    if (!baseUrl) return { ok: false, error: 'bridge_not_configured' }
+    if (!resolveCloakFbBridgeBaseUrl(params.env)) return { ok: false, error: 'bridge_not_configured' }
     const bridgeAccountRow = await getPageSetting(params.db, params.pageId, AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY).catch(() => null)
     const bridgeAccount = resolveAdOnlyBridgeAccountId({
         bodyValue: '',
@@ -4673,7 +4666,7 @@ async function uploadProcessedVideoToMetaAssetLibraryViaBridge(params: {
     if (params.pageId) payload.page_id = params.pageId
     if (bridgeAccount) payload.account = bridgeAccount
 
-    const resp = await fetchWithTimeout(`${baseUrl}/media-library/upload`, {
+    const resp = await fetchIdBridgeWithTimeout(params.env, '/media-library/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -4721,14 +4714,15 @@ async function resolveProcessedVideoMetaViaBridge(params: {
         settingValue: bridgeAccountRow?.value,
         pageId: bridgePageId,
     }) || AD_ONLY_BRIDGE_ACCOUNT_DEFAULT
-    const payload: Record<string, unknown> = { advideo_id: advideoId }
-    if (bridgePageId) payload.page_id = bridgePageId
-    if (bridgeAccount) payload.account = bridgeAccount
     try {
-        const resp = await fetchWithTimeout(`${baseUrl}/media-library/resolve`, {
+        const resp = await fetchIdBridgeWithTimeout(params.env, '/media-library/resolve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+                advideo_id: advideoId,
+                ...(bridgePageId ? { page_id: bridgePageId } : {}),
+                ...(bridgeAccount ? { account: bridgeAccount } : {}),
+            }),
         }, 12000, 'media_library_bridge_resolve')
         const data = await resp.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
         if (!resp.ok || data.ok === false) return null
@@ -14720,7 +14714,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
         const adAccountFromSettings = String(adAccountRow?.value || '').trim()
 
         const callVideoOnecardCreateAd = async (templateAdsetForAttempt: string, fallbackReason = '') => {
-            const onecardResp = await fetch(`${baseUrl}/create-ad`, {
+            const onecardResp = await fetchIdBridge(c.env, '/create-ad', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -14736,6 +14730,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
                     ...(placementTemplate === 'instagram' || skipPublishToPage ? { skip_publish_to_page: true } : {}),
                     ...(skipAd ? { skip_ad: true } : {}),
+                    ...(!skipAd ? { status_option: 'ACTIVE' } : {}),
                     ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
                     // New campaign name must win over selected existing campaign.
                     // UI can keep an existing campaign highlighted while operator types
@@ -14783,8 +14778,8 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // Token priority for COMMENTING:
         //   1) Per-namespace dedicated comment token (LIFF settings → ตั้งค่า → คอมเม้น)
         //      — single source of truth across cron, force-post, and dashboard ads.
-        //   2) Fallback: PAGE access_token from /me/accounts via electron user token
-        //      (legacy behavior).
+        //   2) Fallback: authenticated IDBridge /page-comment. IDBridge resolves the Page
+        //      token internally; the Worker never receives a token from the bridge.
         // namespaceId derived from pages.bot_id since this dashboard endpoint accepts
         // page_id as the only routing input.
         let commentId = ''
@@ -14807,22 +14802,28 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     }
                 }
 
-                // Fallback: page access_token from /me/accounts (legacy behavior)
-                if (!commentToken) {
-                    const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
-                    const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
-                    const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
-                    commentToken = pageEntry?.access_token || ''
-                }
-
-                const postComment = async (token: string, targetId: string) => {
+                const postCommentWithDedicatedToken = async (token: string, targetId: string) => {
                     if (!token || !targetId || !commentText) return {} as Record<string, unknown>
-                    const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(targetId)}/comments`, {
+                    const commentResp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ message: commentText, access_token: token }),
                     })
                     return await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                }
+
+                const postCommentViaIdBridge = async (targetId: string) => {
+                    if (!targetId || !commentText) return {} as Record<string, unknown>
+                    const commentResp = await fetchIdBridge(c.env, '/page-comment', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ page_id: pageId, story_id: targetId, target: targetId, message: commentText }),
+                    })
+                    const result = await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                    if (!commentResp.ok || result.ok === false) {
+                        return { error: result.error || `page_comment_http_${commentResp.status}`, step: result.step }
+                    }
+                    return result
                 }
 
                 const tryCommentTargets = async (token: string, tokenLabel: string) => {
@@ -14834,7 +14835,9 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     const uniqueTargets = Array.from(new Set(targets))
                     let lastData = {} as Record<string, unknown>
                     for (const targetId of uniqueTargets) {
-                        const data = await postComment(token, targetId)
+                        const data = token
+                            ? await postCommentWithDedicatedToken(token, targetId)
+                            : await postCommentViaIdBridge(targetId)
                         lastData = data
                         if (!data.error && data.id) {
                             commentTargetId = targetId
@@ -14848,18 +14851,14 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     return lastData
                 }
 
-                if (commentToken && commentText && (storyId || videoId)) {
-                    // First try the dedicated token across storyId → source videoId.
-                    // If it fails, fall back to the page token from /me/accounts.
-                    let commentData = await tryCommentTargets(commentToken, 'primary')
-                    if (commentData.error || !commentData.id) {
-                        const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
-                        const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
-                        const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
-                        const fallbackToken = pageEntry?.access_token || ''
-                        if (fallbackToken && fallbackToken !== commentToken) {
-                            commentData = await tryCommentTargets(fallbackToken, 'fallback')
-                        }
+                if (commentText && (storyId || videoId)) {
+                    // Preserve the namespace-owned token as the first business-consumer path. If it
+                    // is absent/invalid, IDBridge comments as the Page without token egress.
+                    let commentData = commentToken
+                        ? await tryCommentTargets(commentToken, 'primary')
+                        : await tryCommentTargets('', 'idbridge')
+                    if (commentToken && (commentData.error || !commentData.id)) {
+                        commentData = await tryCommentTargets('', 'idbridge-fallback')
                     }
                     commentId = String(commentData.id || '').trim()
                 }
@@ -15306,11 +15305,13 @@ async function runFollowLaneCreateAdOnly(
                 // Do NOT forward daily_campaign_name/budget here, or the bridge will correctly
                 // place the ad in the fixed adset but return misleading daily-campaign diagnostics.
                 adset_run_hours: schedule.runHours,
+                status_option: 'ACTIVE' as const,
             }
             : {
                 daily_campaign_name: schedule.dailyCampaignName,
                 campaign_daily_budget: schedule.dailyBudgetMinor,
                 adset_run_hours: schedule.runHours,
+                status_option: 'ACTIVE' as const,
             })
         : {
             paused: true as const,
@@ -15320,7 +15321,7 @@ async function runFollowLaneCreateAdOnly(
 
     let bridgeResult: Record<string, unknown>
     try {
-        const bridgeResp = await fetch(`${baseUrl}/create-ad`, {
+        const bridgeResp = await fetchIdBridge(c.env, '/create-ad', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -15418,7 +15419,7 @@ async function runFollowLaneCreateAdOnly(
         const commentMessage = buildFollowLaneCommentMessage(commentShortlink)
         bridgeResult.comment_message = commentMessage.slice(0, 500)
         try {
-            const commentResp = await fetch(`${baseUrl}/page-comment`, {
+            const commentResp = await fetchIdBridge(c.env, '/page-comment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -15655,11 +15656,13 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                 // run window, never daily_campaign_name/budget (which would mislead the bridge into
                 // daily-campaign diagnostics for an ad it placed in the fixed adset).
                 adset_run_hours: schedule.runHours,
+                status_option: 'ACTIVE' as const,
             }
             : {
                 daily_campaign_name: bridgeDailyCampaignName,
                 campaign_daily_budget: schedule.dailyBudgetMinor,
                 adset_run_hours: schedule.runHours,
+                status_option: 'ACTIVE' as const,
             })
         : {
             paused: true as const,
@@ -15681,7 +15684,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
 
     let bridgeResult: Record<string, unknown>
     try {
-        const bridgeResp = await fetch(`${baseUrl}/create-ad`, {
+        const bridgeResp = await fetchIdBridge(c.env, '/create-ad', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -15801,7 +15804,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     let commentStoryIdForProof = adStoryIdForProof
     let commentPostIdForProof = adPostIdForProof
     try {
-        const storyCtaResp = await fetch(`${baseUrl}/update-cta`, {
+        const storyCtaResp = await fetchIdBridge(c.env, '/update-cta', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ page_id: validation.pageId, story_id: commentStoryIdForProof, final_cta_link: finalLink, shortlink: finalLink, cta_type: 'SHOP_NOW' }),
@@ -15829,7 +15832,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         bridgeResult.comment_error = 'comment_template_rendered_empty'
     } else {
         try {
-            const commentResp = await fetch(`${baseUrl}/page-comment`, {
+            const commentResp = await fetchIdBridge(c.env, '/page-comment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ page_id: validation.pageId, story_id: commentStoryIdForProof, message: commentMessage, comment_message: commentMessage }),
@@ -16727,7 +16730,7 @@ async function maybeProcessFollowAdOnSchedule(env: Env): Promise<{ ran: boolean;
 // Auto-pause FINISHED ad-only campaigns — turn OFF, never delete. SALES/CLICK-LINK LANE ONLY.
 // ---------------------------------------------------------------------
 // After a system-created ACTIVE ad-only ad's scheduled run window ends (end_time <= now), this turns
-// the campaign + adset (and the ad, when known) OFF via the bridge /pause-ad-only route. It ONLY ever
+// the campaign + adset (and the ad, when known) OFF via authenticated IDBridge /graph writes. It ONLY ever
 // requests status=PAUSED — it NEVER deletes a campaign/adset/ad and NEVER sets status='DELETED'. The
 // operator contract is close/off, never destroy. Runs from the cron in waitUntil so it can never
 // block (or be blocked by) posting or the ad-only queue, and swallows its own errors. A row's
@@ -16778,7 +16781,9 @@ async function autoPauseCompletedAdOnlyCampaigns(
             const adsetId = String(row.adset_id || '').trim()
             const adId = String(row.ad_id || '').trim()
             try {
-                const resp = await fetch(`${baseUrl}/pause-ad-only`, {
+                // Transport-only change: same single bridge route call as the legacy flow, now
+                // authenticated via fetchIdBridge (X-Bridge-Token). Pause semantics unchanged.
+                const resp = await fetchIdBridge(env, '/pause-ad-only', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -16844,7 +16849,7 @@ async function autoPauseCompletedAdOnlyCampaigns(
 // window ends it must be REMOVED/ARCHIVED from Ads, not merely paused. Pausing alone leaves the
 // LIKE_PAGE/Follow button bound to the story/creative, which blocks the later click-link ad and the
 // button removal — so the click-link handoff requires REMOVAL, not pause. This turns the finished
-// Follow ad OFF-the-active-surface via the bridge /archive-ad-only route (recoverable status=ARCHIVED;
+// Follow ad OFF-the-active-surface via authenticated IDBridge /graph (recoverable status=ARCHIVED;
 // NEVER an HTTP DELETE, NEVER a hard delete — Meta keeps the row + insights). It archives the AD ONLY
 // (the LIKE_PAGE creative/button carrier); a shared/fixed Follow adset or campaign is never touched.
 // follow_removed_at is set ONLY on a CONFIRMED archive read-back, so a transient bridge/Graph failure
@@ -16888,8 +16893,9 @@ async function autoRemoveCompletedFollowAds(
             try {
                 // Archive the AD only (the button/creative carrier). Forward the campaign/adset ids for
                 // audit, but do NOT request their archive — a shared/fixed Follow adset/campaign must
-                // never be removed by the unattended path.
-                const resp = await fetch(`${baseUrl}/archive-ad-only`, {
+                // never be removed by the unattended path. Transport-only change: same single bridge
+                // route call as the legacy flow, now authenticated via fetchIdBridge.
+                const resp = await fetchIdBridge(env, '/archive-ad-only', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ad_id: adId }),
@@ -17367,7 +17373,7 @@ app.get('/api/dashboard/ad-links', async (c) => {
     if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
 
     const graph = async (path: string, fields: string, limit = 100) => {
-        const resp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(path)}&fields=${encodeURIComponent(fields)}&limit=${encodeURIComponent(String(limit))}`)
+        const resp = await fetchIdBridge(c.env, `/graph?path=${encodeURIComponent(path)}&fields=${encodeURIComponent(fields)}&limit=${encodeURIComponent(String(limit))}`)
         const data = await resp.json().catch(() => ({})) as Record<string, unknown>
         return { ok: resp.ok && !(data as any)?.error, status: resp.status, data }
     }
@@ -17616,7 +17622,7 @@ app.get('/api/dashboard/campaigns', async (c) => {
         // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
         // wants only ACTIVE in the create-ad picker — paused ones just clutter
         // the list (same FB UX as Ads Manager's 'Active' filter).
-        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=60`)
+        const campResp = await fetchIdBridge(c.env, `/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=60`)
         const campData = await campResp.json().catch(() => ({})) as Record<string, unknown>
         const allCampaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
         const campaigns = allCampaigns.filter((c: any) => String(c?.effective_status || '').trim() === 'ACTIVE').slice(0, 20)
@@ -17630,7 +17636,7 @@ app.get('/api/dashboard/campaigns', async (c) => {
             const withCounts = await Promise.all(campaigns.map(async (camp: any) => {
                 let adsets: any[] = []
                 try {
-                    const adsetResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status&limit=200`)
+                    const adsetResp = await fetchIdBridge(c.env, `/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status&limit=200`)
                     const adsetData = await adsetResp.json().catch(() => ({})) as Record<string, unknown>
                     adsets = Array.isArray((adsetData as any)?.data) ? (adsetData as any).data : []
                 } catch (_e) {
@@ -17679,13 +17685,13 @@ app.get('/api/dashboard/campaigns', async (c) => {
         const result: Array<Record<string, unknown>> = []
         for (const camp of campaigns) {
             // Get adsets for each campaign
-            const adsetResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status,daily_budget&limit=50`)
+            const adsetResp = await fetchIdBridge(c.env, `/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status,daily_budget&limit=50`)
             const adsetData = await adsetResp.json().catch(() => ({})) as Record<string, unknown>
             const adsets = Array.isArray((adsetData as any)?.data) ? (adsetData as any).data : []
 
             // Get campaign insights — request cost_per_action_type so we can surface
             // 'cost per link click' per campaign in the create-ad popup.
-            const insResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/insights&fields=reach,impressions,spend,cost_per_thruplay,cost_per_action_type,actions&date_preset=lifetime`)
+            const insResp = await fetchIdBridge(c.env, `/graph?path=${encodeURIComponent(String(camp.id))}/insights&fields=reach,impressions,spend,cost_per_thruplay,cost_per_action_type,actions&date_preset=lifetime`)
             const insData = await insResp.json().catch(() => ({})) as Record<string, unknown>
             const insights = Array.isArray((insData as any)?.data) ? (insData as any).data[0] || {} : {}
 
@@ -35294,7 +35300,7 @@ type OneCardPostFirstResult = {
 //             (temporary) Shopee CTA so the post immediately shows the Shopee card + SHOP_NOW
 //             button → post id  (no ad yet)
 //   mint      final affiliate link with sub2=post id tail, sub3=page id
-//   Phase B   bridge /promote → build the PAID ad whose creative CTA carries that final direct
+//   Phase B   IDBridge /create-ad existing-post mode → build the PAID ad whose creative CTA carries that final direct
 //             Shopee link (reuses Phase A's uploaded video; no second post)
 //   Phase B.5 bridge /update-cta → swap the VISIBLE post CTA to the final post-specific link.
 //             REQUIRED for this flow: the run fails closed if the bridge does not confirm the
@@ -35448,7 +35454,7 @@ async function runOneCardPostFirstAds(params: {
     const visibleCtaUpdateError: string | null = null
     let promotedAdCtaFinal = false
     try {
-        const respB = await fetchWithTimeout(`${baseUrl}/promote`, {
+        const respB = await fetchIdBridgeWithTimeout(env, '/promote', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -35550,7 +35556,7 @@ async function runOneCardPostFirstAds(params: {
         // Parity holds for the comment + promoted ad final CTA (re-minted with the post id).
         ctaParity: !!finalLink && remint.reminted,
         promotedAdCtaFinal: !!adId && !!finalLink && remint.reminted,
-        // The visible page CTA report mirrors bridge /promote's visible-page value. /promote does
+        // The visible page CTA report mirrors /create-ad's visible-page value. Existing-post mode does
         // not update the organic page post CTA, so this should normally remain false/null.
         visiblePageCtaLink,
         visiblePageCtaFinal,
@@ -38549,6 +38555,32 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
     }
 }
 
+// Single authenticated egress for IDBridge compatibility operations. Keeping the service-auth
+// injection here makes it impossible for an individual route call to forget X-Bridge-Token; the
+// lower-level helper also refuses to call the injected fetch when URL/auth is unconfigured.
+async function fetchIdBridge(
+    env: Env,
+    pathAndQuery: string,
+    init: RequestInit = {},
+): Promise<Response> {
+    return fetchCloakFbBridgeAuthenticated(env, pathAndQuery, init)
+}
+
+async function fetchIdBridgeWithTimeout(
+    env: Env,
+    pathAndQuery: string,
+    init: RequestInit = {},
+    timeoutMs = 120000,
+    label = 'idbridge',
+): Promise<Response> {
+    return fetchCloakFbBridgeAuthenticated(
+        env,
+        pathAndQuery,
+        init,
+        (url, authenticatedInit) => fetchWithTimeout(url, authenticatedInit, timeoutMs, label),
+    )
+}
+
 function extractStatusText(status: unknown): string {
     if (!status || typeof status !== 'object') return ''
     const s = status as any
@@ -39843,7 +39875,7 @@ async function publishVideoViaOneCard(params: {
         payload.cta = cta
     }
 
-    const resp = await fetchWithTimeout(`${baseUrl}/post`, {
+    const resp = await fetchIdBridgeWithTimeout(params.env, '/post', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -39903,7 +39935,7 @@ async function publishReelViaSessionBridge(params: {
 
     // 1. Fail closed unless the bridge reports a live logged-in session. /token returns
     //    only booleans (accessToken/fbDtsg presence) — never the values.
-    const tokenResp = await fetchWithTimeout(`${baseUrl}/token${accountQuery}`, {}, 15000, 'bridge_token')
+    const tokenResp = await fetchIdBridgeWithTimeout(params.env, `/token${accountQuery}`, {}, 15000, 'bridge_token')
     const tokenData = await tokenResp.json().catch(() => ({} as any)) as { ok?: boolean; accessToken?: boolean }
     if (!tokenResp.ok || !tokenData?.ok || tokenData.accessToken !== true) {
         throw new Error('session_bridge_token_unavailable')
@@ -39911,7 +39943,7 @@ async function publishReelViaSessionBridge(params: {
 
     // 2. Validate page authorization via /pages (me/accounts through the session). Only
     //    the page id is read for the check; page access_token values are never logged.
-    const pagesResp = await fetchWithTimeout(`${baseUrl}/pages${accountQuery}`, {}, 20000, 'bridge_pages')
+    const pagesResp = await fetchIdBridgeWithTimeout(params.env, `/pages${accountQuery}`, {}, 20000, 'bridge_pages')
     const pagesData = await pagesResp.json().catch(() => ({} as any)) as { data?: Array<{ id?: string }>; error?: unknown }
     if (!pagesResp.ok || (pagesData as any)?.error) {
         throw new Error('session_bridge_pages_failed')
@@ -39932,7 +39964,7 @@ async function publishReelViaSessionBridge(params: {
         postBody.website_url = websiteUrl
         postBody.cta = cta
     }
-    const resp = await fetchWithTimeout(`${baseUrl}/post`, {
+    const resp = await fetchIdBridgeWithTimeout(params.env, '/post', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(postBody),
@@ -39973,7 +40005,7 @@ async function publishReelViaSessionBridge(params: {
         try {
             // Hypothesis #2: wait before commenting so Facebook attaches the product card.
             await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)
-            const commentResp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
+            const commentResp = await fetchIdBridgeWithTimeout(params.env, '/page-comment', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ page_id: pageId, story_id: storyId, message: commentText, ...(account ? { account } : {}) }),
@@ -40042,7 +40074,7 @@ async function sendPageCommentViaCloakBridge(params: {
         if (!baseUrl) throw new Error('bridge_not_configured')
         // Hypothesis #2: wait before commenting so Facebook attaches the product card.
         await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)
-        const resp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
+        const resp = await fetchIdBridgeWithTimeout(params.env, '/page-comment', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ page_id: pageId, story_id: storyId, message, ...(String(params.account || '').trim() ? { account: String(params.account || '').trim() } : {}) }),
@@ -45496,9 +45528,8 @@ app.post('/api/pages/:id/promote-ad', async (c) => {
         const storyId = String(body.story_id || '').trim()
         if (!storyId) return c.json({ error: 'Missing story_id' }, 400)
 
-        const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
-        if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
-        const resp = await fetchWithTimeout(baseUrl + '/promote', {
+        if (!resolveCloakFbBridgeBaseUrl(c.env)) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
+        const resp = await fetchIdBridgeWithTimeout(c.env, '/promote', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ story_id: storyId }),

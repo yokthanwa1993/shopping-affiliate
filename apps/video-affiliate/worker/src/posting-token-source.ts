@@ -512,12 +512,14 @@ export function shouldFallbackToOrganicAfterOneCardFailure(params: {
 
 // Env subset the CloakBrowser Facebook posting bridge base URL is resolved from.
 export interface CloakFbBridgeEnv {
-    // Primary: the non-Electron CloakBrowser Facebook posting bridge.
+    // Primary URL retained for deployment compatibility. During the IDBridge cutover Atlas
+    // repoints this at the authenticated IDBridge 8798 tunnel.
     CLOAK_FB_BRIDGE_URL?: string
-    // Deprecated fallback ONLY. The old Electron menu-bar bridge (video-onecard, port 3847,
-    // tunnel https://video-onecard.wwoom.com) has been removed. If this env still holds
-    // that retired URL/port it is IGNORED so active posting never targets the dead bridge;
-    // a non-retired URL is honored only for backwards compatibility during migration.
+    // Outgoing service-auth secret for IDBridge. This is deliberately distinct from the
+    // inbound profile-sync secret used by /api/pages/profile-sync.
+    CLOAK_FB_BRIDGE_AUTH?: string
+    // Deprecated and intentionally ignored. IDBridge-only mode must fail closed instead of
+    // silently routing an operation to a second token-owning bridge.
     VIDEO_ONECARD_WORKER_URL?: string
 }
 
@@ -529,134 +531,42 @@ export function isRetiredElectronBridge(rawUrl: unknown): boolean {
     return v.includes('video-onecard.wwoom.com') || /(^|[^0-9])3847(\D|$)/.test(v)
 }
 
-// Resolve the CloakBrowser FB posting bridge base URL. There is NO hardcoded default: when
+// Resolve the IDBridge compatibility base URL. There is NO hardcoded/default/fallback URL: when
 // the bridge is not configured this returns '' and callers MUST fail closed with a precise
-// `bridge_not_configured` error rather than silently hitting a dead tunnel. The bridge uses
-// its own logged-in CloakBrowser session/page tokens internally — the Worker never sends,
-// receives, or logs a raw token.
+// `bridge_not_configured` error rather than silently hitting a retired token owner.
 export function resolveCloakFbBridgeBaseUrl(env: CloakFbBridgeEnv | null | undefined): string {
     const trim = (v: unknown) => String(v ?? '').trim().replace(/\/+$/, '')
     const primary = trim(env?.CLOAK_FB_BRIDGE_URL)
-    if (primary) return primary
-    const legacy = trim(env?.VIDEO_ONECARD_WORKER_URL)
-    if (legacy && !isRetiredElectronBridge(legacy)) return legacy
-    return ''
+    return primary
 }
 
-// ---- Bridge Token (Facebook Lite / Power Editor) /pages page-token fallback --------------
-// When the BrowserSaving secret refresh route is unavailable (e.g. returns "Not found"), the
-// Worker can still re-mint a stored-token page's posting token from the SAME Bridge Token local
-// tool that powers Facebook Lite / Power Editor — exposed in production at CLOAK_FB_BRIDGE_URL
-// (https://short.wwoom.com). The tool's `GET /pages?account=<login>&includeToken=1` route returns
-// the page-scoped access_token for every page the logged-in session administers. `includeToken=1`
-// is gated to local requests on the tool, but a cloudflared tunnel origin request arrives as
-// 127.0.0.1, so the tunnel returns the token (verified in production). The Worker reads that token
-// IN MEMORY ONLY — it is synced into the pool and used for the retry, never returned or logged.
-
-// Build the Bridge Token /pages lookup URL. `account` (a Facebook login/candidate id) is optional:
-// omitted → the tool uses its default logged-in session, which lists every administered page.
-export function buildBridgeTokenPagesUrl(params: {
-    baseUrl: string
-    account?: string
-    includeToken?: boolean
-}): string {
-    const base = String(params.baseUrl ?? '').trim().replace(/\/+$/, '')
-    if (!base) return ''
-    const qs = new URLSearchParams()
-    const account = String(params.account ?? '').trim()
-    if (account) qs.set('account', account)
-    if (params.includeToken) qs.set('includeToken', '1')
-    const query = qs.toString()
-    return query ? `${base}/pages?${query}` : `${base}/pages`
+export function resolveCloakFbBridgeAuthToken(env: CloakFbBridgeEnv | null | undefined): string {
+    return String(env?.CLOAK_FB_BRIDGE_AUTH ?? '').trim()
 }
 
-// Token-bearing result of a Bridge Token /pages lookup. `accessToken` is a RAW page token held in
-// memory only — callers must sync it into storage and never log/return it. `hasToken` reflects the
-// tool's own presence flag so a caller can distinguish "page found but token withheld" from "page
-// not administered".
-export interface BridgeTokenPageLookup {
-    found: boolean
-    hasToken: boolean
-    accessToken: string
-}
+export type CloakFbBridgeFetch = (url: string, init?: RequestInit) => Promise<Response>
 
-// Extract the page-scoped access_token for `pageId` from a Bridge Token /pages response
-// (`{ data: [{ id, name, hasToken, access_token? }] }`). Returns the first matching row's token.
-export function extractBridgeTokenPageAccessToken(data: unknown, pageId: string): BridgeTokenPageLookup {
-    const wantId = String(pageId ?? '').trim()
-    const rows = (data && typeof data === 'object' && Array.isArray((data as { data?: unknown }).data))
-        ? (data as { data: unknown[] }).data
-        : []
-    for (const row of rows) {
-        if (!row || typeof row !== 'object') continue
-        const r = row as Record<string, unknown>
-        if (String(r.id ?? '').trim() !== wantId) continue
-        const token = String(r.access_token ?? '').trim()
-        return { found: true, hasToken: token.length > 0 || r.hasToken === true, accessToken: token }
+// Authenticated, fail-closed client for the seven IDBridge compatibility operations.
+// `pathAndQuery` is deliberately relative so the service-auth value can never be attached to
+// an arbitrary absolute URL. Missing URL/auth is rejected before `fetchImpl` is invoked.
+export async function fetchCloakFbBridgeAuthenticated(
+    env: CloakFbBridgeEnv | null | undefined,
+    pathAndQuery: string,
+    init: RequestInit = {},
+    fetchImpl: CloakFbBridgeFetch = (url, requestInit) => fetch(url, requestInit),
+): Promise<Response> {
+    const baseUrl = resolveCloakFbBridgeBaseUrl(env)
+    if (!baseUrl) throw new Error('bridge_not_configured')
+    const secret = resolveCloakFbBridgeAuthToken(env)
+    if (!secret) throw new Error('bridge_auth_not_configured')
+
+    const relative = String(pathAndQuery ?? '').trim()
+    if (!relative.startsWith('/') || relative.startsWith('//') || relative.includes('://')) {
+        throw new Error('bridge_path_invalid')
     }
-    return { found: false, hasToken: false, accessToken: '' }
-}
-
-// ---- Bridge /token/auto-sync (Worker → bridge TRUE-RECOVERY trigger) -------
-// The product is fully self-healing: there is NO operator button/manual sync/manual export. When a
-// stored/Facebook Lite PUBLISH or COMMENT fails because the page token was invalidated (190 /
-// "session has been invalidated"), the Worker AUTOMATICALLY asks the local Facebook Lite bridge to
-// run its true-bridge recovery — re-mint a fresh token from the stored credentials/session, list
-// the administered pages in real time, and refresh every matching page token back into THIS
-// namespace's pool. The Worker then reloads the pool and retries once. These pure helpers keep the
-// URL/body shaping, response parsing and rate-limit backoff testable and token-free. The bridge
-// endpoint is internal machine-to-machine (secret-authenticated), never UI-driven.
-
-// The bridge auto-sync URL. `baseUrl` must already be resolved (resolveCloakFbBridgeBaseUrl); '' when
-// the bridge is not configured, so the caller fails closed with a sanitized `bridge_not_configured`.
-export function buildBridgeAutoSyncUrl(baseUrl: string): string {
-    const base = String(baseUrl ?? '').trim().replace(/\/+$/, '')
-    return base ? `${base}/token/auto-sync` : ''
-}
-
-// Token-free body the Worker POSTs to /token/auto-sync. `namespaceId` scopes the recovery to the
-// failing page's namespace; `account` / `candidateLoginIds` target a specific FB Lite login (omitted
-// → the bridge scans all FB-Lite-likely accounts). `dryRun` is ALWAYS false for an internal trusted
-// recovery call — a dry run would resolve no token and leave posting broken.
-export interface BridgeAutoSyncRequestBody {
-    namespaceId: string
-    dryRun: false
-    account?: string
-    accounts?: string[]
-    // Page-targeted recovery: when a SPECIFIC page's token was invalidated, scope the bridge scan to
-    // that page so it refreshes exactly that row (and reports a page-not-found outcome instead of
-    // silently touching nothing) — the difference between "tried and the account lacks the page" and
-    // "recovered the whole namespace".
-    pageId?: string
-    // Explicit fallback accounts to try (in order, AFTER the primary `account`) when the page's primary
-    // bridge account can no longer mint a token / no longer administers the page. e.g. Chanalai →
-    // Thanwan. The bridge ALSO merges any env-configured fallback mapping; this is the per-call hint.
-    fallbackAccounts?: string[]
-}
-
-export function buildBridgeAutoSyncRequestBody(params: {
-    namespaceId: string
-    account?: string
-    candidateLoginIds?: string[]
-    pageId?: string
-    fallbackAccounts?: string[]
-}): BridgeAutoSyncRequestBody {
-    const body: BridgeAutoSyncRequestBody = { namespaceId: String(params.namespaceId ?? '').trim(), dryRun: false }
-    const account = String(params.account ?? '').trim()
-    const accounts = Array.from(new Set(
-        (params.candidateLoginIds ?? []).map((v) => String(v ?? '').trim()).filter(Boolean),
-    ))
-    if (account) body.account = account
-    else if (accounts.length) body.accounts = accounts
-    const pageId = String(params.pageId ?? '').trim()
-    if (pageId) body.pageId = pageId
-    // Fallback accounts are sent verbatim (deduped/trimmed) and never collapsed into `account`/`accounts`
-    // — the bridge appends them to the scan order so the primary is always tried first.
-    const fallbackAccounts = Array.from(new Set(
-        (params.fallbackAccounts ?? []).map((v) => String(v ?? '').trim()).filter(Boolean),
-    )).filter((a) => a !== account)
-    if (fallbackAccounts.length) body.fallbackAccounts = fallbackAccounts
-    return body
+    const headers = new Headers(init.headers || {})
+    headers.set('X-Bridge-Token', secret)
+    return fetchImpl(`${baseUrl}${relative}`, { ...init, headers })
 }
 
 // Parse an env-configured account/page → fallback-accounts mapping. Accepts a JSON object whose values
@@ -714,37 +624,6 @@ export function resolveBridgeFallbackAccounts(params: {
     if (pageId) push(params.pageFallbackMap?.[pageId])
     if (primary) push(params.accountFallbackMap?.[primary])
     return out
-}
-
-// Token-free outcome the Worker keeps after an auto-sync call. `synced` = the bridge refreshed ≥1
-// page token into the pool (so the caller may reload + retry). `reason` is a short redacted hint,
-// never a token. The bridge response is already token-free (booleans/ids/sanitized reasons only).
-export interface BridgeAutoSyncOutcome {
-    ok: boolean
-    synced: boolean
-    reason: string
-}
-
-export function parseBridgeAutoSyncResponse(httpOk: boolean, data: unknown): BridgeAutoSyncOutcome {
-    const payload = (data && typeof data === 'object') ? data as Record<string, unknown> : {}
-    const counts = (payload.counts && typeof payload.counts === 'object') ? payload.counts as Record<string, unknown> : {}
-    const syncedCount = Number(counts.synced ?? 0)
-    const synced = httpOk && (payload.synced === true || syncedCount > 0)
-    const ok = httpOk && payload.ok === true
-    const reasonRaw = String(payload.status ?? payload.error ?? '').trim()
-    return { ok, synced, reason: reasonRaw ? reasonRaw.slice(0, 120) : (synced ? 'synced' : 'auto_sync_no_pages') }
-}
-
-// Rate-limit backoff: fire at most ONE live auto-sync per namespace per TTL window. A repeated
-// publish/comment failure across pages / cron passes in the same window must NOT re-trigger a fresh
-// mint — that is exactly what trips Facebook's login rate limiter. Pure, so it is unit-testable.
-// Returns true when a NEW attempt is allowed at `nowMs` given the last attempt (0/undefined = never
-// attempted). A non-positive TTL disables throttling (used by tests).
-export function isBridgeAutoSyncAllowed(lastAttemptMs: number | undefined, nowMs: number, ttlMs: number): boolean {
-    const last = Number(lastAttemptMs || 0)
-    if (!last) return true
-    if (!(ttlMs > 0)) return true
-    return (nowMs - last) >= ttlMs
 }
 
 // ---- Posting auth-failure circuit breaker (anti-automation cooldown) -------

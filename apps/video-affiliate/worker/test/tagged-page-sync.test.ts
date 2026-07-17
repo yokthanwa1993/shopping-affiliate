@@ -859,7 +859,7 @@ test('sendPageCommentViaCloakBridge comments as the Page and fails closed (no st
     assert.match(fn, /throw new Error\('bridge_not_configured'\)/)
     // Posts page_id/story_id/message to /page-comment — never a token. Optional account
     // is allowed so Facebook Lite can select the correct Token Bridge session.
-    assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
+    assert.match(fn, /fetchIdBridgeWithTimeout\(params\.env, '\/page-comment'/)
     assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message,[\s\S]*account/)
     // Nothing to comment → not_configured; any failure → 'failed' (never silent success).
     assert.match(fn, /return \{ status: 'not_configured'/)
@@ -982,11 +982,11 @@ test('publishReelViaSessionBridge validates /token + /pages then posts /post via
     assert.match(fn, /\/token\$\{accountQuery\}`[\s\S]*tokenData\.accessToken !== true[\s\S]*session_bridge_token_unavailable/)
     assert.match(fn, /\/pages\$\{accountQuery\}`[\s\S]*session_bridge_page_not_authorized/)
     // Posts the organic Reel via the bridge /post route.
-    assert.match(fn, /\$\{baseUrl\}\/post`/)
+    assert.match(fn, /fetchIdBridgeWithTimeout\(params\.env, '\/post'/)
     // Comment is posted AS THE PAGE via the bridge /page-comment route (resolves the page
     // token internally, fails closed, no session-user fallback). Worker sends only
     // page_id/story_id/message (+ optional account selector) — never a token.
-    assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
+    assert.match(fn, /fetchIdBridgeWithTimeout\(params\.env, '\/page-comment'/)
     assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message: commentText,[\s\S]*account/)
     // Must NOT comment via the /graph proxy (that path authors the comment as the
     // logged-in user, not the Page — the bug this fix removes).
@@ -1032,12 +1032,12 @@ test('create-ad accepts an explicit pre-shortened comment link and skips its own
 test('create-ad uses the SAME Cloak FB bridge for every source — no provider branch, fail-closed when unconfigured', () => {
     const routeSource = getDashboardCreateAdRouteSource()
 
-    // create-ad always targets the non-Electron Cloak FB bridge via baseUrl, resolved with
+    // create-ad always targets the authenticated IDBridge compatibility route, resolved with
     // no hardcoded default and failing closed (bridge_not_configured) when unset.
     assert.match(routeSource, /const baseUrl = resolveCloakFbBridgeBaseUrl\(c\.env\)/)
     assert.match(routeSource, /if \(!baseUrl\) return c\.json\(\{ ok: false, error: 'bridge_not_configured'/)
     assert.match(routeSource, /callVideoOnecardCreateAd\(templateAdsetFromSettings\)/)
-    assert.match(routeSource, /await fetch\(`\$\{baseUrl\}\/create-ad`/)
+    assert.match(routeSource, /await fetchIdBridge\(c\.env, '\/create-ad'/)
     // The old facebook-token-cloak provider dispatch is fully removed.
     assert.ok(!routeSource.includes('/provider/create-ad'), 'must not call /provider/create-ad')
     assert.ok(!routeSource.includes("=== 'cloak_provider'"), 'old cloak_provider create-ad branch must be gone')
@@ -1166,8 +1166,9 @@ test('post-first OneCard is opt-in via ADS_POST_FIRST_ENABLED and runs A→mint�
     // Fail closed before Phase B unless re-mint produced the direct final Shopee shortlink.
     // The step name must not imply an organic page CTA change.
     assert.match(helper, /if \(!remint\.reminted \|\| !isDirectShopeeShortlink\(finalLink\)\) \{[\s\S]*final_shortlink_mint/)
-    // Phase B: promote the ad with the FINAL link in the CTA, reusing the Phase A video.
-    assert.match(helper, /\$\{baseUrl\}\/promote`[\s\S]*video_id: videoId[\s\S]*final_cta_link: finalLink/)
+    // Phase B: promote the ad with the FINAL link in the CTA, reusing the Phase A video, via the
+    // authenticated IDBridge helper (X-Bridge-Token is injected by fetchIdBridgeWithTimeout).
+    assert.match(helper, /fetchIdBridgeWithTimeout\(env, '\/promote', \{[\s\S]*video_id: videoId[\s\S]*final_cta_link: finalLink/)
     // The visible-page CTA report is taken strictly from the bridge value (organic post
     // unchanged → false), never inferred from the promoted-ad link.
     assert.match(helper, /visiblePageCtaLink = String\(dataB\.visible_page_cta_link \|\| ''\)\.trim\(\)/)

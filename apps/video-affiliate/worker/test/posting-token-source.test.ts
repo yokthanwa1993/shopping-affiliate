@@ -6,6 +6,8 @@ import {
     resolvePostingRoute,
     postingSourceHint,
     resolveCloakFbBridgeBaseUrl,
+    resolveCloakFbBridgeAuthToken,
+    fetchCloakFbBridgeAuthenticated,
     isRetiredElectronBridge,
     normalizePageCommentTokenSource,
     defaultCommentSourceForRoute,
@@ -16,12 +18,6 @@ import {
     buildFacebookLiteRefreshRequestBody,
     parseFacebookLiteRefreshResponse,
     redactFacebookLiteRefreshResult,
-    buildBridgeTokenPagesUrl,
-    extractBridgeTokenPageAccessToken,
-    buildBridgeAutoSyncUrl,
-    buildBridgeAutoSyncRequestBody,
-    parseBridgeAutoSyncResponse,
-    isBridgeAutoSyncAllowed,
     isFacebookCheckpointOrAutomationFailure,
     shouldArmPostingAuthCooldown,
     resolvePostingAuthCooldownMs,
@@ -84,7 +80,7 @@ test('source hint maps route → token-free label (never a token, never video-on
     assert.equal(postingSourceHint('stored_token'), 'stored_token')
 })
 
-test('Cloak FB bridge base URL: CLOAK_FB_BRIDGE_URL is primary, trailing slash trimmed', () => {
+test('IDBridge base URL: CLOAK_FB_BRIDGE_URL is primary, trailing slash trimmed', () => {
     assert.equal(
         resolveCloakFbBridgeBaseUrl({ CLOAK_FB_BRIDGE_URL: 'https://fb-bridge.example.com/' }),
         'https://fb-bridge.example.com',
@@ -103,7 +99,7 @@ test('Cloak FB bridge base URL: CLOAK_FB_BRIDGE_URL is primary, trailing slash t
     )
 })
 
-test('Cloak FB bridge base URL: NO default — unconfigured returns "" so callers fail closed', () => {
+test('IDBridge base URL: NO default — unconfigured returns "" so callers fail closed', () => {
     assert.equal(resolveCloakFbBridgeBaseUrl(undefined), '')
     assert.equal(resolveCloakFbBridgeBaseUrl(null), '')
     assert.equal(resolveCloakFbBridgeBaseUrl({}), '')
@@ -111,19 +107,68 @@ test('Cloak FB bridge base URL: NO default — unconfigured returns "" so caller
     assert.equal(resolveCloakFbBridgeBaseUrl({ CLOAK_FB_BRIDGE_URL: '   ' }), '')
 })
 
-test('Cloak FB bridge base URL never resolves to the retired Electron video-onecard bridge / port 3847', () => {
+test('IDBridge base URL ignores every deprecated fallback, including non-retired URLs', () => {
     assert.equal(resolveCloakFbBridgeBaseUrl({ VIDEO_ONECARD_WORKER_URL: 'https://video-onecard.wwoom.com' }), '')
     assert.equal(resolveCloakFbBridgeBaseUrl({ VIDEO_ONECARD_WORKER_URL: 'https://video-onecard.wwoom.com/' }), '')
     assert.equal(resolveCloakFbBridgeBaseUrl({ VIDEO_ONECARD_WORKER_URL: 'http://127.0.0.1:3847' }), '')
-    // A non-retired deprecated URL is still honored (backwards-compatible migration window).
-    assert.equal(
-        resolveCloakFbBridgeBaseUrl({ VIDEO_ONECARD_WORKER_URL: 'http://127.0.0.1:8830' }),
-        'http://127.0.0.1:8830',
-    )
+    assert.equal(resolveCloakFbBridgeBaseUrl({ VIDEO_ONECARD_WORKER_URL: 'http://127.0.0.1:8830' }), '')
     assert.ok(isRetiredElectronBridge('https://video-onecard.wwoom.com'))
     assert.ok(isRetiredElectronBridge('http://127.0.0.1:3847'))
     assert.ok(!isRetiredElectronBridge('http://127.0.0.1:8830'))
     assert.ok(!isRetiredElectronBridge(''))
+})
+
+test('IDBridge auth secret is trimmed and never inferred from the URL', () => {
+    assert.equal(resolveCloakFbBridgeAuthToken({ CLOAK_FB_BRIDGE_AUTH: '  bridge-secret  ' }), 'bridge-secret')
+    assert.equal(resolveCloakFbBridgeAuthToken({ CLOAK_FB_BRIDGE_URL: 'https://bridge.example' }), '')
+})
+
+test('all twelve IDBridge compatibility operations carry X-Bridge-Token', async () => {
+    const routes = [
+        '/token', '/pages', '/post', '/page-comment', '/create-ad', '/graph', '/update-cta',
+        '/pause-ad-only', '/archive-ad-only', '/promote', '/media-library/upload', '/media-library/resolve',
+    ]
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fakeFetch = async (url: string, init?: RequestInit) => {
+        calls.push({ url, init })
+        return new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    for (const route of routes) {
+        await fetchCloakFbBridgeAuthenticated(
+            { CLOAK_FB_BRIDGE_URL: 'https://idbridge.example/', CLOAK_FB_BRIDGE_AUTH: 'service-secret' },
+            route,
+            { method: route === '/token' || route === '/pages' ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' } },
+            fakeFetch,
+        )
+    }
+    assert.equal(calls.length, routes.length)
+    for (const [index, call] of calls.entries()) {
+        assert.equal(call.url, `https://idbridge.example${routes[index]}`)
+        const headers = new Headers(call.init?.headers)
+        assert.equal(headers.get('X-Bridge-Token'), 'service-secret')
+        assert.equal(headers.get('Content-Type'), 'application/json')
+    }
+})
+
+test('IDBridge client fails closed before fetch when URL/auth/path is invalid', async () => {
+    let calls = 0
+    const fakeFetch = async () => {
+        calls += 1
+        return new Response('{}')
+    }
+    await assert.rejects(
+        fetchCloakFbBridgeAuthenticated({ CLOAK_FB_BRIDGE_AUTH: 'secret' }, '/post', {}, fakeFetch),
+        /bridge_not_configured/,
+    )
+    await assert.rejects(
+        fetchCloakFbBridgeAuthenticated({ CLOAK_FB_BRIDGE_URL: 'https://idbridge.example' }, '/post', {}, fakeFetch),
+        /bridge_auth_not_configured/,
+    )
+    await assert.rejects(
+        fetchCloakFbBridgeAuthenticated({ CLOAK_FB_BRIDGE_URL: 'https://idbridge.example', CLOAK_FB_BRIDGE_AUTH: 'do-not-leak' }, 'https://evil.example', {}, fakeFetch),
+        (error: unknown) => error instanceof Error && error.message === 'bridge_path_invalid' && !error.message.includes('do-not-leak'),
+    )
+    assert.equal(calls, 0)
 })
 
 test('comment source: explicit values win (decoupled from posting source)', () => {
@@ -299,45 +344,6 @@ test('posting refresh: only stored_token, only on auth failure / missing token',
     assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'cloak_browser', tokenMissing: true }), false)
 })
 
-// ---- Bridge Token /pages fallback URL + token extraction -----------------------------------
-
-test('bridge token /pages url: includes account + includeToken=1, omits empty account', () => {
-    const withAccount = buildBridgeTokenPagesUrl({ baseUrl: 'https://short.wwoom.com', account: '100090320823561', includeToken: true })
-    assert.ok(withAccount.startsWith('https://short.wwoom.com/pages?'), 'targets the bridge /pages route')
-    assert.ok(/account=100090320823561/.test(withAccount), 'carries the candidate login id as account=')
-    assert.ok(/includeToken=1/.test(withAccount), 'requests the raw token via includeToken=1')
-    // No account → default session, no account= param, still includeToken=1.
-    const defaultSession = buildBridgeTokenPagesUrl({ baseUrl: 'https://short.wwoom.com/', includeToken: true })
-    assert.equal(defaultSession, 'https://short.wwoom.com/pages?includeToken=1')
-    // Empty base → empty url (caller fails closed).
-    assert.equal(buildBridgeTokenPagesUrl({ baseUrl: '', includeToken: true }), '')
-})
-
-test('bridge token /pages: extracts the matching page access_token, ignores others', () => {
-    const data = {
-        data: [
-            { id: '999', name: 'other', hasToken: true, access_token: 'EAAotherZZZ' },
-            { id: '1008898512617594', name: 'เฉียบ', hasToken: true, access_token: 'EAAfreshpagetoken' },
-        ],
-    }
-    const hit = extractBridgeTokenPageAccessToken(data, '1008898512617594')
-    assert.equal(hit.found, true)
-    assert.equal(hit.hasToken, true)
-    assert.equal(hit.accessToken, 'EAAfreshpagetoken')
-    // Page absent → found:false, no token.
-    const miss = extractBridgeTokenPageAccessToken(data, '111')
-    assert.equal(miss.found, false)
-    assert.equal(miss.accessToken, '')
-    // hasToken flag with token withheld (non-local caller) → found but empty token.
-    const withheld = extractBridgeTokenPageAccessToken({ data: [{ id: '5', hasToken: true }] }, '5')
-    assert.equal(withheld.found, true)
-    assert.equal(withheld.hasToken, true)
-    assert.equal(withheld.accessToken, '')
-    // Garbage payloads never throw.
-    assert.equal(extractBridgeTokenPageAccessToken(null, '5').found, false)
-    assert.equal(extractBridgeTokenPageAccessToken({ data: 'nope' }, '5').found, false)
-})
-
 // ---- Facebook Lite (EAAD6V) page-token prioritization ----------------------
 // Regression guard for the live bug: after a facebook_lite_bridge export synced a fresh EAAD6V
 // page token, force-post kept posting/commenting with the stale EAABsb token (row 33519). The
@@ -480,43 +486,6 @@ test('a (#10) permission error reaches the bridge fallback while an auth error s
     assert.equal(isFacebookLitePostingPermissionError('upload_video:(#10) Permission Denied'), true)
 })
 
-// ---- Bridge /token/auto-sync (Worker → bridge TRUE-RECOVERY trigger) -------
-// Recovery is fully AUTOMATIC and machine-to-machine: when a stored/Facebook Lite token is
-// invalidated, the Worker POSTs the bridge's /token/auto-sync itself (no operator button). These
-// pure helpers shape the URL/body, parse the token-free response, and back off to avoid spamming
-// Facebook's login rate limiter.
-
-test('buildBridgeAutoSyncUrl appends /token/auto-sync, returns "" when the bridge is unconfigured (fail closed)', () => {
-    assert.equal(buildBridgeAutoSyncUrl('https://short.wwoom.com'), 'https://short.wwoom.com/token/auto-sync')
-    assert.equal(buildBridgeAutoSyncUrl('https://short.wwoom.com/'), 'https://short.wwoom.com/token/auto-sync')
-    assert.equal(buildBridgeAutoSyncUrl(''), '')
-    assert.equal(buildBridgeAutoSyncUrl('   '), '')
-})
-
-test('buildBridgeAutoSyncRequestBody is always dryRun:false (internal trusted recovery), scopes by namespace, targets account/candidates', () => {
-    // Bare namespace → all-account scan, live (never a preview that would resolve no token).
-    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [] }), { namespaceId: '177', dryRun: false })
-    // A specific account is preferred over a candidate list.
-    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: '100090', candidateLoginIds: ['x'] }), { namespaceId: '177', dryRun: false, account: '100090' })
-    // Candidate login ids (deduped, trimmed) only when no explicit account.
-    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [' a ', 'a', 'b'] }), { namespaceId: '177', dryRun: false, accounts: ['a', 'b'] })
-})
-
-test('buildBridgeAutoSyncRequestBody carries pageId + fallbackAccounts for page-targeted recovery (Chanalai → Thanwan), deduped, primary excluded', () => {
-    // A page-targeted recovery: primary account named, the failing page id, and an explicit fallback.
-    assert.deepEqual(
-        buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: '100090320823561', pageId: '182865331578296', fallbackAccounts: ['100077795357192'] }),
-        { namespaceId: '177', dryRun: false, account: '100090320823561', pageId: '182865331578296', fallbackAccounts: ['100077795357192'] },
-    )
-    // Fallbacks are trimmed/deduped and never re-list the primary account.
-    assert.deepEqual(
-        buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: 'A', fallbackAccounts: [' B ', 'B', 'A', 'C'] }),
-        { namespaceId: '177', dryRun: false, account: 'A', fallbackAccounts: ['B', 'C'] },
-    )
-    // No fallback fields emitted when none supplied (back-compat with existing all-account scan).
-    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [] }), { namespaceId: '177', dryRun: false })
-})
-
 test('parseAccountFallbackMap: tolerant JSON/object → normalized id lists, malformed never throws', () => {
     // JSON string (env var shape): Chanalai uid → Thanwan uid.
     assert.deepEqual(parseAccountFallbackMap('{"100090320823561":["100077795357192"]}'), { '100090320823561': ['100077795357192'] })
@@ -546,32 +515,6 @@ test('resolveBridgeFallbackAccounts: ordered explicit → page-map → account-m
     )
     // No mappings → empty (so an all-account scan is unaffected).
     assert.deepEqual(resolveBridgeFallbackAccounts({ primaryAccount: 'A', pageId: 'P' }), [])
-})
-
-test('parseBridgeAutoSyncResponse reports synced from counts.synced or the synced flag, token-free, http failure never synced', () => {
-    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, synced: true, counts: { synced: 2 } }).synced, true)
-    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, counts: { synced: 1 } }).synced, true)
-    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, status: 'synced_with_errors', counts: { synced: 0 } }).synced, false)
-    // A throttled/dry response is NOT synced.
-    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, synced: false, status: 'throttled' }).synced, false)
-    // A non-2xx transport never counts as synced regardless of body.
-    assert.equal(parseBridgeAutoSyncResponse(false, { ok: true, synced: true, counts: { synced: 5 } }).synced, false)
-    // reason is a short hint, capped, never a token.
-    const r = parseBridgeAutoSyncResponse(true, { ok: false, error: 'x'.repeat(400) })
-    assert.ok(r.reason.length <= 120)
-})
-
-test('isBridgeAutoSyncAllowed: first attempt allowed, repeat within TTL blocked, after TTL allowed again, non-positive TTL disables throttle', () => {
-    // Never attempted → allowed.
-    assert.equal(isBridgeAutoSyncAllowed(undefined, 1_000_000, 60_000), true)
-    assert.equal(isBridgeAutoSyncAllowed(0, 1_000_000, 60_000), true)
-    // Within the window → blocked.
-    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_030_000, 60_000), false)
-    // Exactly/after the window → allowed.
-    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_060_000, 60_000), true)
-    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_200_000, 60_000), true)
-    // TTL<=0 disables throttling (test override).
-    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_000_001, 0), true)
 })
 
 test('isFacebookCheckpointOrAutomationFailure: flags checkpoint/automation/rate-limit, not a plain 190', () => {
