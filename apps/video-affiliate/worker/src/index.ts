@@ -6311,16 +6311,31 @@ function buildFastGalleryPostingOrderBy(postingOrder: NamespacePostingOrder): st
     return `ORDER BY ${sortExpr} ASC, gi.video_id ASC`
 }
 
-function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder): number[] {
-    const pages = Array.from({ length: Math.max(0, maxPages) }, (_, index) => index)
-    if (postingOrder !== 'random') return pages
+function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder, availablePageCount?: number | null): number[] {
+    const boundedMaxPages = Math.max(0, maxPages)
+    if (postingOrder !== 'random') {
+        return Array.from({ length: boundedMaxPages }, (_, index) => index)
+    }
+    // Random mode must sample across the FULL page range of the loaded pool,
+    // not only 0..maxPages-1: on a large namespace (CHEARB 2026-07 incident,
+    // 8,786 fresh candidates) a fully-blocked head window otherwise starves
+    // every tick. Callers that cannot know the total page count without an
+    // expensive COUNT(*) omit availablePageCount and keep the legacy bounded
+    // window.
+    const knownPageCount = typeof availablePageCount === 'number' && Number.isFinite(availablePageCount)
+        ? Math.max(0, Math.floor(availablePageCount))
+        : null
+    // A known-empty pool still probes page 0 so the scan observes emptiness and
+    // can report the fresh pass as exhausted (the reuse-fallback gate).
+    const pageRange = knownPageCount === null ? boundedMaxPages : Math.max(1, knownPageCount)
+    const pages = Array.from({ length: pageRange }, (_, index) => index)
     for (let index = pages.length - 1; index > 0; index -= 1) {
         const swapIndex = Math.floor(Math.random() * (index + 1))
         const current = pages[index]
         pages[index] = pages[swapIndex]
         pages[swapIndex] = current
     }
-    return pages
+    return pages.slice(0, boundedMaxPages)
 }
 
 async function hydrateFastPostingCandidateSourceFingerprint(params: {
@@ -6541,7 +6556,14 @@ async function claimFastGalleryVideoForPosting(params: {
         stats.pages = 0
 
         const seenVideoIds = new Set<string>()
-        const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder)
+        // The in-memory fresh pool is fully loaded, so random selection may
+        // sample page indexes across all of it. The SQL fallback cannot know
+        // its total page count without COUNT(*) (production D1 CPU incident),
+        // so it keeps the legacy bounded window.
+        const availablePageCount = mode === 'namespace_unposted'
+            ? Math.ceil(visibleReadyPostingCandidates.length / pageSize)
+            : null
+        const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder, availablePageCount)
         let exhaustedAfterPageIndex: number | null = null
         let candidateRows = 0
         const successfulSourceHistoryByFingerprint = new Map<string, SuccessfulNamespaceSourceHistoryRow | null>()

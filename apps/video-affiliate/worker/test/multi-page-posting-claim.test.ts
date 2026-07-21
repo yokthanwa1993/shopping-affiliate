@@ -13,7 +13,11 @@ import test from 'node:test'
 //
 // These are source-level assertions (the worker's D1 helpers are not exported
 // and there is no D1 mock in this suite), matching the established pattern in
-// stale-posting-recovery.test.ts / recover-failed-history.test.ts.
+// stale-posting-recovery.test.ts / recover-failed-history.test.ts. The one
+// exception is buildFastGalleryPostingPageIndexes: it is a pure function, so
+// its sliced source is additionally rewritten to plain JS and EXECUTED under a
+// stubbed Math.random to prove the random page window covers the full
+// candidate range (CHEARB 2026-07 starvation regression).
 
 function getSource(): string {
     return readFileSync('src/index.ts', 'utf8')
@@ -97,6 +101,52 @@ function getClaimFastSource(): string {
         '\nasync function getSystemGalleryPageFast',
         'claimFastGalleryVideoForPosting'
     )
+}
+
+// --- Executable harness for the pure page-index builder -----------------------
+//
+// The builder's body is deliberately plain JS; only the single-line signature
+// carries TypeScript annotations. Rewriting that one known line lets the tests
+// run the real production sampling logic instead of only asserting on source
+// text. If the signature changes, the assert below fails loudly so the
+// replacement is updated alongside it.
+
+type FastGalleryPageIndexBuilder = (
+    maxPages: number,
+    postingOrder: string,
+    availablePageCount?: number | null,
+) => number[]
+
+const PAGE_INDEX_BUILDER_TS_SIGNATURE =
+    'function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder, availablePageCount?: number | null): number[] {'
+const PAGE_INDEX_BUILDER_JS_SIGNATURE =
+    'function buildFastGalleryPostingPageIndexes(maxPages, postingOrder, availablePageCount) {'
+
+function compilePageIndexBuilder(): FastGalleryPageIndexBuilder {
+    const tsSource = getPageIndexesSource()
+    assert.ok(
+        tsSource.includes(PAGE_INDEX_BUILDER_TS_SIGNATURE),
+        'page index builder must keep the single-line typed signature the executable harness rewrites'
+    )
+    const jsSource = tsSource.replace(PAGE_INDEX_BUILDER_TS_SIGNATURE, PAGE_INDEX_BUILDER_JS_SIGNATURE)
+    const factory = new Function(`${jsSource}\nreturn buildFastGalleryPostingPageIndexes`)
+    return factory() as FastGalleryPageIndexBuilder
+}
+
+function withStubbedRandom<T>(seed: number, run: () => T): T {
+    const originalRandom = Math.random
+    let state = seed >>> 0
+    // Deterministic LCG (Numerical Recipes constants) so every run of the
+    // suite samples identical "random" page windows.
+    Math.random = () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+        return state / 4294967296
+    }
+    try {
+        return run()
+    } finally {
+        Math.random = originalRandom
+    }
 }
 
 test('claim path no longer blocks siblings via namespace-wide post_history dedup', () => {
@@ -406,7 +456,7 @@ test('random posting order uses bounded random page windows without COUNT', () =
     assert.match(pageIndexBody, /Math\.random\(\)/, 'random order must shuffle bounded page windows')
     assert.match(
         claimBody,
-        /const pageIndexes = buildFastGalleryPostingPageIndexes\(maxPages, params\.postingOrder\)/,
+        /const pageIndexes = buildFastGalleryPostingPageIndexes\(maxPages, params\.postingOrder, availablePageCount\)/,
         'claimFast must use bounded page indexes instead of COUNT-derived random offsets'
     )
     assert.match(
@@ -414,6 +464,90 @@ test('random posting order uses bounded random page windows without COUNT', () =
         /if \(!namespaceFreshScan\.exhausted \|\| namespaceFreshScan\.candidateRows > 0\) return finish\(null\)/,
         'bounded random scans must return no pick when they lack proof of an empty fresh pool'
     )
+})
+
+// --- Full-range random page window (CHEARB 2026-07 starvation regression) -----
+//
+// With 8,786 fresh candidates (pageSize 24 → 367 pages) the legacy builder only
+// ever emitted indexes 0..14, so the tick considered offsets 0..359 forever and
+// starved once that fixed head window was fully blocked by duplicate guards.
+// Random mode must now sample bounded distinct indexes across the WHOLE known
+// page range, while the SQL fallback (unknown total, COUNT(*) forbidden) keeps
+// the legacy window.
+
+test('in-memory fresh pass feeds the full available page count into random sampling', () => {
+    const claimBody = getClaimFastSource()
+    assert.match(
+        claimBody,
+        /const availablePageCount = mode === 'namespace_unposted'\s*\?\s*Math\.ceil\(visibleReadyPostingCandidates\.length \/ pageSize\)\s*:\s*null/,
+        'namespace_unposted must derive availablePageCount from the loaded in-memory pool; the SQL fallback must pass null'
+    )
+    assert.doesNotMatch(
+        getListCandidatesSource(),
+        /COUNT\s*\(/i,
+        'deriving the page range must not reintroduce COUNT into the candidate lister'
+    )
+})
+
+test('random page window samples the full in-memory range (8786 candidates, pageSize 24, maxPages 15)', () => {
+    const buildPageIndexes = compilePageIndexBuilder()
+    const availablePageCount = Math.ceil(8786 / 24) // 367 pages, matching the live CHEARB pool
+    let sawBeyondLegacyWindow = false
+    for (let seed = 1; seed <= 25; seed += 1) {
+        const pages = withStubbedRandom(seed * 2654435761, () => buildPageIndexes(15, 'random', availablePageCount))
+        assert.equal(pages.length, 15, 'random mode must return exactly maxPages indexes')
+        assert.equal(new Set(pages).size, pages.length, 'random page indexes must be unique')
+        for (const pageIndex of pages) {
+            assert.ok(Number.isInteger(pageIndex), 'page indexes must be integers')
+            assert.ok(
+                pageIndex >= 0 && pageIndex < availablePageCount,
+                `page index ${pageIndex} must stay inside 0..${availablePageCount - 1}`
+            )
+        }
+        if (pages.some((pageIndex) => pageIndex > 14)) sawBeyondLegacyWindow = true
+    }
+    assert.ok(sawBeyondLegacyWindow, 'full-range sampling must reach page indexes beyond the legacy 0..14 window')
+})
+
+test('random page window caps at maxPages and covers every page of a small pool', () => {
+    const buildPageIndexes = compilePageIndexBuilder()
+    const smallPool = withStubbedRandom(1337, () => buildPageIndexes(15, 'random', 3))
+    assert.deepEqual(
+        [...smallPool].sort((a, b) => a - b),
+        [0, 1, 2],
+        'a 3-page pool must shuffle exactly pages 0..2 without inventing indexes'
+    )
+    assert.deepEqual(
+        withStubbedRandom(7, () => buildPageIndexes(15, 'random', 0)),
+        [0],
+        'a known-empty pool must still probe page 0 so the scan can observe exhaustion for the reuse fallback'
+    )
+})
+
+test('random page window without a known pool size keeps the legacy shuffled 0..14 window', () => {
+    const buildPageIndexes = compilePageIndexBuilder()
+    const legacyWindow = withStubbedRandom(42, () => buildPageIndexes(15, 'random'))
+    assert.deepEqual(
+        [...legacyWindow].sort((a, b) => a - b),
+        Array.from({ length: 15 }, (_, index) => index),
+        'unknown pool size (SQL fallback) must keep exactly the pages 0..14'
+    )
+    assert.ok(
+        legacyWindow.some((pageIndex, position) => pageIndex !== position),
+        'legacy window must still be shuffled, not sequential'
+    )
+})
+
+test('sequential posting orders ignore availablePageCount and stay 0..maxPages-1', () => {
+    const buildPageIndexes = compilePageIndexBuilder()
+    for (const order of ['oldest_first', 'newest_first']) {
+        const pages = withStubbedRandom(99, () => buildPageIndexes(15, order, 367))
+        assert.deepEqual(
+            pages,
+            Array.from({ length: 15 }, (_, index) => index),
+            `${order} must keep sequential page indexes 0..14 even when the pool is larger`
+        )
+    }
 })
 
 test('reuse fallback requires a real namespace success history row', () => {
