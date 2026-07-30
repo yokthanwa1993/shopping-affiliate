@@ -48358,10 +48358,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             pagesFailed: cronStats.pagesFailed,
             lastError: fatalError ? fatalError.message : null,
         }).catch(() => { })
+        await releaseScheduledRunLock(env.DB, scheduledRunLockKey, runId).catch(() => { })
         // Backstop: finalize any post-log rows whose linked post_history reached a terminal
         // state this run (story/status/error/snapshot). Best-effort, bounded, never throws.
         await reconcilePostLogTagsFromHistory(env.DB, { limit: 300 }).catch(() => 0)
-        await releaseScheduledRunLock(env.DB, scheduledRunLockKey, runId).catch(() => { })
     }
 
     console.log('[CRON] Auto-post check complete')

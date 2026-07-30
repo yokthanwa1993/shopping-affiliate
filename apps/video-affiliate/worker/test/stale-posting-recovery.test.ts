@@ -325,6 +325,27 @@ test('scheduled runtime records awaited startup, first-page, completion, and fai
     )
 })
 
+test('scheduled terminal cleanup releases owner lock before best-effort reconciliation', () => {
+    const body = getScheduledSource()
+    const terminalStatusIdx = body.indexOf("status: fatalError ? 'failed' : 'completed'")
+    const terminalUpdateIdx = body.lastIndexOf('await updateCronRuntimeState(env.DB, runId, {', terminalStatusIdx)
+    const releaseIdx = body.indexOf(
+        'await releaseScheduledRunLock(env.DB, scheduledRunLockKey, runId).catch(() => { })',
+        terminalStatusIdx,
+    )
+    const reconcileIdx = body.indexOf(
+        'await reconcilePostLogTagsFromHistory(env.DB, { limit: 300 }).catch(() => 0)',
+        terminalStatusIdx,
+    )
+
+    assert.notEqual(terminalStatusIdx, -1, 'scheduled cleanup must persist a terminal status')
+    assert.notEqual(terminalUpdateIdx, -1, 'scheduled cleanup must await its terminal runtime update')
+    assert.notEqual(releaseIdx, -1, 'scheduled cleanup must await the owner-safe run-lock release')
+    assert.notEqual(reconcileIdx, -1, 'scheduled cleanup must keep bounded best-effort reconciliation')
+    assert.ok(terminalUpdateIdx < releaseIdx, 'owner lock release must follow the terminal runtime update')
+    assert.ok(releaseIdx < reconcileIdx, 'owner lock release must precede best-effort reconciliation')
+})
+
 test('partial runtime heartbeats preserve current-page and error diagnostics unless explicitly cleared', () => {
     const body = getRuntimeUpdateSource()
     assert.match(body, /Object\.prototype\.hasOwnProperty\.call\(patch, field\)/, 'runtime updates must distinguish omitted fields from explicit null')
