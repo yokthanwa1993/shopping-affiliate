@@ -2169,78 +2169,34 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
     }
 }
 
-async function ensurePagePostedVideoGuardsTable(db: D1Database): Promise<void> {
-    await db.prepare(
-        `CREATE TABLE IF NOT EXISTS page_posted_video_guards (
-            guard_key TEXT PRIMARY KEY,
-            bot_id TEXT NOT NULL,
-            page_id TEXT NOT NULL,
-            video_id TEXT NOT NULL DEFAULT '',
-            source_fingerprint TEXT NOT NULL DEFAULT '',
-            history_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )`
-    ).run()
-    await db.prepare(
-        'CREATE INDEX IF NOT EXISTS idx_page_posted_video_guards_page ON page_posted_video_guards(bot_id, page_id)'
-    ).run()
-}
+let pagePostedVideoGuardsTableReady: Promise<void> | null = null
 
-async function ensurePagePostedVideoGuardsBackfilled(db: D1Database): Promise<void> {
-    await ensurePostHistoryTraceColumns(db)
-    await ensurePagePostedVideoGuardsTable(db)
-    await db.prepare(
-        `INSERT OR IGNORE INTO page_posted_video_guards (
-            guard_key,
-            bot_id,
-            page_id,
-            video_id,
-            source_fingerprint,
-            history_id,
-            created_at,
-            updated_at
-        )
-        SELECT
-            'video::' || ph.bot_id || '::' || ph.page_id || '::' || ph.video_id,
-            ph.bot_id,
-            ph.page_id,
-            ph.video_id,
-            COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), ''),
-            ph.id,
-            ph.posted_at,
-            ph.posted_at
-        FROM post_history ph
-        WHERE ph.status = 'success'
-          AND TRIM(COALESCE(ph.video_id, '')) <> ''`
-    ).run().catch(() => { })
-    await db.prepare(
-        `INSERT OR IGNORE INTO page_posted_video_guards (
-            guard_key,
-            bot_id,
-            page_id,
-            video_id,
-            source_fingerprint,
-            history_id,
-            created_at,
-            updated_at
-        )
-        SELECT
-            'fingerprint::' || ph.bot_id || '::' || ph.page_id || '::' || COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), TRIM(nvs.source_fingerprint)),
-            ph.bot_id,
-            ph.page_id,
-            ph.video_id,
-            COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), TRIM(nvs.source_fingerprint)),
-            ph.id,
-            ph.posted_at,
-            ph.posted_at
-        FROM post_history ph
-        LEFT JOIN namespace_video_state nvs
-          ON nvs.namespace_id = ph.bot_id
-         AND nvs.video_id = ph.video_id
-        WHERE ph.status = 'success'
-          AND TRIM(COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint, '')) <> ''`
-    ).run().catch(() => { })
+async function ensurePagePostedVideoGuardsTable(db: D1Database): Promise<void> {
+    if (!pagePostedVideoGuardsTableReady) {
+        pagePostedVideoGuardsTableReady = (async () => {
+            await db.prepare(
+                `CREATE TABLE IF NOT EXISTS page_posted_video_guards (
+                    guard_key TEXT PRIMARY KEY,
+                    bot_id TEXT NOT NULL,
+                    page_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL DEFAULT '',
+                    source_fingerprint TEXT NOT NULL DEFAULT '',
+                    history_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )`
+            ).run()
+            await db.prepare(
+                'CREATE INDEX IF NOT EXISTS idx_page_posted_video_guards_page ON page_posted_video_guards(bot_id, page_id)'
+            ).run()
+        })()
+    }
+    try {
+        await pagePostedVideoGuardsTableReady
+    } catch (error) {
+        pagePostedVideoGuardsTableReady = null
+        throw error
+    }
 }
 
 function buildPagePostedVideoGuardKeys(params: {
@@ -2269,7 +2225,10 @@ async function getExistingPagePostedVideoGuard(db: D1Database, params: {
 }): Promise<{ historyId: number | null; createdAt: string | null } | null> {
     const keys = buildPagePostedVideoGuardKeys(params)
     if (keys.length === 0) return null
-    await ensurePagePostedVideoGuardsBackfilled(db)
+    // Legacy successes are checked directly in post_history by
+    // ensurePageVideoNeverPosted. Keep this hot lookup bounded instead of
+    // globally backfilling all history rows for every candidate claim.
+    await ensurePagePostedVideoGuardsTable(db)
     const placeholders = keys.map(() => '?').join(', ')
     const row = await db.prepare(
         `SELECT p.history_id, p.created_at
@@ -2295,7 +2254,7 @@ async function recordPagePostedVideoGuard(db: D1Database, params: {
 }): Promise<void> {
     const keys = buildPagePostedVideoGuardKeys(params)
     if (keys.length === 0) return
-    await ensurePagePostedVideoGuardsBackfilled(db)
+    await ensurePagePostedVideoGuardsTable(db)
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
     const videoId = String(params.videoId || '').trim()
@@ -6275,7 +6234,7 @@ function mapDashboardGalleryRow(row: Record<string, unknown>, namespaceId: strin
 }
 
 type FastGalleryPostingClaimStats = {
-    source: 'gallery_ready_namespace_unposted' | 'gallery_index_namespace_unposted' | 'gallery_index_page_reuse_fallback'
+    source: 'gallery_index_namespace_unposted' | 'gallery_index_page_reuse_fallback'
     candidateTotal: number
     scanned: number
     pages: number
@@ -6311,31 +6270,14 @@ function buildFastGalleryPostingOrderBy(postingOrder: NamespacePostingOrder): st
     return `ORDER BY ${sortExpr} ASC, gi.video_id ASC`
 }
 
-function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder, availablePageCount?: number | null): number[] {
-    const boundedMaxPages = Math.max(0, maxPages)
-    if (postingOrder !== 'random') {
-        return Array.from({ length: boundedMaxPages }, (_, index) => index)
-    }
-    // Random mode must sample across the FULL page range of the loaded pool,
-    // not only 0..maxPages-1: on a large namespace (CHEARB 2026-07 incident,
-    // 8,786 fresh candidates) a fully-blocked head window otherwise starves
-    // every tick. Callers that cannot know the total page count without an
-    // expensive COUNT(*) omit availablePageCount and keep the legacy bounded
-    // window.
-    const knownPageCount = typeof availablePageCount === 'number' && Number.isFinite(availablePageCount)
-        ? Math.max(0, Math.floor(availablePageCount))
-        : null
-    // A known-empty pool still probes page 0 so the scan observes emptiness and
-    // can report the fresh pass as exhausted (the reuse-fallback gate).
-    const pageRange = knownPageCount === null ? boundedMaxPages : Math.max(1, knownPageCount)
-    const pages = Array.from({ length: pageRange }, (_, index) => index)
-    for (let index = pages.length - 1; index > 0; index -= 1) {
-        const swapIndex = Math.floor(Math.random() * (index + 1))
-        const current = pages[index]
-        pages[index] = pages[swapIndex]
-        pages[swapIndex] = current
-    }
-    return pages.slice(0, boundedMaxPages)
+function buildFastGalleryPostingRandomCursor(randomValue = Math.random()): string {
+    const normalized = Number.isFinite(randomValue)
+        ? Math.min(Math.max(randomValue, 0), 1 - Number.EPSILON)
+        : Math.random()
+    // Gallery video ids are generated as eight lowercase UUID hex characters.
+    // A fresh cursor therefore gives every row a chance across ticks while the
+    // (namespace_id, video_id) primary key keeps each query index-backed.
+    return Math.floor(normalized * 0x1_0000_0000).toString(16).padStart(8, '0')
 }
 
 async function hydrateFastPostingCandidateSourceFingerprint(params: {
@@ -6444,24 +6386,87 @@ async function listFastGalleryPostingCandidatePage(params: {
     mode: FastGalleryPostingCandidateMode
     limit: number
     offset: number
+    randomCursor?: string
+    randomWrap?: boolean
 }): Promise<Array<Record<string, unknown>>> {
     const namespacePostedClause = params.mode === 'namespace_unposted'
         ? `AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})`
         : `AND (${DASHBOARD_GALLERY_POSTED_SQL})`
+    const randomCursor = String(params.randomCursor || '').trim().toLowerCase()
+    const useRandomKeyset = /^[0-9a-f]{8}$/.test(randomCursor)
+    const randomCursorClause = useRandomKeyset
+        ? (params.randomWrap ? 'AND gi.video_id < ?' : 'AND gi.video_id >= ?')
+        : ''
+    const orderBy = useRandomKeyset
+        ? 'ORDER BY gi.video_id ASC'
+        : buildFastGalleryPostingOrderBy(params.postingOrder)
+    const pagination = useRandomKeyset ? 'LIMIT ?' : 'LIMIT ? OFFSET ?'
+    const binds: Array<string | number> = [params.namespaceId]
+    if (useRandomKeyset) binds.push(randomCursor)
+    binds.push(params.limit)
+    if (!useRandomKeyset) binds.push(params.offset)
+    const postingShopeeLinkSql = buildUsableShopeeSql(
+        "coalesce(nullif(trim(nvs.shopee_link), ''), nullif(trim(gi.shopee_link), ''), nullif(trim(nvs.shopee_original_link), ''), nullif(trim(gi.shopee_original_link), ''))"
+    )
+    const postingHasLazadaLinkSql = "trim(coalesce(nullif(trim(nvs.lazada_link), ''), nullif(trim(gi.lazada_link), ''), nullif(trim(nvs.lazada_original_link), ''), nullif(trim(gi.lazada_original_link), ''), '')) <> ''"
+
     const rows = await params.db.prepare(
         `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
          ${DASHBOARD_GALLERY_FROM_JOIN}
-         WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+         WHERE gi.namespace_id = ?
+           AND gi.has_public_video = 1
+           AND TRIM(COALESCE(gi.public_url, '')) <> ''
+           AND ${postingShopeeLinkSql}
+           AND ${postingHasLazadaLinkSql}
            ${namespacePostedClause}
-         ${buildFastGalleryPostingOrderBy(params.postingOrder)}
-         LIMIT ? OFFSET ?`
-    ).bind(params.namespaceId, params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
+           ${randomCursorClause}
+         ${orderBy}
+         ${pagination}`
+    ).bind(...binds).all() as { results?: Array<Record<string, unknown>> }
 
     return (rows.results || []).map((row) => ({
         ...mapDashboardGalleryRow(row, params.namespaceId),
         sourceNamespaceId: params.namespaceId,
         source_namespace_id: params.namespaceId,
     }))
+}
+
+async function listFastGalleryPostingRandomWindow(params: {
+    db: D1Database
+    namespaceId: string
+    mode: FastGalleryPostingCandidateMode
+    limit: number
+}): Promise<{ rows: Array<Record<string, unknown>>; exhausted: boolean }> {
+    const cursor = buildFastGalleryPostingRandomCursor()
+    const firstRange = await listFastGalleryPostingCandidatePage({
+        db: params.db,
+        namespaceId: params.namespaceId,
+        postingOrder: 'random',
+        mode: params.mode,
+        limit: params.limit,
+        offset: 0,
+        randomCursor: cursor,
+        randomWrap: false,
+    })
+    if (firstRange.length >= params.limit) {
+        return { rows: firstRange, exhausted: false }
+    }
+
+    const remaining = params.limit - firstRange.length
+    const wrappedRange = await listFastGalleryPostingCandidatePage({
+        db: params.db,
+        namespaceId: params.namespaceId,
+        postingOrder: 'random',
+        mode: params.mode,
+        limit: remaining,
+        offset: 0,
+        randomCursor: cursor,
+        randomWrap: true,
+    })
+    return {
+        rows: [...firstRange, ...wrappedRange],
+        exhausted: wrappedRange.length < remaining,
+    }
 }
 
 async function claimFastGalleryVideoForPosting(params: {
@@ -6526,27 +6531,9 @@ async function claimFastGalleryVideoForPosting(params: {
 
     const candidateBucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
 
-    const loadVisibleReadyPostingCandidates = async (): Promise<Array<Record<string, unknown>>> => {
-        const inventory = await getNamespaceGalleryInventory(params.env, namespaceId)
-        const readyVideos = (inventory.videos || [])
-            .filter((video) => isNamespaceGalleryVideoDisplayReady(video as Record<string, unknown>))
-            .filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
-            .map((video) => ({
-                ...(video as Record<string, unknown>),
-                sourceNamespaceId: String((video as Record<string, unknown>).sourceNamespaceId || (video as Record<string, unknown>).source_namespace_id || namespaceId).trim() || namespaceId,
-                source_namespace_id: String((video as Record<string, unknown>).sourceNamespaceId || (video as Record<string, unknown>).source_namespace_id || namespaceId).trim() || namespaceId,
-            }))
-        return orderGalleryVideosForPosting(readyVideos, params.postingOrder)
-    }
-
-    const visibleReadyPostingCandidates = await loadVisibleReadyPostingCandidates().catch((error) => {
-        console.log(`[GALLERY-READY] Failed to load visible ready inventory ns=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
-        return [] as Array<Record<string, unknown>>
-    })
-
     const scanCandidateMode = async (mode: FastGalleryPostingCandidateMode): Promise<FastGalleryPostingScanResult> => {
         stats.source = mode === 'namespace_unposted'
-            ? 'gallery_ready_namespace_unposted'
+            ? 'gallery_index_namespace_unposted'
             : 'gallery_index_page_reuse_fallback'
         // Do not run COUNT(*) here: production D1 can hit CPU limits on large
         // gallery namespaces before a post even starts. candidateTotal is the
@@ -6556,47 +6543,48 @@ async function claimFastGalleryVideoForPosting(params: {
         stats.pages = 0
 
         const seenVideoIds = new Set<string>()
-        // The in-memory fresh pool is fully loaded, so random selection may
-        // sample page indexes across all of it. The SQL fallback cannot know
-        // its total page count without COUNT(*) (production D1 CPU incident),
-        // so it keeps the legacy bounded window.
-        const availablePageCount = mode === 'namespace_unposted'
-            ? Math.ceil(visibleReadyPostingCandidates.length / pageSize)
-            : null
-        const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder, availablePageCount)
-        let exhaustedAfterPageIndex: number | null = null
-        let candidateRows = 0
-        const successfulSourceHistoryByFingerprint = new Map<string, SuccessfulNamespaceSourceHistoryRow | null>()
-
-        for (const pageIndex of pageIndexes) {
-            if (exhaustedAfterPageIndex !== null && pageIndex > exhaustedAfterPageIndex) continue
-            const offset = pageIndex * pageSize
-
-            const page = mode === 'namespace_unposted'
-                ? visibleReadyPostingCandidates.slice(offset, offset + pageSize)
-                : await listFastGalleryPostingCandidatePage({
+        const candidatePages: Array<Array<Record<string, unknown>>> = []
+        let exhausted = false
+        if (params.postingOrder === 'random') {
+            const randomWindowLimit = pageSize * maxPages
+            const randomWindow = await listFastGalleryPostingRandomWindow({
+                db: params.env.DB,
+                namespaceId,
+                mode,
+                limit: randomWindowLimit,
+            })
+            const shuffledWindow = orderGalleryVideosForPosting(randomWindow.rows, 'random')
+            for (let offset = 0; offset < shuffledWindow.length; offset += pageSize) {
+                candidatePages.push(shuffledWindow.slice(offset, offset + pageSize))
+            }
+            if (candidatePages.length === 0) candidatePages.push([])
+            exhausted = randomWindow.exhausted
+        } else {
+            for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+                const page = await listFastGalleryPostingCandidatePage({
                     db: params.env.DB,
                     namespaceId,
                     postingOrder: params.postingOrder,
                     mode,
                     limit: pageSize,
-                    offset,
+                    offset: pageIndex * pageSize,
                 })
+                candidatePages.push(page)
+                if (page.length < pageSize) {
+                    exhausted = true
+                    break
+                }
+            }
+        }
+
+        let candidateRows = 0
+        const successfulSourceHistoryByFingerprint = new Map<string, SuccessfulNamespaceSourceHistoryRow | null>()
+
+        for (const page of candidatePages) {
             stats.pages += 1
             stats.candidateTotal += page.length
             candidateRows += page.length
-            if (page.length === 0) {
-                exhaustedAfterPageIndex = exhaustedAfterPageIndex === null
-                    ? pageIndex
-                    : Math.min(exhaustedAfterPageIndex, pageIndex)
-                if (params.postingOrder !== 'random') break
-                continue
-            }
-            if (page.length < pageSize) {
-                exhaustedAfterPageIndex = exhaustedAfterPageIndex === null
-                    ? pageIndex
-                    : Math.min(exhaustedAfterPageIndex, pageIndex)
-            }
+            if (page.length === 0) continue
 
             const orderedPage = orderGalleryVideosForPosting(page, params.postingOrder)
             for (const candidate of orderedPage) {
@@ -6656,10 +6644,8 @@ async function claimFastGalleryVideoForPosting(params: {
                 })
                 if (picked) return { picked, exhausted: false, candidateRows }
             }
-
-            if (params.postingOrder !== 'random' && page.length < pageSize) break
         }
-        return { picked: null, exhausted: exhaustedAfterPageIndex !== null, candidateRows }
+        return { picked: null, exhausted, candidateRows }
     }
 
     const namespaceFreshScan = await scanCandidateMode('namespace_unposted')
@@ -39854,22 +39840,59 @@ function pickOneCardWebsiteUrl(params: {
     return shopeeLink || lazadaLink || ''
 }
 
+let pagesOneCardColumnsReady: Promise<void> | null = null
+
 async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
-    const alterStatements = [
-        `ALTER TABLE pages ADD COLUMN onecard_enabled INTEGER DEFAULT 0`,
-        `ALTER TABLE pages ADD COLUMN onecard_link_mode TEXT DEFAULT 'shopee'`,
-        `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'`,
-        `ALTER TABLE pages ADD COLUMN ads_publish_enabled INTEGER DEFAULT 0`,
-        `ALTER TABLE pages ADD COLUMN caption_link_enabled INTEGER DEFAULT 0`,
-        `ALTER TABLE pages ADD COLUMN posting_token_source TEXT DEFAULT 'stored_token'`,
-        // Per-page comment token source (NULL → runtime follows the posting source).
-        `ALTER TABLE pages ADD COLUMN comment_token_source TEXT`,
-        // Per-page Accounts Bridge posting account UID (e.g. 100077795357192). Public
-        // FB account uid only — never a token. '' → no per-page override (auto-discovery).
-        `ALTER TABLE pages ADD COLUMN posting_profile_uid TEXT DEFAULT ''`,
-    ]
-    for (const sql of alterStatements) {
-        await db.prepare(sql).run().catch(() => undefined)
+    if (!pagesOneCardColumnsReady) {
+        pagesOneCardColumnsReady = (async () => {
+            const schema = await db.prepare('PRAGMA table_info(pages)').all() as {
+                results?: Array<{ name?: string }>
+            }
+            const existingColumns = new Set(
+                (schema.results || []).map((row) => String(row.name || '').trim()).filter(Boolean)
+            )
+            const columns = [
+                { name: 'onecard_enabled', sql: `ALTER TABLE pages ADD COLUMN onecard_enabled INTEGER DEFAULT 0` },
+                { name: 'onecard_link_mode', sql: `ALTER TABLE pages ADD COLUMN onecard_link_mode TEXT DEFAULT 'shopee'` },
+                { name: 'onecard_cta', sql: `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'` },
+                { name: 'ads_publish_enabled', sql: `ALTER TABLE pages ADD COLUMN ads_publish_enabled INTEGER DEFAULT 0` },
+                { name: 'caption_link_enabled', sql: `ALTER TABLE pages ADD COLUMN caption_link_enabled INTEGER DEFAULT 0` },
+                { name: 'posting_token_source', sql: `ALTER TABLE pages ADD COLUMN posting_token_source TEXT DEFAULT 'stored_token'` },
+                // Per-page comment token source (NULL → runtime follows the posting source).
+                { name: 'comment_token_source', sql: `ALTER TABLE pages ADD COLUMN comment_token_source TEXT` },
+                // Per-page Accounts Bridge posting account UID (e.g. 100077795357192).
+                { name: 'posting_profile_uid', sql: `ALTER TABLE pages ADD COLUMN posting_profile_uid TEXT DEFAULT ''` },
+            ]
+            let alteredSchema = false
+            for (const column of columns) {
+                if (existingColumns.has(column.name)) continue
+                alteredSchema = true
+                // Another isolate may add the same column after our PRAGMA.
+                // Preserve idempotence, then verify the schema instead of
+                // treating every ALTER error as success.
+                await db.prepare(column.sql).run().catch(() => undefined)
+            }
+            if (alteredSchema) {
+                const refreshedSchema = await db.prepare('PRAGMA table_info(pages)').all() as {
+                    results?: Array<{ name?: string }>
+                }
+                const refreshedColumns = new Set(
+                    (refreshedSchema.results || []).map((row) => String(row.name || '').trim()).filter(Boolean)
+                )
+                const unresolvedColumns = columns
+                    .map((column) => column.name)
+                    .filter((name) => !refreshedColumns.has(name))
+                if (unresolvedColumns.length > 0) {
+                    throw new Error(`pages_column_maintenance_failed:${unresolvedColumns.join(',')}`)
+                }
+            }
+        })()
+    }
+    try {
+        await pagesOneCardColumnsReady
+    } catch (error) {
+        pagesOneCardColumnsReady = null
+        throw error
     }
 }
 
@@ -46382,6 +46405,9 @@ function runPendingCommentBacklogSoon(
     })
 }
 
+const CRON_PAGE_HEARTBEAT_INTERVAL_MS = 15_000
+const SCHEDULED_RUN_LOCK_KEY = 'page::__scheduled__::run'
+
 async function ensureCronRuntimeStateTable(db: D1Database): Promise<void> {
     await db.prepare(
         `CREATE TABLE IF NOT EXISTS cron_runtime_state (
@@ -46403,8 +46429,7 @@ async function ensureCronRuntimeStateTable(db: D1Database): Promise<void> {
     ).run()
 }
 
-async function updateCronRuntimeState(db: D1Database, patch: {
-    runId?: string | null
+type CronRuntimeStatePatch = {
     status?: string | null
     startedAt?: string | null
     finishedAt?: string | null
@@ -46417,9 +46442,33 @@ async function updateCronRuntimeState(db: D1Database, patch: {
     pagesPosted?: number | null
     pagesFailed?: number | null
     lastError?: string | null
-}): Promise<void> {
+}
+
+type CronRuntimeStateInitialization = {
+    status: string
+    startedAt: string
+    finishedAt: string | null
+    heartbeatAt: string
+    currentPageId: string | null
+    currentPageName: string | null
+    currentNamespaceId: string | null
+    pagesTotal: number
+    pagesVisited: number
+    pagesPosted: number
+    pagesFailed: number
+    lastError: string | null
+}
+
+async function initializeCronRuntimeState(
+    db: D1Database,
+    runId: string,
+    state: CronRuntimeStateInitialization,
+): Promise<boolean> {
+    const normalizedRunId = String(runId || '').trim()
+    if (!normalizedRunId) return false
+    await ensurePostingLocksTable(db)
     await ensureCronRuntimeStateTable(db)
-    await db.prepare(
+    const result = await db.prepare(
         `INSERT INTO cron_runtime_state (
             id,
             run_id,
@@ -46435,77 +46484,180 @@ async function updateCronRuntimeState(db: D1Database, patch: {
             pages_posted,
             pages_failed,
             last_error
-        ) VALUES ('scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        )
+        SELECT 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        FROM posting_locks
+        WHERE lock_key = ?
+          AND video_id = ?
         ON CONFLICT(id) DO UPDATE SET
-            run_id = COALESCE(excluded.run_id, cron_runtime_state.run_id),
-            status = COALESCE(excluded.status, cron_runtime_state.status),
-            started_at = COALESCE(excluded.started_at, cron_runtime_state.started_at),
+            run_id = excluded.run_id,
+            status = excluded.status,
+            started_at = excluded.started_at,
             finished_at = excluded.finished_at,
-            heartbeat_at = COALESCE(excluded.heartbeat_at, cron_runtime_state.heartbeat_at),
+            heartbeat_at = excluded.heartbeat_at,
             current_page_id = excluded.current_page_id,
             current_page_name = excluded.current_page_name,
             current_namespace_id = excluded.current_namespace_id,
-            pages_total = COALESCE(excluded.pages_total, cron_runtime_state.pages_total),
-            pages_visited = COALESCE(excluded.pages_visited, cron_runtime_state.pages_visited),
-            pages_posted = COALESCE(excluded.pages_posted, cron_runtime_state.pages_posted),
-            pages_failed = COALESCE(excluded.pages_failed, cron_runtime_state.pages_failed),
+            pages_total = excluded.pages_total,
+            pages_visited = excluded.pages_visited,
+            pages_posted = excluded.pages_posted,
+            pages_failed = excluded.pages_failed,
             last_error = excluded.last_error`
     ).bind(
-        patch.runId ?? null,
+        normalizedRunId,
+        state.status,
+        state.startedAt,
+        state.finishedAt,
+        state.heartbeatAt,
+        state.currentPageId,
+        state.currentPageName,
+        state.currentNamespaceId,
+        state.pagesTotal,
+        state.pagesVisited,
+        state.pagesPosted,
+        state.pagesFailed,
+        state.lastError,
+        SCHEDULED_RUN_LOCK_KEY,
+        normalizedRunId,
+    ).run()
+    return Number(result.meta?.changes || 0) > 0
+}
+
+async function updateCronRuntimeState(
+    db: D1Database,
+    runId: string,
+    patch: CronRuntimeStatePatch,
+): Promise<boolean> {
+    const normalizedRunId = String(runId || '').trim()
+    if (!normalizedRunId) return false
+    const hasPatchField = (field: string) => Object.prototype.hasOwnProperty.call(patch, field)
+    await ensureCronRuntimeStateTable(db)
+    const result = await db.prepare(
+        `UPDATE cron_runtime_state
+         SET status = COALESCE(?, status),
+             started_at = COALESCE(?, started_at),
+             finished_at = CASE WHEN ? = 1 THEN ? ELSE finished_at END,
+             heartbeat_at = COALESCE(?, heartbeat_at),
+             current_page_id = CASE WHEN ? = 1 THEN ? ELSE current_page_id END,
+             current_page_name = CASE WHEN ? = 1 THEN ? ELSE current_page_name END,
+             current_namespace_id = CASE WHEN ? = 1 THEN ? ELSE current_namespace_id END,
+             pages_total = COALESCE(?, pages_total),
+             pages_visited = COALESCE(?, pages_visited),
+             pages_posted = COALESCE(?, pages_posted),
+             pages_failed = COALESCE(?, pages_failed),
+             last_error = CASE WHEN ? = 1 THEN ? ELSE last_error END
+         WHERE id = 'scheduled'
+           AND run_id = ?
+           AND status IN ('starting', 'running')`
+    ).bind(
         patch.status ?? null,
         patch.startedAt ?? null,
+        hasPatchField('finishedAt') ? 1 : 0,
         patch.finishedAt ?? null,
         patch.heartbeatAt ?? null,
+        hasPatchField('currentPageId') ? 1 : 0,
         patch.currentPageId ?? null,
+        hasPatchField('currentPageName') ? 1 : 0,
         patch.currentPageName ?? null,
+        hasPatchField('currentNamespaceId') ? 1 : 0,
         patch.currentNamespaceId ?? null,
         typeof patch.pagesTotal === 'number' ? patch.pagesTotal : null,
         typeof patch.pagesVisited === 'number' ? patch.pagesVisited : null,
         typeof patch.pagesPosted === 'number' ? patch.pagesPosted : null,
         typeof patch.pagesFailed === 'number' ? patch.pagesFailed : null,
+        hasPatchField('lastError') ? 1 : 0,
         patch.lastError ?? null,
+        normalizedRunId,
     ).run()
+    return Number(result.meta?.changes || 0) > 0
+}
+
+async function releaseScheduledRunLock(
+    db: D1Database,
+    lockKey: string | null | undefined,
+    runId: string,
+): Promise<boolean> {
+    const normalizedLockKey = String(lockKey || '').trim()
+    const normalizedRunId = String(runId || '').trim()
+    if (!normalizedLockKey || !normalizedRunId) return false
+    const result = await db.prepare(
+        `DELETE FROM posting_locks
+         WHERE lock_key = ?
+           AND video_id = ?`
+    ).bind(normalizedLockKey, normalizedRunId).run()
+    return Number(result.meta?.changes || 0) > 0
 }
 
 async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Promise<boolean> {
+    await ensurePostingLocksTable(db)
+    await ensureCronRuntimeStateTable(db)
     const runtime = await db.prepare(
-        `SELECT run_id, status, started_at, heartbeat_at, pages_visited
-         FROM cron_runtime_state
-         WHERE id = 'scheduled'
+        `SELECT runtime.run_id,
+                runtime.status,
+                runtime.started_at,
+                runtime.heartbeat_at,
+                runtime.pages_visited,
+                owned_lock.video_id AS lock_owner_run_id,
+                owned_lock.created_at AS lock_created_at
+         FROM cron_runtime_state AS runtime
+         LEFT JOIN posting_locks AS owned_lock
+           ON owned_lock.lock_key = ?
+         WHERE runtime.id = 'scheduled'
          LIMIT 1`
-    ).first() as {
+    ).bind(SCHEDULED_RUN_LOCK_KEY).first() as {
         run_id?: string | null
         status?: string | null
         started_at?: string | null
         heartbeat_at?: string | null
         pages_visited?: number | null
+        lock_owner_run_id?: string | null
+        lock_created_at?: string | null
     } | null
 
-    const status = String(runtime?.status || '').trim().toLowerCase()
+    const runId = String(runtime?.run_id || '').trim()
+    const observedStatus = String(runtime?.status || '').trim()
+    const status = observedStatus.toLowerCase()
     const heartbeatAt = String(runtime?.heartbeat_at || '').trim()
     const heartbeatMs = Date.parse(heartbeatAt)
-    const startedAtMs = Date.parse(String(runtime?.started_at || '').trim())
-    const pagesVisited = Number(runtime?.pages_visited || 0)
-    if (status !== 'running' || !Number.isFinite(heartbeatMs)) return false
+    if (!runId || (status !== 'starting' && status !== 'running') || !Number.isFinite(heartbeatMs)) return false
     const ageMs = Date.now() - heartbeatMs
-    const startupAgeMs = Number.isFinite(startedAtMs) ? (Date.now() - startedAtMs) : ageMs
-    const startupHung = pagesVisited <= 0 && startupAgeMs > 20_000
-    if (!startupHung && ageMs <= Math.max(30_000, maxStaleMs)) return false
+    if (ageMs <= Math.max(30_000, maxStaleMs)) return false
 
-    const staleError = `stale_scheduled_run_recovered:${String(runtime?.run_id || '').trim() || 'unknown'}`
-    await db.prepare(
-        `DELETE FROM posting_locks
-         WHERE lock_key = 'page::__scheduled__::run'`
-    ).run().catch(() => { })
-    await updateCronRuntimeState(db, {
-        status: 'failed',
-        finishedAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
-        currentPageId: null,
-        currentPageName: null,
-        currentNamespaceId: null,
-        lastError: staleError,
-    }).catch(() => { })
+    const staleError = `stale_scheduled_run_recovered:${runId}`
+    const recoveredAt = new Date().toISOString()
+    const recovered = await db.prepare(
+        `UPDATE cron_runtime_state
+         SET status = 'failed',
+             finished_at = ?,
+             heartbeat_at = ?,
+             current_page_id = NULL,
+             current_page_name = NULL,
+             current_namespace_id = NULL,
+             last_error = ?
+         WHERE id = 'scheduled'
+           AND run_id = ?
+           AND status = ?
+           AND heartbeat_at = ?`
+    ).bind(
+        recoveredAt,
+        recoveredAt,
+        staleError,
+        runId,
+        observedStatus,
+        heartbeatAt,
+    ).run()
+    if (Number(recovered.meta?.changes || 0) !== 1) return false
+
+    const lockOwnerRunId = String(runtime?.lock_owner_run_id || '')
+    const lockCreatedAt = String(runtime?.lock_created_at || '').trim()
+    if (lockCreatedAt && (!lockOwnerRunId || lockOwnerRunId === runId)) {
+        await db.prepare(
+            `DELETE FROM posting_locks
+             WHERE lock_key = ?
+               AND video_id = ?
+               AND created_at = ?`
+        ).bind(SCHEDULED_RUN_LOCK_KEY, lockOwnerRunId, lockCreatedAt).run()
+    }
     console.warn(`[CRON] Recovered stale scheduled run: ${staleError}`)
     return true
 }
@@ -46516,27 +46668,26 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const dedupCommentTargets = new Set<string>()
     await env.DB.prepare(
         `DELETE FROM posting_locks
-         WHERE lock_key = 'page::__scheduled__::run'
-           AND NOT EXISTS (
+         WHERE lock_key = ?
+           AND TRIM(video_id) != ''
+           AND EXISTS (
                SELECT 1
                FROM cron_runtime_state
                WHERE id = 'scheduled'
-                 AND status = 'running'
+                 AND run_id = posting_locks.video_id
+                 AND status NOT IN ('starting', 'running')
            )`
-    ).run().catch(() => { })
-    await env.DB.prepare(
-        `DELETE FROM posting_locks
-         WHERE lock_key = 'page::__scheduled__::run'
-           AND datetime(created_at) < datetime('now', '-2 minutes')`
-    ).run().catch(() => { })
+    ).bind(SCHEDULED_RUN_LOCK_KEY).run().catch(() => { })
     await recoverStaleScheduledRun(env.DB).catch(() => { })
     // Keep the posting cron isolated. Background import/warm-up/comment/ad jobs
     // can consume subrequest slots and starve the auto-post loop before it gets
     // to pages_visited; run them from their dedicated/manual paths instead.
+    const runId = crypto.randomUUID()
     let scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
         scope: 'page',
         namespaceId: '__scheduled__',
         pageId: 'run',
+        videoId: runId,
         ttlMinutes: 10,
     })
     if (!scheduledRunLockKey) {
@@ -46546,22 +46697,40 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 scope: 'page',
                 namespaceId: '__scheduled__',
                 pageId: 'run',
+                videoId: runId,
                 ttlMinutes: 10,
             })
         }
     }
     if (!scheduledRunLockKey) {
         console.log('[CRON] Skip run (scheduled global lock busy)')
-        await updateCronRuntimeState(env.DB, {
-            status: 'busy',
-            heartbeatAt: new Date().toISOString(),
+        return
+    }
+
+    const cronStats = {
+        pagesVisited: 0,
+        pagesPosted: 0,
+        pagesFailed: 0,
+    }
+    let fatalError: Error | null = null
+    const startedAt = new Date().toISOString()
+
+    try {
+        const initialized = await initializeCronRuntimeState(env.DB, runId, {
+            status: 'starting',
+            startedAt,
+            finishedAt: null,
+            heartbeatAt: startedAt,
             currentPageId: null,
             currentPageName: null,
             currentNamespaceId: null,
-            lastError: 'scheduled_run_busy',
-        }).catch(() => { })
-        return
-    }
+            pagesTotal: 0,
+            pagesVisited: 0,
+            pagesPosted: 0,
+            pagesFailed: 0,
+            lastError: null,
+        })
+        if (!initialized) throw new Error('scheduled_run_lock_ownership_lost_before_initialization')
 
     // Get current time in Thailand timezone (UTC+7) using proper Intl
     const now = new Date()
@@ -46642,12 +46811,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
 
     console.log(`[CRON] Found ${pages.length} active pages, Thai time: ${thaiHour}:${thaiMinute.toString().padStart(2, '0')} (${nowMinutes}m), date: ${todayStr}`)
 
-    const runId = crypto.randomUUID()
-    const cronStats = {
-        pagesVisited: 0,
-        pagesPosted: 0,
-        pagesFailed: 0,
-    }
     const geminiApiKeysByNamespace = new Map<string, string[]>()
     const shortlinkEnabledByNamespace = new Map<string, boolean>()
     const galleryVideosByNamespace = new Map<string, Array<Record<string, unknown>>>()
@@ -46656,13 +46819,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     // optional env allowlist ONCE for the whole cron run; decide per page below.
     const cronAdminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
     const cronPostLogTagAllowlist = readPostLogTagNamespaceAllowlist(env)
-    let fatalError: Error | null = null
-    await updateCronRuntimeState(env.DB, {
-        runId,
+    await updateCronRuntimeState(env.DB, runId, {
         status: 'running',
-        startedAt: nowISO,
+        startedAt,
         finishedAt: null,
-        heartbeatAt: nowISO,
+        heartbeatAt: new Date().toISOString(),
         currentPageId: null,
         currentPageName: null,
         currentNamespaceId: null,
@@ -46671,14 +46832,17 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         pagesPosted: 0,
         pagesFailed: 0,
         lastError: null,
-    }).catch(() => { })
+    })
 
-    try {
-        for (const page of pages) {
-            const botId = page.bot_id || 'default'
-            cronStats.pagesVisited += 1
-            updateCronRuntimeState(env.DB, {
-                runId,
+    for (const page of pages) {
+        const botId = page.bot_id || 'default'
+        cronStats.pagesVisited += 1
+        let pageHeartbeatTimer: ReturnType<typeof setInterval> | null = null
+        let pageHeartbeatWrites: Promise<void> = Promise.resolve()
+        let pageHeartbeatErrorLogged = false
+
+        try {
+            await updateCronRuntimeState(env.DB, runId, {
                 heartbeatAt: new Date().toISOString(),
                 currentPageId: String(page.id || ''),
                 currentPageName: String(page.name || ''),
@@ -46686,9 +46850,28 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 pagesVisited: cronStats.pagesVisited,
                 pagesPosted: cronStats.pagesPosted,
                 pagesFailed: cronStats.pagesFailed,
-            }).catch(() => { })
+            })
+            pageHeartbeatTimer = setInterval(() => {
+                pageHeartbeatWrites = pageHeartbeatWrites
+                    .then(async () => {
+                        await updateCronRuntimeState(env.DB, runId, {
+                            heartbeatAt: new Date().toISOString(),
+                            currentPageId: String(page.id || ''),
+                            currentPageName: String(page.name || ''),
+                            currentNamespaceId: botId,
+                            pagesVisited: cronStats.pagesVisited,
+                            pagesPosted: cronStats.pagesPosted,
+                            pagesFailed: cronStats.pagesFailed,
+                        })
+                    })
+                    .catch((error) => {
+                        if (!pageHeartbeatErrorLogged) {
+                            pageHeartbeatErrorLogged = true
+                            console.warn(`[CRON-RUNTIME] Page heartbeat failed page=${String(page.id || '')}: ${error instanceof Error ? error.message : String(error)}`)
+                        }
+                    })
+            }, CRON_PAGE_HEARTBEAT_INTERVAL_MS)
 
-            try {
                 // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
                 if (!reconciledNamespaces.has(botId)) {
                     // Reconcile/recover maintenance is intentionally not launched
@@ -46953,7 +47136,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             isNamespaceAffiliateShortlinkRequired(env.DB, botId).catch(() => false),
         ])
         const isAdminNamespace = isAdminManaged && shortlinkRequired
-        const rawShopeeLink = normalizeMetaShopeeLink(meta) || ''
+        const rawShopeeLink = normalizeMetaShopeeLink(meta)
+            || normalizeMetaShopeeLink(pickedVideo)
+            || getVideoSourceShopeeLink(meta)
+            || getVideoSourceShopeeLink(pickedVideo)
+            || ''
         const shopeeShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         let normalizedShopeeLink = rawShopeeLink
         if (isAdminNamespace && rawShopeeLink) {
@@ -47246,6 +47433,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             await updatePostHistoryAffiliateVerificationById(env.DB, cronHistoryId, affiliateVerification)
         }
         if (!affiliateVerification.ok) {
+            cronStats.pagesFailed++
             if (cronHistoryId) {
                 await env.DB.prepare(
                     "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
@@ -47373,8 +47561,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     if (pf.ok) cronStats.pagesPosted++; else cronStats.pagesFailed++
                     console.log(`[CRON] Page ${page.name}: POST-FIRST ADS ${pf.ok ? 'OK' : 'PARTIAL'} — story=${pf.storyId} ad_id=${pf.adId} comment=${pf.commentStatus} promoted_ad_cta_final=${pf.promotedAdCtaFinal} visible_cta_update=${pf.visibleCtaUpdateStatus} visible_page_cta_final=${pf.visiblePageCtaFinal}`)
                     await clearVideoShopeeLink(botBucket, unpostedId)
-                    await updateCronRuntimeState(env.DB, {
-                        runId, heartbeatAt: new Date().toISOString(),
+                    await updateCronRuntimeState(env.DB, runId, {
+                        heartbeatAt: new Date().toISOString(),
                         pagesVisited: cronStats.pagesVisited, pagesPosted: cronStats.pagesPosted, pagesFailed: cronStats.pagesFailed,
                     }).catch(() => { })
                     continue
@@ -47505,8 +47693,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 cronStats.pagesPosted++
                 console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${cronAdsCommentStatus} remint=${cronAdsCommentRemint?.reminted ? `sub2=${cronAdsCommentRemint.sub2} sub3=${cronAdsCommentRemint.sub3}` : (cronAdsCommentRemint?.error || 'n/a')}`)
                 await clearVideoShopeeLink(botBucket, unpostedId)
-                await updateCronRuntimeState(env.DB, {
-                    runId,
+                await updateCronRuntimeState(env.DB, runId, {
                     heartbeatAt: new Date().toISOString(),
                     pagesVisited: cronStats.pagesVisited,
                     pagesPosted: cronStats.pagesPosted,
@@ -47675,8 +47862,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 cronStats.pagesPosted++
                 console.log(`[CRON] Page ${page.name}: CLOAK-BRIDGE POST OK — post=${confirmedPostId} comment=${cloakCommentStatus}`)
                 await clearVideoShopeeLink(botBucket, unpostedId)
-                await updateCronRuntimeState(env.DB, {
-                    runId,
+                await updateCronRuntimeState(env.DB, runId, {
                     heartbeatAt: new Date().toISOString(),
                     pagesVisited: cronStats.pagesVisited,
                     pagesPosted: cronStats.pagesPosted,
@@ -47932,8 +48118,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 postedAt: nowISO,
             }).catch(() => { })
             cronStats.pagesPosted += 1
-            await updateCronRuntimeState(env.DB, {
-                runId,
+            await updateCronRuntimeState(env.DB, runId, {
                 heartbeatAt: new Date().toISOString(),
                 pagesVisited: cronStats.pagesVisited,
                 pagesPosted: cronStats.pagesPosted,
@@ -48097,8 +48282,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             postedAt: nowISO,
                         }).catch(() => { })
                         cronStats.pagesPosted += 1
-                        updateCronRuntimeState(env.DB, {
-                            runId,
+                        await updateCronRuntimeState(env.DB, runId, {
                             heartbeatAt: new Date().toISOString(),
                             pagesVisited: cronStats.pagesVisited,
                             pagesPosted: cronStats.pagesPosted,
@@ -48136,8 +48320,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 cronStats.pagesFailed += 1
                 const message = pageError instanceof Error ? pageError.message : String(pageError)
                 console.error(`[CRON] Page ${page.name}: unexpected fatal page error - ${message}`)
-                await updateCronRuntimeState(env.DB, {
-                    runId,
+                await updateCronRuntimeState(env.DB, runId, {
                     heartbeatAt: new Date().toISOString(),
                     pagesVisited: cronStats.pagesVisited,
                     pagesPosted: cronStats.pagesPosted,
@@ -48146,8 +48329,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 }).catch(() => { })
                 continue
             } finally {
-                await updateCronRuntimeState(env.DB, {
-                    runId,
+                if (pageHeartbeatTimer !== null) clearInterval(pageHeartbeatTimer)
+                await pageHeartbeatWrites
+                await updateCronRuntimeState(env.DB, runId, {
                     heartbeatAt: new Date().toISOString(),
                     currentPageId: null,
                     currentPageName: null,
@@ -48162,13 +48346,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         fatalError = error instanceof Error ? error : new Error(String(error))
         throw fatalError
     } finally {
-        await env.DB.prepare(
-            `DELETE FROM posting_locks
-             WHERE lock_key = 'page::__scheduled__::run'`
-        ).run().catch(() => { })
-        await updateCronRuntimeState(env.DB, {
-            runId,
-            status: fatalError ? 'failed' : 'idle',
+        await updateCronRuntimeState(env.DB, runId, {
+            status: fatalError ? 'failed' : 'completed',
             finishedAt: new Date().toISOString(),
             heartbeatAt: new Date().toISOString(),
             currentPageId: null,
@@ -48182,7 +48361,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         // Backstop: finalize any post-log rows whose linked post_history reached a terminal
         // state this run (story/status/error/snapshot). Best-effort, bounded, never throws.
         await reconcilePostLogTagsFromHistory(env.DB, { limit: 300 }).catch(() => 0)
-        await releasePostingLock(env.DB, scheduledRunLockKey)
+        await releaseScheduledRunLock(env.DB, scheduledRunLockKey, runId).catch(() => { })
     }
 
     console.log('[CRON] Auto-post check complete')

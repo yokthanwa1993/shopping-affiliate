@@ -14,10 +14,10 @@ import test from 'node:test'
 // These are source-level assertions (the worker's D1 helpers are not exported
 // and there is no D1 mock in this suite), matching the established pattern in
 // stale-posting-recovery.test.ts / recover-failed-history.test.ts. The one
-// exception is buildFastGalleryPostingPageIndexes: it is a pure function, so
-// its sliced source is additionally rewritten to plain JS and EXECUTED under a
-// stubbed Math.random to prove the random page window covers the full
-// candidate range (CHEARB 2026-07 starvation regression).
+// exception is buildFastGalleryPostingRandomCursor: it is a pure function, so
+// its sliced source is additionally rewritten to plain JS and EXECUTED to prove
+// random ticks can start at any point in the indexed 8-hex video-id keyspace
+// without hydrating the full namespace inventory.
 
 function getSource(): string {
     return readFileSync('src/index.ts', 'utf8')
@@ -67,12 +67,12 @@ function getListCandidatesSource(): string {
     )
 }
 
-function getPageIndexesSource(): string {
+function getRandomCursorSource(): string {
     return sliceBetween(
         getSource(),
-        'function buildFastGalleryPostingPageIndexes',
+        'function buildFastGalleryPostingRandomCursor',
         '\nasync function hydrateFastPostingCandidateSourceFingerprint',
-        'buildFastGalleryPostingPageIndexes'
+        'buildFastGalleryPostingRandomCursor'
     )
 }
 
@@ -103,50 +103,28 @@ function getClaimFastSource(): string {
     )
 }
 
-// --- Executable harness for the pure page-index builder -----------------------
+// --- Executable harness for the pure random-cursor builder --------------------
 //
 // The builder's body is deliberately plain JS; only the single-line signature
 // carries TypeScript annotations. Rewriting that one known line lets the tests
-// run the real production sampling logic instead of only asserting on source
-// text. If the signature changes, the assert below fails loudly so the
-// replacement is updated alongside it.
+// run the real production cursor logic instead of only asserting on source text.
 
-type FastGalleryPageIndexBuilder = (
-    maxPages: number,
-    postingOrder: string,
-    availablePageCount?: number | null,
-) => number[]
+type FastGalleryRandomCursorBuilder = (randomValue?: number) => string
 
-const PAGE_INDEX_BUILDER_TS_SIGNATURE =
-    'function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder, availablePageCount?: number | null): number[] {'
-const PAGE_INDEX_BUILDER_JS_SIGNATURE =
-    'function buildFastGalleryPostingPageIndexes(maxPages, postingOrder, availablePageCount) {'
+const RANDOM_CURSOR_BUILDER_TS_SIGNATURE =
+    'function buildFastGalleryPostingRandomCursor(randomValue = Math.random()): string {'
+const RANDOM_CURSOR_BUILDER_JS_SIGNATURE =
+    'function buildFastGalleryPostingRandomCursor(randomValue = Math.random()) {'
 
-function compilePageIndexBuilder(): FastGalleryPageIndexBuilder {
-    const tsSource = getPageIndexesSource()
+function compileRandomCursorBuilder(): FastGalleryRandomCursorBuilder {
+    const tsSource = getRandomCursorSource()
     assert.ok(
-        tsSource.includes(PAGE_INDEX_BUILDER_TS_SIGNATURE),
-        'page index builder must keep the single-line typed signature the executable harness rewrites'
+        tsSource.includes(RANDOM_CURSOR_BUILDER_TS_SIGNATURE),
+        'random cursor builder must keep the single-line typed signature the executable harness rewrites'
     )
-    const jsSource = tsSource.replace(PAGE_INDEX_BUILDER_TS_SIGNATURE, PAGE_INDEX_BUILDER_JS_SIGNATURE)
-    const factory = new Function(`${jsSource}\nreturn buildFastGalleryPostingPageIndexes`)
-    return factory() as FastGalleryPageIndexBuilder
-}
-
-function withStubbedRandom<T>(seed: number, run: () => T): T {
-    const originalRandom = Math.random
-    let state = seed >>> 0
-    // Deterministic LCG (Numerical Recipes constants) so every run of the
-    // suite samples identical "random" page windows.
-    Math.random = () => {
-        state = (Math.imul(state, 1664525) + 1013904223) >>> 0
-        return state / 4294967296
-    }
-    try {
-        return run()
-    } finally {
-        Math.random = originalRandom
-    }
+    const jsSource = tsSource.replace(RANDOM_CURSOR_BUILDER_TS_SIGNATURE, RANDOM_CURSOR_BUILDER_JS_SIGNATURE)
+    const factory = new Function(`${jsSource}\nreturn buildFastGalleryPostingRandomCursor`)
+    return factory() as FastGalleryRandomCursorBuilder
 }
 
 test('claim path no longer blocks siblings via namespace-wide post_history dedup', () => {
@@ -282,11 +260,8 @@ test('posting selector avoids page-aware SQL subqueries in the hot path', () => 
     assert.ok(!source.includes('PAGE_SCOPED_ALREADY_POSTED_SQL'), 'runtime selector must not use expensive page-aware subquery predicate')
     assert.ok(!source.includes('pageScopedAlreadyPostedBinds'), 'runtime selector must not bind page-aware subqueries')
     assert.match(listBody, /mode: FastGalleryPostingCandidateMode/, 'list params must include selection mode')
-    assert.match(
-        listBody,
-        /\.bind\(params\.namespaceId,\s*params\.limit,\s*params\.offset\)/,
-        'list query bind order must only be namespaceId, limit, offset'
-    )
+    assert.match(listBody, /const binds: Array<string \| number>/, 'candidate query binds must be assembled explicitly')
+    assert.match(listBody, /\.bind\(\.\.\.binds\)/, 'candidate query must bind only its bounded keyset/page parameters')
 })
 
 test('claimFastGalleryVideoForPosting keeps strict same-page guard outside the selector', () => {
@@ -324,33 +299,30 @@ test('claimFastGalleryVideoForPosting scans namespace-fresh before reuse fallbac
     assert.match(body, /gallery_index_page_reuse_fallback/, 'stats/log source must expose fallback reuse mode')
 })
 
-test('claimFastGalleryVideoForPosting uses visible ready inventory for the primary pass', () => {
+test('claimFastGalleryVideoForPosting never hydrates the full namespace inventory', () => {
     const body = getClaimFastSource()
-    const loadIdx = body.indexOf('const loadVisibleReadyPostingCandidates')
-    const inventoryIdx = body.indexOf('getNamespaceGalleryInventory(params.env, namespaceId)', loadIdx)
-    const readyFilterIdx = body.indexOf('isNamespaceGalleryVideoDisplayReady', inventoryIdx)
-    const unpostedFilterIdx = body.indexOf('!isNamespaceGalleryVideoPosted', readyFilterIdx)
-    const orderIdx = body.indexOf('orderGalleryVideosForPosting(readyVideos, params.postingOrder)', unpostedFilterIdx)
-    const scanIdx = body.indexOf("scanCandidateMode('namespace_unposted')")
-
-    assert.notEqual(loadIdx, -1, 'claimFast must define the visible-ready inventory loader')
-    assert.ok(inventoryIdx > loadIdx, 'primary pool must load the same namespace inventory as Gallery')
-    assert.ok(readyFilterIdx > inventoryIdx, 'primary pool must use Gallery display-ready semantics')
-    assert.ok(unpostedFilterIdx > readyFilterIdx, 'primary pool must exclude Gallery posted items')
-    assert.ok(orderIdx > unpostedFilterIdx, 'primary pool must apply the configured posting order to visible-ready items')
-    assert.ok(scanIdx > orderIdx, 'visible-ready candidates must be prepared before the primary scan')
-    assert.match(body, /gallery_ready_namespace_unposted/, 'stats/log source must distinguish visible-ready primary mode')
+    assert.doesNotMatch(
+        body,
+        /getNamespaceGalleryInventory\(/,
+        'the posting hot path must not materialize the full namespace inventory'
+    )
+    assert.doesNotMatch(
+        body,
+        /visibleReadyPostingCandidates|loadVisibleReadyPostingCandidates/,
+        'the posting hot path must not retain a full ready pool in Worker memory'
+    )
+    assert.match(body, /gallery_index_namespace_unposted/, 'stats/log source must identify the indexed primary mode')
 })
 
-test('namespace-unposted scan slices visible ready candidates instead of raw gallery_index SQL', () => {
-    const body = getClaimFastSource()
-    const primarySliceIdx = body.indexOf("mode === 'namespace_unposted'\n                ? visibleReadyPostingCandidates.slice(offset, offset + pageSize)")
-    const rawSqlIdx = body.indexOf('await listFastGalleryPostingCandidatePage({', primarySliceIdx)
-    const fallbackIdx = body.indexOf("scanCandidateMode('page_reuse_fallback')")
-
-    assert.notEqual(primarySliceIdx, -1, 'namespace_unposted scan must page through visibleReadyPostingCandidates')
-    assert.ok(rawSqlIdx > primarySliceIdx, 'raw SQL candidate lister must be only the fallback branch')
-    assert.ok(fallbackIdx > primarySliceIdx, 'reuse fallback must remain after visible-ready primary scan')
+test('candidate lister keeps Gallery readiness semantics in bounded SQL', () => {
+    const body = getListCandidatesSource()
+    assert.match(body, /gi\.namespace_id = \?/, 'candidate query must stay namespace-scoped')
+    assert.match(body, /gi\.has_public_video = 1/, 'candidate query must require a public video')
+    assert.match(body, /buildUsableShopeeSql/, 'candidate query must require a usable Shopee source')
+    assert.match(body, /nvs\.shopee_original_link/, 'candidate readiness must preserve state-level original Shopee sources')
+    assert.match(body, /nvs\.lazada_original_link/, 'candidate readiness must preserve state-level original Lazada sources')
+    assert.match(body, /postingHasLazadaLinkSql/, 'candidate query must require a Lazada source')
+    assert.match(body, /LIMIT \?/, 'candidate query must always be bounded')
 })
 
 test('claimFastGalleryVideoForPosting treats seen fresh rows as no-fallback even when none claim', () => {
@@ -368,7 +340,7 @@ test('claimFastGalleryVideoForPosting treats seen fresh rows as no-fallback even
     assert.match(body, /candidateRows \+= page\.length/, 'scan pass must count fetched fresh rows')
     assert.match(
         body,
-        /return \{ picked: null, exhausted: exhaustedAfterPageIndex !== null, candidateRows \}/,
+        /return \{ picked: null, exhausted, candidateRows \}/,
         'scan pass must report exhaustion separately from whether rows existed'
     )
     assert.ok(guardIdx !== -1 && guardIdx < fallbackIdx, 'fresh-row no-fallback guard must run before fallback scan')
@@ -449,16 +421,32 @@ test('source-fingerprint duplicate guard stays bounded and avoids page-aware hot
     assert.doesNotMatch(historyBody, /page_id\s*=\s*\?/, 'source guard must not add a page-aware subquery')
 })
 
-test('random posting order uses bounded random page windows without COUNT', () => {
-    const pageIndexBody = getPageIndexesSource()
+test('random posting order uses a bounded keyset ring without COUNT or OFFSET', () => {
+    const cursorBody = getRandomCursorSource()
+    const listBody = getListCandidatesSource()
     const claimBody = getClaimFastSource()
-    assert.match(pageIndexBody, /postingOrder !== 'random'/, 'non-random order must keep sequential pages')
-    assert.match(pageIndexBody, /Math\.random\(\)/, 'random order must shuffle bounded page windows')
+    assert.match(cursorBody, /Math\.random\(\)/, 'random mode must choose a fresh indexed cursor each tick')
+    assert.match(listBody, /gi\.video_id >= \?/, 'first keyset range must start at the random cursor')
+    assert.match(listBody, /gi\.video_id < \?/, 'wrapped keyset range must cover keys before the cursor')
+    assert.match(listBody, /ORDER BY gi\.video_id ASC/, 'random ranges must use the namespace/video primary-key order')
     assert.match(
         claimBody,
-        /const pageIndexes = buildFastGalleryPostingPageIndexes\(maxPages, params\.postingOrder, availablePageCount\)/,
-        'claimFast must use bounded page indexes instead of COUNT-derived random offsets'
+        /const randomWindowLimit = pageSize \* maxPages/,
+        'random mode must cap the total rows loaded into Worker memory'
     )
+    assert.match(
+        claimBody,
+        /listFastGalleryPostingRandomWindow\(/,
+        'claimFast must use the bounded indexed random window'
+    )
+    const randomBranch = sliceBetween(
+        claimBody,
+        "if (params.postingOrder === 'random') {",
+        '\n        } else {',
+        'random scan branch'
+    )
+    assert.doesNotMatch(randomBranch, /\bOFFSET\s+\?/i, 'random scan must not use SQL OFFSET')
+    assert.doesNotMatch(randomBranch, /COUNT\s*\(/i, 'random scan must not count the full pool')
     assert.match(
         claimBody,
         /if \(!namespaceFreshScan\.exhausted \|\| namespaceFreshScan\.candidateRows > 0\) return finish\(null\)/,
@@ -466,88 +454,30 @@ test('random posting order uses bounded random page windows without COUNT', () =
     )
 })
 
-// --- Full-range random page window (CHEARB 2026-07 starvation regression) -----
+// --- Full-range random keyset ring (CHEARB 2026-07 starvation regression) -----
 //
-// With 8,786 fresh candidates (pageSize 24 → 367 pages) the legacy builder only
-// ever emitted indexes 0..14, so the tick considered offsets 0..359 forever and
-// starved once that fixed head window was fully blocked by duplicate guards.
-// Random mode must now sample bounded distinct indexes across the WHOLE known
-// page range, while the SQL fallback (unknown total, COUNT(*) forbidden) keeps
-// the legacy window.
+// With ~13,851 ready rows, loading/sorting the pool per due page exceeded Worker
+// limits. A random 8-hex pivot plus an indexed wrap-around range gives every
+// generated video id a chance across ticks while loading at most 360 rows.
 
-test('in-memory fresh pass feeds the full available page count into random sampling', () => {
+test('random cursor spans the complete generated video-id keyspace', () => {
+    const buildCursor = compileRandomCursorBuilder()
+    assert.equal(buildCursor(0), '00000000')
+    assert.equal(buildCursor(0.5), '80000000')
+    assert.equal(buildCursor(0.999999999999), 'ffffffff')
+    assert.match(buildCursor(Number.NaN), /^[0-9a-f]{8}$/)
+})
+
+test('bounded random window wraps around the keyspace and never materializes the full pool', () => {
+    const source = getSource()
     const claimBody = getClaimFastSource()
     assert.match(
-        claimBody,
-        /const availablePageCount = mode === 'namespace_unposted'\s*\?\s*Math\.ceil\(visibleReadyPostingCandidates\.length \/ pageSize\)\s*:\s*null/,
-        'namespace_unposted must derive availablePageCount from the loaded in-memory pool; the SQL fallback must pass null'
+        source,
+        /async function listFastGalleryPostingRandomWindow[\s\S]*randomWrap: false[\s\S]*randomWrap: true/,
+        'random window must query from the cursor and wrap once to the beginning'
     )
-    assert.doesNotMatch(
-        getListCandidatesSource(),
-        /COUNT\s*\(/i,
-        'deriving the page range must not reintroduce COUNT into the candidate lister'
-    )
-})
-
-test('random page window samples the full in-memory range (8786 candidates, pageSize 24, maxPages 15)', () => {
-    const buildPageIndexes = compilePageIndexBuilder()
-    const availablePageCount = Math.ceil(8786 / 24) // 367 pages, matching the live CHEARB pool
-    let sawBeyondLegacyWindow = false
-    for (let seed = 1; seed <= 25; seed += 1) {
-        const pages = withStubbedRandom(seed * 2654435761, () => buildPageIndexes(15, 'random', availablePageCount))
-        assert.equal(pages.length, 15, 'random mode must return exactly maxPages indexes')
-        assert.equal(new Set(pages).size, pages.length, 'random page indexes must be unique')
-        for (const pageIndex of pages) {
-            assert.ok(Number.isInteger(pageIndex), 'page indexes must be integers')
-            assert.ok(
-                pageIndex >= 0 && pageIndex < availablePageCount,
-                `page index ${pageIndex} must stay inside 0..${availablePageCount - 1}`
-            )
-        }
-        if (pages.some((pageIndex) => pageIndex > 14)) sawBeyondLegacyWindow = true
-    }
-    assert.ok(sawBeyondLegacyWindow, 'full-range sampling must reach page indexes beyond the legacy 0..14 window')
-})
-
-test('random page window caps at maxPages and covers every page of a small pool', () => {
-    const buildPageIndexes = compilePageIndexBuilder()
-    const smallPool = withStubbedRandom(1337, () => buildPageIndexes(15, 'random', 3))
-    assert.deepEqual(
-        [...smallPool].sort((a, b) => a - b),
-        [0, 1, 2],
-        'a 3-page pool must shuffle exactly pages 0..2 without inventing indexes'
-    )
-    assert.deepEqual(
-        withStubbedRandom(7, () => buildPageIndexes(15, 'random', 0)),
-        [0],
-        'a known-empty pool must still probe page 0 so the scan can observe exhaustion for the reuse fallback'
-    )
-})
-
-test('random page window without a known pool size keeps the legacy shuffled 0..14 window', () => {
-    const buildPageIndexes = compilePageIndexBuilder()
-    const legacyWindow = withStubbedRandom(42, () => buildPageIndexes(15, 'random'))
-    assert.deepEqual(
-        [...legacyWindow].sort((a, b) => a - b),
-        Array.from({ length: 15 }, (_, index) => index),
-        'unknown pool size (SQL fallback) must keep exactly the pages 0..14'
-    )
-    assert.ok(
-        legacyWindow.some((pageIndex, position) => pageIndex !== position),
-        'legacy window must still be shuffled, not sequential'
-    )
-})
-
-test('sequential posting orders ignore availablePageCount and stay 0..maxPages-1', () => {
-    const buildPageIndexes = compilePageIndexBuilder()
-    for (const order of ['oldest_first', 'newest_first']) {
-        const pages = withStubbedRandom(99, () => buildPageIndexes(15, order, 367))
-        assert.deepEqual(
-            pages,
-            Array.from({ length: 15 }, (_, index) => index),
-            `${order} must keep sequential page indexes 0..14 even when the pool is larger`
-        )
-    }
+    assert.match(claimBody, /randomWindowLimit = pageSize \* maxPages/, 'random window must be bounded by the existing scan budget')
+    assert.doesNotMatch(claimBody, /getNamespaceGalleryInventory\(/, 'claim must never reload all 13k+ namespace rows')
 })
 
 test('reuse fallback requires a real namespace success history row', () => {
@@ -573,4 +503,51 @@ test('claimFastGalleryVideoForPosting reports candidateTotal as fetched bounded-
     assert.match(body, /stats\.candidateTotal \+= page\.length/, 'candidateTotal must count fetched bounded-window rows')
     assert.match(body, /stats\.scanned = 0/, 'each pass must reset scanned count')
     assert.match(body, /stats\.pages = 0/, 'each pass must reset page count')
+})
+
+test('failed cron candidates are excluded before claim so one invalid affiliate clip cannot monopolize a page', () => {
+    const body = getClaimFastSource()
+    const failedQueryIdx = body.indexOf('SELECT DISTINCT video_id')
+    const skipCheckIdx = body.indexOf('skipFailedTodayVideoIds.has(videoId)')
+    const claimIdx = body.indexOf('const picked = await claimGalleryVideoForPosting({')
+
+    assert.notEqual(failedQueryIdx, -1, 'claim must load today’s failed cron candidates for this page')
+    assert.match(
+        body.slice(failedQueryIdx, skipCheckIdx),
+        /bot_id = \?[\s\S]*page_id = \?[\s\S]*status = 'failed'[\s\S]*trigger_source = 'cron'/,
+        'failed-candidate exclusion must be namespace-, page-, status-, and cron-scoped'
+    )
+    assert.ok(skipCheckIdx > failedQueryIdx, 'failed-today exclusion must use the durable history rows')
+    assert.ok(claimIdx > skipCheckIdx, 'failed-today candidates must be skipped before acquiring their video claim')
+})
+
+test('scheduled posting passes today into failed-candidate exclusion and preserves original-link fallback', () => {
+    const source = getSource()
+    const cronStart = source.indexOf('async function handleScheduled')
+    const cronEnd = source.indexOf('\n// Container class', cronStart)
+    assert.notEqual(cronStart, -1)
+    assert.notEqual(cronEnd, -1)
+    const cronBody = source.slice(cronStart, cronEnd)
+
+    assert.match(
+        cronBody,
+        /claimFastGalleryVideoForPosting\(\{[\s\S]*skipFailedTodayThaiDate: todayStr/,
+        'cron must exclude candidates that already failed on the current Thai-local date'
+    )
+    assert.match(
+        cronBody,
+        /const rawShopeeLink = normalizeMetaShopeeLink\(meta\)\s*\|\|\s*normalizeMetaShopeeLink\(pickedVideo\)\s*\|\|\s*getVideoSourceShopeeLink\(meta\)\s*\|\|\s*getVideoSourceShopeeLink\(pickedVideo\)\s*\|\|\s*''/,
+        'cron must recover the selected row’s original Shopee source when a newer R2 meta object has a blank current link'
+    )
+    const verificationFailure = sliceBetween(
+        cronBody,
+        'if (!affiliateVerification.ok) {',
+        '\n        // The stored/manual comment-token preflight',
+        'cron affiliate verification failure'
+    )
+    assert.match(
+        verificationFailure,
+        /cronStats\.pagesFailed\+\+/,
+        'fail-closed affiliate rejection must be reflected in runtime failure counters'
+    )
 })
