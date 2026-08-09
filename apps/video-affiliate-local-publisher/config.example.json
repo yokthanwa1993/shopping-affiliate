@@ -1,0 +1,37 @@
+{
+  "studio_db": "~/Library/Application Support/AffiliateAdmin/content.db",
+  "ledger_db": "~/Library/Application Support/VideoAffiliatePublisher/publisher.db",
+  "spool_root": "~/Library/Application Support/VideoAffiliatePublisher/spool",
+  "log_root": "~/Library/Logs/VideoAffiliatePublisher",
+  "editor_channel_id": "1518808518176800769",
+  "discord_env_file": "~/Developer/shopping-affiliate/apps/admin-media-drive/.env",
+  "idbridge_auth_file": "~/Library/Application Support/IDBridge/service-auth",
+  "idbridge_url": "http://127.0.0.1:8798",
+  "merge_url": "http://127.0.0.1:18080",
+  "host": "127.0.0.1",
+  "port": 3110,
+  "writes_enabled": false,
+  "scheduler_enabled": false,
+  "manual_api_enabled": false,
+  "pages": [
+    {
+      "page_id": "1008898512617594",
+      "name": "เฉียบ",
+      "enabled": false,
+      "interval_minutes": 20,
+      "timezone": "Asia/Bangkok",
+      "campaign_sub1": "",
+      "shopee_account": "15130770000",
+      "affiliate_id": "15130770000",
+      "facebook_account": "",
+      "power_editor_account": "",
+      "avatar_path": "~/Library/Application Support/VideoAffiliatePublisher/assets/pages/100000000000000/avatar.mp4",
+      "avatar_url": "https://api.oomnn.com/api/pages/100000000000000/avatar-video/public?namespace_id=YOUR_NAMESPACE_ID",
+      "avatar_version": "v1",
+      "caption_template": "{caption}",
+      "comment_template": "{shortlink}\n📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้\n🟠 สั่งผ่านลิงก์เพจเป็นพาร์ทเนอร์กับ Shopee ปลอดภัย 💯",
+      "chromakey_similarity": 0.14,
+      "chromakey_blend": 0.02
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.coverage
+.env
+runtime/
+*.log
+src/
+config/*.json
