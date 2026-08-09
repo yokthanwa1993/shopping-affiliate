@@ -202,6 +202,12 @@ class PublisherHelpersTests(unittest.TestCase):
             engine.ledger = ledger
             engine._idbridge = cast(Any, bridge)
             engine.spool = cast(Any, SimpleNamespace(cleanup=lambda attempt_id: None))
+            self.assertTrue(ledger.acquire_lease("page:100", "active-publisher", 900))
+            busy = engine.reconcile_attempt(attempt)
+            self.assertEqual(busy["state"], "skipped")
+            self.assertEqual(busy["reason"], "page_lease_busy")
+            self.assertEqual(bridge.comment_posts, 0)
+            ledger.release_lease("page:100", "active-publisher")
             result = engine.reconcile_attempt(attempt)
             self.assertEqual(result["state"], "success")
             self.assertEqual(bridge.comment_posts, 0)

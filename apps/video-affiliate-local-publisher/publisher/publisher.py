@@ -231,6 +231,15 @@ class PublisherEngine:
             )
         except Exception as exc:
             row = self.ledger.attempt(attempt_id)
+            if str(row["state"]) == "success":
+                return {
+                    "ok": True, "mode": "write", "attempt_id": attempt_id,
+                    "page_id": page.page_id, "studio_content_id": item.content_id,
+                    "state": "success", "fb_story_id": story_id,
+                    "fb_video_id": str(row["fb_video_id"] or posted["video_id"]),
+                    "comment_id": str(row["comment_id"] or ""),
+                    "permalink": str(row["permalink"] or posted.get("post_url", "")),
+                }
             if row["state"] != "post_success_comment_failed":
                 self.ledger.transition(attempt_id, "post_success_comment_failed", {
                     "error_code": _error_code(exc),
@@ -239,10 +248,30 @@ class PublisherEngine:
             self._notify_failure(page.page_id, attempt_id, "post_success_comment_failed", exc)
             raise
 
+        current = self.ledger.attempt(attempt_id)
+        if str(current["state"]) == "success":
+            return {
+                "ok": True, "mode": "write", "attempt_id": attempt_id,
+                "page_id": page.page_id, "studio_content_id": item.content_id,
+                "state": "success", "fb_story_id": story_id,
+                "fb_video_id": str(current["fb_video_id"] or posted["video_id"]),
+                "comment_id": str(current["comment_id"] or comment_id),
+                "permalink": str(current["permalink"] or posted.get("post_url", "")),
+            }
         self.ledger.transition(attempt_id, "verifying", {"comment_id": comment_id})
         try:
             readback = self._verify_live_readback(page, story_id, comment_id, comment)
         except Exception as exc:
+            current = self.ledger.attempt(attempt_id)
+            if str(current["state"]) == "success":
+                return {
+                    "ok": True, "mode": "write", "attempt_id": attempt_id,
+                    "page_id": page.page_id, "studio_content_id": item.content_id,
+                    "state": "success", "fb_story_id": story_id,
+                    "fb_video_id": str(current["fb_video_id"] or posted["video_id"]),
+                    "comment_id": str(current["comment_id"] or comment_id),
+                    "permalink": str(current["permalink"] or posted.get("post_url", "")),
+                }
             self.ledger.transition(attempt_id, "post_success_verification_failed", {
                 "error_code": _error_code(exc),
                 "error_detail_redacted": redact_error(exc),
@@ -402,6 +431,21 @@ class PublisherEngine:
     def reconcile_attempt(self, attempt_id: str) -> Dict[str, Any]:
         if not self.config.writes_enabled:
             raise PublisherError("external_writes_disabled")
+        initial = self.ledger.attempt(attempt_id)
+        page_id = str(initial["page_id"])
+        owner = "reconcile-" + uuid.uuid4().hex
+        page_key = "page:" + page_id
+        if not self.ledger.acquire_lease(page_key, owner, 900):
+            return {
+                "ok": False, "state": "skipped", "reason": "page_lease_busy",
+                "attempt_id": attempt_id, "page_id": page_id,
+            }
+        try:
+            return self._reconcile_attempt_locked(attempt_id)
+        finally:
+            self.ledger.release_lease(page_key, owner)
+
+    def _reconcile_attempt_locked(self, attempt_id: str) -> Dict[str, Any]:
         row = self.ledger.attempt(attempt_id)
         state = str(row["state"])
         recoverable = {
