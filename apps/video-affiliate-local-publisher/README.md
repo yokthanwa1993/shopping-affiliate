@@ -20,7 +20,7 @@ Mac mini publisher สำหรับ organic Facebook Reel ของเพจ�
 1. อ่าน Studio SQLite ด้วย URI `mode=ro`
 2. เลือก `content_items.status='ready'` ที่มี Editor Message ID, video attachment, Shopee URL และ caption ครบ
 3. resolve Discord `#editor` message สดและตรวจ attachment/buttons ตรง Studio DB
-4. sync Avatar จาก Cloudflare public route: HEAD ตรวจ `X-Avatar-Version`/ETag และดาวน์โหลดใหม่เฉพาะ version เปลี่ยน; local asset เป็น verified cache 0600
+4. ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare
 5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe และ SHA-256
 6. compose Avatar ผ่าน local merge-rust `127.0.0.1:18080`
 7. preflight Facebook Lite + Power Editor + Shopee CHEARB
@@ -37,7 +37,7 @@ SQLite เก็บ leases, state transitions, source/media hash, post/comment I
 ```bash
 python3 main.py --config config.example.json migrate
 python3 main.py --config config.example.json status
-python3 main.py --config config.example.json shadow --page-id 100000000000000 --count 3
+python3 main.py --config config.example.json run-once --page-id 100000000000000
 python3 -m unittest discover -s test -v
 python3 install_launchagent.py
 ```

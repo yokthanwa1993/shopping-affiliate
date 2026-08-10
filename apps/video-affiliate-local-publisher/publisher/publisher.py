@@ -8,7 +8,6 @@ from typing import Any, Dict, Optional
 
 from .asset_server import AssetServer
 from .avatar_client import AvatarClient
-from .avatar_source import sync_cloudflare_avatar
 from .config import AppConfig, PageConfig
 from .discord_source import DiscordSource
 from .idbridge_client import IDBridgeClient, IDBridgeError
@@ -62,6 +61,14 @@ class PublisherEngine:
             if page.page_id == str(page_id):
                 return page
         raise PublisherError("page_not_configured")
+
+    @staticmethod
+    def resolve_avatar_asset(page: PageConfig, spool: Spool) -> str:
+        """Use the durable Mac mini avatar only; publishing has no Cloudflare runtime dependency."""
+        if not page.avatar_path.is_file():
+            raise PublisherError("avatar_asset_missing")
+        spool.inspect(page.avatar_path)
+        return page.avatar_version
 
     @staticmethod
     def caption(page: PageConfig, item: StudioItem) -> str:
@@ -363,16 +370,7 @@ class PublisherEngine:
                 self.ledger.upsert_source(item, resolved.attachment_id, source.sha256)
                 self.ledger.transition(attempt_id, "source_resolved")
                 self.ledger.transition(attempt_id, "downloaded", {"source_sha256": source.sha256})
-                avatar_version = page.avatar_version
-                if page.avatar_url:
-                    cloudflare_avatar = sync_cloudflare_avatar(
-                        page.avatar_url, page.avatar_path, self.spool,
-                    )
-                    avatar_version = cloudflare_avatar.version
-                elif not page.avatar_path.is_file():
-                    raise PublisherError("avatar_asset_missing")
-                else:
-                    self.spool.inspect(page.avatar_path)
+                avatar_version = self.resolve_avatar_asset(page, self.spool)
                 self.ledger.transition(attempt_id, "avatar_composing")
                 output_path = attempt_dir / "avatar-composed.mp4"
                 with AssetServer() as server:

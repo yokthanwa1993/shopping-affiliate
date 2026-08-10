@@ -26,13 +26,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self.make({"host": "0.0.0.0", "pages": []})
 
-    def test_avatar_cloudflare_url_requires_https(self):
-        with self.assertRaisesRegex(ConfigError, "avatar_url_must_be_https"):
-            self.make({
-                "pages": [{
-                    "page_id": "100", "avatar_url": "http://example.test/avatar.mp4",
-                }],
-            })
 
     def test_write_config_requires_all_identity_fields(self):
         with patch.dict("os.environ", {"PUBLISHER_ALLOW_WRITES": "I_UNDERSTAND_EXTERNAL_SIDE_EFFECTS"}):

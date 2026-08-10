@@ -29,6 +29,34 @@ class PublisherHelpersTests(unittest.TestCase):
         self.assertEqual(story, "100_200")
         self.assertEqual(tail, "200")
 
+    def test_avatar_uses_local_asset(self):
+        class InspectingSpool:
+            inspected = None
+
+            def inspect(self, path):
+                self.inspected = path
+
+        with tempfile.TemporaryDirectory() as root:
+            avatar = Path(root) / "avatar.mp4"
+            avatar.write_bytes(b"local-avatar")
+            page = cast(Any, SimpleNamespace(
+                avatar_path=avatar,
+                avatar_version="local-v1",
+            ))
+            spool = InspectingSpool()
+            version = PublisherEngine.resolve_avatar_asset(page, cast(Any, spool))
+            self.assertEqual(version, "local-v1")
+            self.assertEqual(spool.inspected, avatar)
+
+    def test_avatar_fails_closed_when_local_asset_is_missing(self):
+        with tempfile.TemporaryDirectory() as root:
+            page = cast(Any, SimpleNamespace(
+                avatar_path=Path(root) / "missing.mp4",
+                avatar_version="local-v1",
+            ))
+            with self.assertRaisesRegex(PublisherError, "avatar_asset_missing"):
+                PublisherEngine.resolve_avatar_asset(page, cast(Any, SimpleNamespace()))
+
     def test_redaction(self):
         text = redact_error(RuntimeError("Authorization: Bearer secret-token Cookie: session=abc X-Bridge-Token: bridge-secret"))
         self.assertNotIn("secret-token", text)

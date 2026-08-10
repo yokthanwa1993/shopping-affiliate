@@ -26,7 +26,6 @@
       "facebook_account": "",
       "power_editor_account": "",
       "avatar_path": "~/Library/Application Support/VideoAffiliatePublisher/assets/pages/100000000000000/avatar.mp4",
-      "avatar_url": "https://api.oomnn.com/api/pages/100000000000000/avatar-video/public?namespace_id=YOUR_NAMESPACE_ID",
       "avatar_version": "v1",
       "caption_template": "{caption}",
       "comment_template": "{shortlink}\n📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้\n🟠 สั่งผ่านลิงก์เพจเป็นพาร์ทเนอร์กับ Shopee ปลอดภัย 💯",

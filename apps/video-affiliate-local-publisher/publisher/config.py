@@ -35,7 +35,6 @@ class PageConfig:
     facebook_account: str
     power_editor_account: str
     avatar_path: Path
-    avatar_url: str
     avatar_version: str
     caption_template: str
     comment_template: str
@@ -91,9 +90,6 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
     if interval < 1 or interval > 1440:
         raise ConfigError("interval_minutes_invalid")
     avatar_path = _path(raw.get("avatar_path"), APP_SUPPORT / f"assets/pages/{page_id}/avatar.mp4")
-    avatar_url = _text(raw.get("avatar_url"))
-    if avatar_url and not avatar_url.startswith("https://"):
-        raise ConfigError("avatar_url_must_be_https")
     similarity = float(raw.get("chromakey_similarity", 0.30))
     blend = float(raw.get("chromakey_blend", 0.10))
     if not 0 <= similarity <= 1 or not 0 <= blend <= 1:
@@ -110,7 +106,6 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
         facebook_account=_text(raw.get("facebook_account")),
         power_editor_account=_text(raw.get("power_editor_account")),
         avatar_path=avatar_path,
-        avatar_url=avatar_url,
         avatar_version=_text(raw.get("avatar_version")) or "unversioned",
         caption_template=_text(raw.get("caption_template")) or "{caption}",
         comment_template=_text(raw.get("comment_template")) or "{shortlink}",
@@ -201,7 +196,6 @@ def safe_config_summary(config: AppConfig) -> Dict[str, Any]:
                 "enabled": page.enabled,
                 "interval_minutes": page.interval_minutes,
                 "avatar_present": page.avatar_path.is_file(),
-                "avatar_cloudflare_source": bool(page.avatar_url),
                 "campaign_present": bool(page.campaign_sub1),
                 "facebook_account_present": bool(page.facebook_account),
                 "power_editor_account_present": bool(page.power_editor_account),
