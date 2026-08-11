@@ -38,9 +38,12 @@ SQLite เก็บ leases, state transitions, source/media hash, post/comment I
 python3 main.py --config config.example.json migrate
 python3 main.py --config config.example.json status
 python3 main.py --config config.example.json run-once --page-id 100000000000000
+python3 scripts/lookup_facebook_source.py --config config.example.json '<Facebook share/reel URL>'
 python3 -m unittest discover -s test -v
 python3 install_launchagent.py
 ```
+
+`lookup_facebook_source.py` เป็น read-only: resolve Facebook share/reel URL ผ่าน HTTP ตรง แล้วไล่ `post_attempts → source_items → Studio content_items` เพื่อคืน Content ID และ Discord Editor jumper ของวิดีโอที่ใช้โพสต์จริง โดยไม่อ่านหรือแสดง token/cookie.
 
 การ activate production ต้องทำหลัง explicit approval และ cutover owner เดิมแล้ว:
 
