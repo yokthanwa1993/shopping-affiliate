@@ -40,6 +40,7 @@ class PublisherHelpersTests(unittest.TestCase):
             avatar = Path(root) / "avatar.mp4"
             avatar.write_bytes(b"local-avatar")
             page = cast(Any, SimpleNamespace(
+                avatar_enabled=True,
                 avatar_path=avatar,
                 avatar_version="local-v1",
             ))
@@ -51,11 +52,23 @@ class PublisherHelpersTests(unittest.TestCase):
     def test_avatar_fails_closed_when_local_asset_is_missing(self):
         with tempfile.TemporaryDirectory() as root:
             page = cast(Any, SimpleNamespace(
+                avatar_enabled=True,
                 avatar_path=Path(root) / "missing.mp4",
                 avatar_version="local-v1",
             ))
             with self.assertRaisesRegex(PublisherError, "avatar_asset_missing"):
                 PublisherEngine.resolve_avatar_asset(page, cast(Any, SimpleNamespace()))
+
+    def test_avatar_can_be_disabled_per_page_without_an_asset(self):
+        page = cast(Any, SimpleNamespace(
+            avatar_enabled=False,
+            avatar_path=Path("/missing/avatar.mp4"),
+            avatar_version="unused",
+        ))
+        self.assertEqual(
+            PublisherEngine.resolve_avatar_asset(page, cast(Any, SimpleNamespace())),
+            "none",
+        )
 
     def test_redaction(self):
         text = redact_error(RuntimeError("Authorization: Bearer secret-token Cookie: session=abc X-Bridge-Token: bridge-secret"))
@@ -65,7 +78,7 @@ class PublisherHelpersTests(unittest.TestCase):
 
     def test_post_error_after_invocation_is_outcome_unknown(self):
         class FailingBridge:
-            def ensure_page(self, account, page_id):
+            def ensure_page(self, *args):
                 return None
 
             def graph_get(self, account, path, params):
@@ -94,6 +107,7 @@ class PublisherHelpersTests(unittest.TestCase):
             engine._idbridge = cast(Any, FailingBridge())
             page = cast(Any, SimpleNamespace(
                 page_id="100", facebook_account="uid", power_editor_account="peuid",
+                posting_source="facebook_lite_eaad6",
                 shopee_account="15130770000",
                 affiliate_id="15130770000", campaign_sub1="campaign",
                 caption_template="{caption}", comment_template="{shortlink}",
@@ -109,7 +123,7 @@ class PublisherHelpersTests(unittest.TestCase):
                 self.comment_message = ""
                 self.shorten_calls = []
 
-            def ensure_page(self, account, page_id):
+            def ensure_page(self, *args):
                 return None
 
             def shopee_accounts(self):
@@ -151,6 +165,7 @@ class PublisherHelpersTests(unittest.TestCase):
             page = cast(Any, SimpleNamespace(
                 page_id="100", name="page", enabled=True, interval_minutes=20,
                 facebook_account="uid", power_editor_account="peuid",
+                posting_source="facebook_lite_eaad6",
                 shopee_account="15130770000", affiliate_id="15130770000",
                 campaign_sub1="campaign", caption_template="{caption}",
                 comment_template="{shortlink}\ncomment",
@@ -178,7 +193,7 @@ class PublisherHelpersTests(unittest.TestCase):
                 self.message = message
                 self.comment_posts = 0
 
-            def ensure_page(self, account, page_id):
+            def ensure_page(self, *args):
                 return None
 
             def shopee_accounts(self):
@@ -219,6 +234,7 @@ class PublisherHelpersTests(unittest.TestCase):
             page = cast(Any, SimpleNamespace(
                 page_id="100", name="page", enabled=True, interval_minutes=20,
                 facebook_account="uid", power_editor_account="peuid",
+                posting_source="facebook_lite_eaad6",
                 shopee_account="15130770000", affiliate_id="15130770000",
                 campaign_sub1="campaign", caption_template="{caption}",
                 comment_template="{shortlink}\ncomment",

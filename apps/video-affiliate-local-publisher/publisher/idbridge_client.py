@@ -52,9 +52,15 @@ class IDBridgeClient:
             raise IDBridgeError(f"idbridge_http_{status}:{redact_error(code or 'failed')}")
         return payload
 
-    def token_ready(self, account: str) -> bool:
+    def token_info(self, account: str) -> Dict[str, Any]:
         data = self._request("/token", query={"account": account}, timeout=30)
-        return isinstance(data, dict) and data.get("ok") is True and data.get("accessToken") is True
+        if not isinstance(data, dict):
+            raise IDBridgeError("facebook_token_status_invalid")
+        return data
+
+    def token_ready(self, account: str) -> bool:
+        data = self.token_info(account)
+        return data.get("ok") is True and data.get("accessToken") is True
 
     def pages(self, account: str) -> List[Dict[str, Any]]:
         data = self._request("/pages", query={"account": account}, timeout=30)
@@ -63,12 +69,28 @@ class IDBridgeClient:
             raise IDBridgeError("idbridge_pages_invalid")
         return [row for row in rows if isinstance(row, dict)]
 
-    def ensure_page(self, account: str, page_id: str) -> None:
+    def ensure_page(self, account: str, page_id: str,
+                    expected_source: str = "facebook_lite_eaad6") -> None:
         if not account:
             raise IDBridgeError("facebook_account_missing")
-        if not self.token_ready(account):
-            raise IDBridgeError("facebook_lite_token_unavailable")
-        if not any(str(row.get("id") or "") == str(page_id) for row in self.pages(account)):
+        info = self.token_info(account)
+        if info.get("ok") is not True or info.get("accessToken") is not True:
+            raise IDBridgeError("facebook_token_unavailable")
+        if str(info.get("source") or "") != expected_source:
+            raise IDBridgeError("facebook_token_source_mismatch")
+        if expected_source == "facebook_lite_eaad6":
+            rows = self.pages(account)
+        elif expected_source == "idbridge_power_editor":
+            payload = self.graph_get(account, "me/accounts", {
+                "fields": "id,name", "limit": "100",
+            })
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise IDBridgeError("facebook_pages_invalid")
+            rows = [row for row in data if isinstance(row, dict)]
+        else:
+            raise IDBridgeError("facebook_post_source_unsupported")
+        if not any(str(row.get("id") or "") == str(page_id) for row in rows):
             raise IDBridgeError("facebook_page_not_authorized")
 
     def graph_get(self, account: str, path: str,
@@ -101,7 +123,8 @@ class IDBridgeClient:
             raise IDBridgeError("shorten_result_invalid")
         return link
 
-    def post(self, page_id: str, video_url: str, message: str, account: str) -> Dict[str, str]:
+    def post(self, page_id: str, video_url: str, message: str, account: str,
+             expected_source: str = "facebook_lite_eaad6") -> Dict[str, str]:
         payload = self._request("/post", method="POST", timeout=210, body={
             "page_id": page_id, "video_url": video_url, "message": message, "account": account,
         })
@@ -111,8 +134,8 @@ class IDBridgeClient:
         source = str(payload.get("source") or "").strip()
         story_id = str(payload.get("story_id") or "").strip()
         video_id = str(payload.get("video_id") or "").strip()
-        if source != "facebook_lite_eaad6":
-            raise IDBridgeError("facebook_post_source_not_lite")
+        if source != expected_source:
+            raise IDBridgeError("facebook_post_source_mismatch")
         if not story_id or not video_id:
             raise IDBridgeError("facebook_post_identity_missing")
         return {

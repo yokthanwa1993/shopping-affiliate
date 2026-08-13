@@ -25,6 +25,9 @@ def parser() -> argparse.ArgumentParser:
     retry.add_argument("--attempt-id", required=True)
     reconcile = commands.add_parser("reconcile-attempt")
     reconcile.add_argument("--attempt-id", required=True)
+    resolve = commands.add_parser("resolve-no-post")
+    resolve.add_argument("--attempt-id", required=True)
+    resolve.add_argument("--evidence-code", required=True)
     commands.add_parser("serve")
     return result
 
@@ -38,6 +41,18 @@ def main(argv=None) -> int:
             for page in config.pages:
                 ledger.sync_page(page)
             print(json.dumps({"ok": True, "config": safe_config_summary(config)}, ensure_ascii=False))
+            return 0
+        if args.command == "resolve-no-post":
+            if not config.writes_enabled:
+                raise RuntimeError("external_writes_disabled")
+            ledger = Ledger(config.ledger_db)
+            ledger.resolve_unknown_no_post(args.attempt_id, args.evidence_code)
+            print(json.dumps({
+                "ok": True,
+                "attempt_id": args.attempt_id,
+                "state": "failed_pre_post",
+                "evidence_code": args.evidence_code,
+            }, ensure_ascii=False))
             return 0
         engine = PublisherEngine(config)
         if args.command == "status":

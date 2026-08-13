@@ -16,7 +16,7 @@ class IDBridgeClientTests(unittest.TestCase):
                 self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
             def do_GET(self):
                 if self.headers.get("X-Bridge-Token") != "secret": return self.reply({"error":"unauthorized"},401)
-                if self.path.startswith("/token"): return self.reply({"ok":True,"accessToken":True})
+                if self.path.startswith("/token"): return self.reply({"ok":True,"accessToken":True,"source":"facebook_lite_eaad6"})
                 if self.path.startswith("/pages"): return self.reply({"data":[{"id":"p1"}]})
                 if self.path.startswith("/accounts"): return self.reply([{"account":"15130770000"}])
                 return self.reply({"error":"not_found"},404)

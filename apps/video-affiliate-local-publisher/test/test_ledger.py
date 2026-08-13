@@ -59,3 +59,38 @@ class LedgerTests(unittest.TestCase):
         row = self.ledger.attempt(attempt)
         self.assertEqual(row["error_code"], "")
         self.assertEqual(row["error_detail_redacted"], "")
+
+    def test_operator_can_close_unknown_only_with_allowlisted_no_post_evidence(self):
+        attempt = self.ledger.claim_attempt("p1", 10, "slot-unknown", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_outcome_unknown",
+        ]:
+            self.ledger.transition(attempt, state)
+        with self.assertRaises(LedgerError):
+            self.ledger.resolve_unknown_no_post(attempt, "operator_says_ok")
+        self.ledger.resolve_unknown_no_post(
+            attempt, "idbridge_rejected_before_upload_and_graph_no_post",
+        )
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "failed_pre_post")
+        self.assertEqual(row["error_code"], "operator_confirmed_no_post")
+        event = self.ledger.connect().execute(
+            "SELECT old_state,new_state,detail_json FROM events WHERE attempt_id=? ORDER BY id DESC LIMIT 1",
+            (attempt,),
+        ).fetchone()
+        self.assertEqual(event["old_state"], "post_outcome_unknown")
+        self.assertEqual(event["new_state"], "failed_pre_post")
+        self.assertIn("idbridge_rejected_before_upload_and_graph_no_post", event["detail_json"])
+
+    def test_operator_can_close_rejected_upload_after_graph_confirms_no_post(self):
+        attempt = self.ledger.claim_attempt("p1", 11, "slot-upload-rejected", "manual")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_outcome_unknown",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.resolve_unknown_no_post(
+            attempt, "facebook_upload_rejected_and_graph_no_post",
+        )
+        self.assertEqual(self.ledger.attempt(attempt)["state"], "failed_pre_post")

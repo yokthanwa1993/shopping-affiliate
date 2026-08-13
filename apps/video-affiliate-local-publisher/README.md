@@ -1,6 +1,6 @@
 # video-affiliate-local-publisher
 
-Mac mini publisher สำหรับ organic Facebook Reel ของเพจเฉียบ ใช้ SQLite local เป็น source of truth และทำงาน side-by-side โดยไม่ใช้ Cloudflare Worker/D1/Container เป็น runtime ของ posting lane
+Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page ใช้ SQLite local เป็น source of truth และทำงาน side-by-side โดยไม่ใช้ Cloudflare Worker/D1/Container เป็น runtime ของ posting lane
 
 ## Safety contract
 
@@ -20,13 +20,13 @@ Mac mini publisher สำหรับ organic Facebook Reel ของเพจ�
 1. อ่าน Studio SQLite ด้วย URI `mode=ro`
 2. เลือก `content_items.status='ready'` ที่มี Editor Message ID, video attachment, Shopee URL และ caption ครบ
 3. resolve Discord `#editor` message สดและตรวจ attachment/buttons ตรง Studio DB
-4. ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare
+4. ถ้า Page เปิด `avatar_enabled` ให้ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare. Page ที่ปิด Avatar ใช้ source MP4 ตรงๆ
 5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe และ SHA-256
 6. compose Avatar ผ่าน local merge-rust `127.0.0.1:18080`
-7. preflight Facebook Lite + Power Editor + Shopee CHEARB
-8. โพสต์ Reel ผ่าน IDBridge, mint final link Sub1=Campaign/Sub2=Page/Sub3=Post, รอ 30 วินาทีแล้ว comment เป็น Page
+7. preflight source ตาม Page (`facebook_lite_eaad6` หรือ `idbridge_power_editor`) + Power Editor + Shopee CHEARB แบบ account-scoped และ fail closed เมื่อ source/account ไม่ตรง
+8. โพสต์ Reel ผ่าน IDBridge, mint final link Sub1=Campaign/Sub2=Page/Sub3=Post, รอ 30 วินาทีแล้ว comment เป็น Page. Power Editor Page posting ต้อง bind session cookies ของ account เดิมเพื่อ resolve Page token; upload/comment ใช้ Page token เป็น actor และห้าม fallback ข้าม account
 9. Graph readback post/comment ก่อน mark SQLite `success`
-10. advance `next_due_at` ตาม interval 20 นาทีและ cleanup spool
+10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup spool
 
 SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)` และ recovery states. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
 

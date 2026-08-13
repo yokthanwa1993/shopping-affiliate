@@ -16,6 +16,7 @@ DEFAULT_LOGS = Path.home() / "Library/Logs/VideoAffiliatePublisher"
 DEFAULT_DISCORD_ENV = Path.home() / "Developer/shopping-affiliate/apps/admin-media-drive/.env"
 DEFAULT_IDBRIDGE_AUTH = Path.home() / "Library/Application Support/IDBridge/service-auth"
 DIGITS = re.compile(r"^[0-9]+$")
+POSTING_SOURCES = {"facebook_lite_eaad6", "idbridge_power_editor"}
 
 
 class ConfigError(RuntimeError):
@@ -34,6 +35,8 @@ class PageConfig:
     affiliate_id: str
     facebook_account: str
     power_editor_account: str
+    posting_source: str
+    avatar_enabled: bool
     avatar_path: Path
     avatar_version: str
     caption_template: str
@@ -94,6 +97,9 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
     blend = float(raw.get("chromakey_blend", 0.10))
     if not 0 <= similarity <= 1 or not 0 <= blend <= 1:
         raise ConfigError("chromakey_invalid")
+    posting_source = _text(raw.get("posting_source")) or "facebook_lite_eaad6"
+    if posting_source not in POSTING_SOURCES:
+        raise ConfigError("posting_source_invalid")
     return PageConfig(
         page_id=page_id,
         name=_text(raw.get("name")) or page_id,
@@ -105,6 +111,8 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
         affiliate_id=_text(raw.get("affiliate_id")),
         facebook_account=_text(raw.get("facebook_account")),
         power_editor_account=_text(raw.get("power_editor_account")),
+        posting_source=posting_source,
+        avatar_enabled=_boolean(raw.get("avatar_enabled"), True),
         avatar_path=avatar_path,
         avatar_version=_text(raw.get("avatar_version")) or "unversioned",
         caption_template=_text(raw.get("caption_template")) or "{caption}",
@@ -195,7 +203,9 @@ def safe_config_summary(config: AppConfig) -> Dict[str, Any]:
                 "name": page.name,
                 "enabled": page.enabled,
                 "interval_minutes": page.interval_minutes,
-                "avatar_present": page.avatar_path.is_file(),
+                "posting_source": page.posting_source,
+                "avatar_enabled": page.avatar_enabled,
+                "avatar_present": page.avatar_path.is_file() if page.avatar_enabled else True,
                 "campaign_present": bool(page.campaign_sub1),
                 "facebook_account_present": bool(page.facebook_account),
                 "power_editor_account_present": bool(page.power_editor_account),

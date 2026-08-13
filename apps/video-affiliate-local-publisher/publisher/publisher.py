@@ -65,6 +65,8 @@ class PublisherEngine:
     @staticmethod
     def resolve_avatar_asset(page: PageConfig, spool: Spool) -> str:
         """Use the durable Mac mini avatar only; publishing has no Cloudflare runtime dependency."""
+        if not page.avatar_enabled:
+            return "none"
         if not page.avatar_path.is_file():
             raise PublisherError("avatar_asset_missing")
         spool.inspect(page.avatar_path)
@@ -177,7 +179,9 @@ class PublisherEngine:
         return ""
 
     def _preflight_identity(self, page: PageConfig) -> None:
-        self.idbridge.ensure_page(page.facebook_account, page.page_id)
+        self.idbridge.ensure_page(
+            page.facebook_account, page.page_id, page.posting_source,
+        )
         graph_page = self.idbridge.graph_get(
             page.power_editor_account, page.page_id, {"fields": "id"},
         )
@@ -202,7 +206,10 @@ class PublisherEngine:
             video_url = server.register(composed_path)
             self.ledger.transition(attempt_id, "posting")
             try:
-                posted = self.idbridge.post(page.page_id, video_url, caption, page.facebook_account)
+                posted = self.idbridge.post(
+                    page.page_id, video_url, caption, page.facebook_account,
+                    page.posting_source,
+                )
             except IDBridgeError as exc:
                 # Once /post has been invoked, every transport or application error is
                 # outcome-unknown until reconciled. Never classify it as safe to retry.
@@ -372,15 +379,18 @@ class PublisherEngine:
                 self.ledger.transition(attempt_id, "downloaded", {"source_sha256": source.sha256})
                 avatar_version = self.resolve_avatar_asset(page, self.spool)
                 self.ledger.transition(attempt_id, "avatar_composing")
-                output_path = attempt_dir / "avatar-composed.mp4"
-                with AssetServer() as server:
-                    source_url = server.register(source_path)
-                    avatar_url = server.register(page.avatar_path)
-                    AvatarClient(self.config.merge_url, self.spool).compose(
-                        source_url, avatar_url, output_path,
-                        similarity=page.chromakey_similarity,
-                        blend=page.chromakey_blend,
-                    )
+                if page.avatar_enabled:
+                    output_path = attempt_dir / "avatar-composed.mp4"
+                    with AssetServer() as server:
+                        source_url = server.register(source_path)
+                        avatar_url = server.register(page.avatar_path)
+                        AvatarClient(self.config.merge_url, self.spool).compose(
+                            source_url, avatar_url, output_path,
+                            similarity=page.chromakey_similarity,
+                            blend=page.chromakey_blend,
+                        )
+                else:
+                    output_path = source_path
                 self.ledger.transition(attempt_id, "avatar_ready", {"avatar_version": avatar_version})
                 if shadow:
                     self.ledger.transition(attempt_id, "shadow_ready")

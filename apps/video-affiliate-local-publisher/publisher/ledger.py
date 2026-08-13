@@ -38,6 +38,12 @@ ALLOWED_TRANSITIONS = {
     "verifying": {"success", "post_success_verification_failed"},
     "post_success_comment_failed": {"final_shortlink_ok", "comment_pending", "verifying"},
     "post_success_verification_failed": {"success"},
+    "post_outcome_unknown": {"failed_pre_post"},
+}
+
+NO_POST_EVIDENCE_CODES = {
+    "idbridge_rejected_before_upload_and_graph_no_post",
+    "facebook_upload_rejected_and_graph_no_post",
 }
 
 SCHEMA = """
@@ -316,6 +322,22 @@ class Ledger:
             return
         self.transition(attempt_id, "failed_pre_post", {
             "error_code": code[:100], "error_detail_redacted": detail[:240],
+        })
+
+    def resolve_unknown_no_post(self, attempt_id: str, evidence_code: str) -> None:
+        """Close an unknown outcome only after operator-confirmed live readback.
+
+        This preserves the original attempt and writes an auditable state transition.
+        It must never be used when a Facebook object may have been created.
+        """
+        if evidence_code not in NO_POST_EVIDENCE_CODES:
+            raise LedgerError("no_post_evidence_invalid")
+        row = self.attempt(attempt_id)
+        if str(row["state"]) != "post_outcome_unknown":
+            raise LedgerError("unknown_resolution_state_invalid")
+        self.transition(attempt_id, "failed_pre_post", {
+            "error_code": "operator_confirmed_no_post",
+            "error_detail_redacted": f"evidence={evidence_code}",
         })
 
     def advance_page_after_success(self, page_id: str, interval_minutes: int, now: Optional[int] = None) -> None:
