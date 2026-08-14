@@ -1,4 +1,6 @@
 import tempfile
+import sqlite3
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,3 +96,43 @@ class LedgerTests(unittest.TestCase):
             attempt, "facebook_upload_rejected_and_graph_no_post",
         )
         self.assertEqual(self.ledger.attempt(attempt)["state"], "failed_pre_post")
+
+    def test_primary_success_ids_and_daily_count_are_sql_backed(self):
+        success = self.ledger.claim_attempt("primary", 101, "slot-success-primary", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending", "verifying", "success",
+        ]:
+            self.ledger.transition(success, state)
+        failed = self.ledger.claim_attempt("primary", 102, "slot-failed-primary", "scheduler")
+        self.ledger.transition(failed, "failed_pre_post")
+        posted = self.ledger.claim_attempt("primary", 103, "slot-posted-primary", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+        ]:
+            self.ledger.transition(posted, state)
+        self.assertEqual(self.ledger.successful_content_ids("primary"), {101})
+        now = int(time.time())
+        self.assertEqual(self.ledger.success_count_between("primary", now - 60, now + 60), 1)
+        self.assertEqual(self.ledger.posted_count_between("primary", now - 60, now + 60), 2)
+
+    def test_migrate_adds_secondary_policy_columns_to_existing_pages_table(self):
+        old_path = Path(self.temp.name) / "old.db"
+        conn = sqlite3.connect(old_path)
+        conn.execute("""
+            CREATE TABLE pages(
+              page_id TEXT PRIMARY KEY,name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,
+              interval_minutes INTEGER NOT NULL,timezone TEXT NOT NULL,next_due_at INTEGER,
+              campaign_sub1 TEXT NOT NULL DEFAULT '',shopee_account TEXT NOT NULL DEFAULT '',
+              affiliate_id TEXT NOT NULL DEFAULT '',facebook_account TEXT NOT NULL DEFAULT '',
+              avatar_path TEXT NOT NULL DEFAULT '',avatar_version TEXT NOT NULL DEFAULT '',
+              caption_template TEXT NOT NULL DEFAULT '{caption}',last_success_at INTEGER,
+              updated_at INTEGER NOT NULL)
+        """)
+        conn.commit(); conn.close()
+        migrated = Ledger(old_path)
+        columns = {row[1] for row in migrated.connect().execute("PRAGMA table_info(pages)")}
+        self.assertIn("daily_success_limit", columns)
+        self.assertIn("reuse_success_from_page_id", columns)

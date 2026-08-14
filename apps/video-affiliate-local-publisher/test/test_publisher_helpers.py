@@ -8,6 +8,7 @@ from publisher.idbridge_client import IDBridgeError
 from publisher.ledger import Ledger
 from publisher.publisher import PublisherEngine, PublisherError
 from publisher.scheduler import slot_key
+from publisher.scheduler import local_day_window
 from publisher.security import redact_error
 
 
@@ -261,6 +262,34 @@ class PublisherHelpersTests(unittest.TestCase):
 
     def test_slot_key_stable(self):
         self.assertEqual(slot_key("100", 20, at=1234), slot_key("100", 20, at=2399))
+
+    def test_daily_limit_stops_before_source_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            attempt = ledger.claim_attempt("secondary", 3, "daily-success", "scheduler")
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting", "post_confirmed",
+                "final_shortlink_ok", "comment_pending", "verifying", "success",
+            ]:
+                ledger.transition(attempt, state)
+            now = int(__import__("time").time())
+            start, end = local_day_window("Asia/Bangkok", now)
+            self.assertLess(start, now)
+            self.assertGreater(end, now)
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.ledger = ledger
+            engine.studio = cast(Any, SimpleNamespace(
+                candidates=lambda *args, **kwargs: self.fail("must_not_select_source"),
+            ))
+            page = cast(Any, SimpleNamespace(
+                page_id="secondary", timezone="Asia/Bangkok",
+                daily_success_limit=1, reuse_success_from_page_id="",
+            ))
+            result = engine._run_locked(page, shadow=False, trigger="manual", at=now)
+            self.assertEqual(result["reason"], "daily_success_limit_reached")
+            self.assertEqual(result["daily_posts"], 1)
+            self.assertEqual(result["daily_post_limit"], 1)
 
 
 if __name__ == "__main__":

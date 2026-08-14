@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,15 +71,11 @@ class StudioSource:
                   AND COALESCE(ai_post_caption,'')!=''
             """).fetchone()[0])
 
-    def candidates(self, limit: int = 20, excluded_ids: Optional[Set[int]] = None) -> List[StudioItem]:
-        excluded = sorted(excluded_ids or set())
-        where_excluded = ""
-        params: List[object] = []
-        if excluded:
-            where_excluded = " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
-            params.extend(excluded)
-        params.append(max(1, min(int(limit), 100)))
-        sql = """
+    def candidates(self, limit: int = 20, excluded_ids: Optional[Set[int]] = None,
+                   allowed_ids: Optional[Set[int]] = None) -> List[StudioItem]:
+        excluded_set = {int(value) for value in (excluded_ids or set())}
+        limit_value = max(1, min(int(limit), 100))
+        base_sql = """
             SELECT id,edited_message_id,editor_video_url,shopee_link,lazada_link,ai_post_caption,ready_at
             FROM content_items
             WHERE status='ready'
@@ -87,7 +84,35 @@ class StudioSource:
               AND COALESCE(shopee_link,'')!=''
               AND COALESCE(lazada_link,'')!=''
               AND COALESCE(ai_post_caption,'')!=''
-        """ + where_excluded + " ORDER BY RANDOM() LIMIT ?"
+        """
+        if allowed_ids is not None:
+            eligible = list({int(value) for value in allowed_ids} - excluded_set)
+            if not eligible:
+                return []
+            random.shuffle(eligible)
+            results: List[StudioItem] = []
+            with self.connect() as conn:
+                for start in range(0, len(eligible), 500):
+                    remaining = limit_value - len(results)
+                    if remaining <= 0:
+                        break
+                    chunk = eligible[start:start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    sql = base_sql + f" AND id IN ({placeholders}) ORDER BY RANDOM() LIMIT ?"
+                    results.extend(
+                        self._to_item(row)
+                        for row in conn.execute(sql, [*chunk, remaining])
+                    )
+            return results
+
+        excluded = sorted(excluded_set)
+        where_excluded = ""
+        params: List[object] = []
+        if excluded:
+            where_excluded = " AND id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+            params.extend(excluded)
+        params.append(limit_value)
+        sql = base_sql + where_excluded + " ORDER BY RANDOM() LIMIT ?"
         with self.connect() as conn:
             return [self._to_item(row) for row in conn.execute(sql, params)]
 

@@ -19,6 +19,8 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 
 1. อ่าน Studio SQLite ด้วย URI `mode=ro`
 2. เลือก `content_items.status='ready'` ที่มี Editor Message ID, video attachment, Shopee URL และ caption ครบ
+   - Page ที่ตั้ง `reuse_success_from_page_id` จะเลือกได้เฉพาะ Content ID ที่ Page ต้นทางมี SQLite state=`success` แล้ว
+   - `daily_success_limit` เป็น hard cap จำนวน Reel ที่โพสต์แล้วต่อวันตาม timezone ของ Page; นับตั้งแต่ `post_confirmed` แม้ comment/readback ยังรอ และ scheduler เลื่อนไปรอบวันถัดไปเมื่อครบเพดาน
 3. resolve Discord `#editor` message สดและตรวจ attachment/buttons ตรง Studio DB
 4. ถ้า Page เปิด `avatar_enabled` ให้ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare. Page ที่ปิด Avatar ใช้ source MP4 ตรงๆ
 5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe และ SHA-256
@@ -28,7 +30,7 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 9. Graph readback post/comment ก่อน mark SQLite `success`
 10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup spool
 
-SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)` และ recovery states. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
+SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap และ recovery states. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
 
 ## Commands
 

@@ -29,6 +29,8 @@ class PageConfig:
     name: str
     enabled: bool
     interval_minutes: int
+    daily_success_limit: int
+    reuse_success_from_page_id: str
     timezone: str
     campaign_sub1: str
     shopee_account: str
@@ -92,6 +94,14 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
     interval = int(raw.get("interval_minutes") or 20)
     if interval < 1 or interval > 1440:
         raise ConfigError("interval_minutes_invalid")
+    daily_success_limit = int(raw.get("daily_success_limit") or 0)
+    if daily_success_limit < 0 or daily_success_limit > 1440:
+        raise ConfigError("daily_success_limit_invalid")
+    reuse_success_from_page_id = _text(raw.get("reuse_success_from_page_id"))
+    if reuse_success_from_page_id and not DIGITS.fullmatch(reuse_success_from_page_id):
+        raise ConfigError("reuse_success_from_page_id_invalid")
+    if reuse_success_from_page_id == page_id:
+        raise ConfigError("reuse_success_from_page_id_self")
     avatar_path = _path(raw.get("avatar_path"), APP_SUPPORT / f"assets/pages/{page_id}/avatar.mp4")
     similarity = float(raw.get("chromakey_similarity", 0.30))
     blend = float(raw.get("chromakey_blend", 0.10))
@@ -105,6 +115,8 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
         name=_text(raw.get("name")) or page_id,
         enabled=_boolean(raw.get("enabled"), False),
         interval_minutes=interval,
+        daily_success_limit=daily_success_limit,
+        reuse_success_from_page_id=reuse_success_from_page_id,
         timezone=_text(raw.get("timezone")) or "Asia/Bangkok",
         campaign_sub1=_text(raw.get("campaign_sub1")),
         shopee_account=_text(raw.get("shopee_account")),
@@ -139,6 +151,10 @@ def load_config(path: Optional[Path] = None) -> AppConfig:
     pages = [_page(item) for item in pages_raw if isinstance(item, dict)]
     if len({p.page_id for p in pages}) != len(pages):
         raise ConfigError("page_id_duplicate")
+    page_ids = {p.page_id for p in pages}
+    for page in pages:
+        if page.reuse_success_from_page_id and page.reuse_success_from_page_id not in page_ids:
+            raise ConfigError(f"reuse_success_from_page_id_not_configured:{page.page_id}")
     host = _text(raw.get("host")) or "127.0.0.1"
     if host != "127.0.0.1":
         raise ConfigError("host_must_be_loopback")
@@ -203,6 +219,8 @@ def safe_config_summary(config: AppConfig) -> Dict[str, Any]:
                 "name": page.name,
                 "enabled": page.enabled,
                 "interval_minutes": page.interval_minutes,
+                "daily_success_limit": page.daily_success_limit,
+                "reuse_success_from_page_id": page.reuse_success_from_page_id,
                 "posting_source": page.posting_source,
                 "avatar_enabled": page.avatar_enabled,
                 "avatar_present": page.avatar_path.is_file() if page.avatar_enabled else True,

@@ -13,7 +13,7 @@ from .discord_source import DiscordSource
 from .idbridge_client import IDBridgeClient, IDBridgeError
 from .ledger import Ledger, LedgerError, PAGE_BLOCKING_STATES
 from .notifier import Notifier
-from .scheduler import manual_slot_key, slot_key
+from .scheduler import local_day_window, manual_slot_key, slot_key
 from .security import discord_bot_token, idbridge_service_auth, redact_error
 from .spool import Spool
 from .studio_source import StudioItem, StudioSource
@@ -340,8 +340,46 @@ class PublisherEngine:
 
     def _run_locked(self, page: PageConfig, *, shadow: bool, trigger: str,
                     at: Optional[int]) -> Dict[str, Any]:
+        if page.daily_success_limit:
+            day_start, next_day = local_day_window(page.timezone, at=at)
+            daily_posts = self.ledger.posted_count_between(
+                page.page_id, day_start, next_day,
+            )
+            if daily_posts >= page.daily_success_limit:
+                if trigger == "scheduler":
+                    self.ledger.set_next_due_at(page.page_id, next_day, now=at)
+                return {
+                    "ok": True,
+                    "state": "idle",
+                    "reason": "daily_success_limit_reached",
+                    "page_id": page.page_id,
+                    "daily_posts": daily_posts,
+                    "daily_post_limit": page.daily_success_limit,
+                    "next_due_at": next_day,
+                }
         used = self.ledger.used_content_ids(page.page_id, include_shadow=shadow)
-        candidates = self.studio.candidates(limit=20, excluded_ids=used)
+        allowed: Optional[set[int]] = None
+        if page.reuse_success_from_page_id:
+            allowed = self.ledger.successful_content_ids(page.reuse_success_from_page_id)
+            if not allowed:
+                return {
+                    "ok": False,
+                    "state": "blocked",
+                    "reason": "reuse_source_success_empty",
+                    "page_id": page.page_id,
+                    "reuse_success_from_page_id": page.reuse_success_from_page_id,
+                }
+            if not (allowed - used):
+                return {
+                    "ok": False,
+                    "state": "blocked",
+                    "reason": "reuse_source_success_exhausted",
+                    "page_id": page.page_id,
+                    "reuse_success_from_page_id": page.reuse_success_from_page_id,
+                }
+        candidates = self.studio.candidates(
+            limit=20, excluded_ids=used, allowed_ids=allowed,
+        )
         if not candidates:
             return {"ok": False, "state": "blocked", "reason": "strict_ready_exhausted"}
         candidate_errors = []

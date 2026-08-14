@@ -33,3 +33,9 @@ class StudioSourceTests(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             conn.execute("UPDATE content_items SET status='x'")
         conn.close()
+
+    def test_candidates_can_be_restricted_to_primary_success_ids(self):
+        source = StudioSource(self.path)
+        self.assertEqual([row.content_id for row in source.candidates(allowed_ids={1})], [1])
+        self.assertEqual(source.candidates(allowed_ids={2}), [])
+        self.assertEqual(source.candidates(excluded_ids={1}, allowed_ids={1}), [])

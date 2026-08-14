@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS pages(
   name TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 0,
   interval_minutes INTEGER NOT NULL,
+  daily_success_limit INTEGER NOT NULL DEFAULT 0,
+  reuse_success_from_page_id TEXT NOT NULL DEFAULT '',
   timezone TEXT NOT NULL,
   next_due_at INTEGER,
   campaign_sub1 TEXT NOT NULL DEFAULT '',
@@ -144,26 +146,41 @@ class Ledger:
     def migrate(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(pages)")}
+            if "daily_success_limit" not in columns:
+                conn.execute(
+                    "ALTER TABLE pages ADD COLUMN daily_success_limit INTEGER NOT NULL DEFAULT 0"
+                )
+            if "reuse_success_from_page_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE pages ADD COLUMN reuse_success_from_page_id TEXT NOT NULL DEFAULT ''"
+                )
         self.path.chmod(0o600)
 
     def sync_page(self, page: Any) -> None:
         now = int(time.time())
         with self.connect() as conn:
             conn.execute("""
-                INSERT INTO pages(page_id,name,enabled,interval_minutes,timezone,campaign_sub1,
+                INSERT INTO pages(page_id,name,enabled,interval_minutes,daily_success_limit,
+                  reuse_success_from_page_id,timezone,campaign_sub1,
                   shopee_account,affiliate_id,facebook_account,avatar_path,avatar_version,
                   caption_template,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(page_id) DO UPDATE SET
                   name=excluded.name, enabled=excluded.enabled,
-                  interval_minutes=excluded.interval_minutes, timezone=excluded.timezone,
+                  interval_minutes=excluded.interval_minutes,
+                  daily_success_limit=excluded.daily_success_limit,
+                  reuse_success_from_page_id=excluded.reuse_success_from_page_id,
+                  timezone=excluded.timezone,
                   campaign_sub1=excluded.campaign_sub1, shopee_account=excluded.shopee_account,
                   affiliate_id=excluded.affiliate_id, facebook_account=excluded.facebook_account,
                   avatar_path=excluded.avatar_path, avatar_version=excluded.avatar_version,
                   caption_template=excluded.caption_template, updated_at=excluded.updated_at
-            """, (page.page_id, page.name, int(page.enabled), page.interval_minutes, page.timezone,
-                  page.campaign_sub1, page.shopee_account, page.affiliate_id, page.facebook_account,
-                  str(page.avatar_path), page.avatar_version, page.caption_template, now))
+            """, (page.page_id, page.name, int(page.enabled), page.interval_minutes,
+                  page.daily_success_limit, page.reuse_success_from_page_id, page.timezone,
+                  page.campaign_sub1, page.shopee_account, page.affiliate_id,
+                  page.facebook_account, str(page.avatar_path), page.avatar_version,
+                  page.caption_template, now))
 
     def due_pages(self, now: Optional[int] = None) -> List[sqlite3.Row]:
         current = int(now or time.time())
@@ -212,6 +229,46 @@ class Ledger:
                 (page_id, *states),
             )
             return {int(row[0]) for row in rows}
+
+    def successful_content_ids(self, page_id: str) -> Set[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT studio_content_id FROM post_attempts WHERE page_id=? AND state='success'",
+                (str(page_id),),
+            )
+            return {int(row[0]) for row in rows}
+
+    def success_count_between(self, page_id: str, start_at: int, end_at: int) -> int:
+        with self.connect() as conn:
+            return int(conn.execute(
+                """
+                SELECT COUNT(*) FROM post_attempts
+                WHERE page_id=? AND state='success'
+                  AND completed_at>=? AND completed_at<?
+                """,
+                (str(page_id), int(start_at), int(end_at)),
+            ).fetchone()[0])
+
+    def posted_count_between(self, page_id: str, start_at: int, end_at: int) -> int:
+        placeholders = ",".join("?" for _ in POSTED_STATES)
+        with self.connect() as conn:
+            return int(conn.execute(
+                f"""
+                SELECT COUNT(*) FROM post_attempts
+                WHERE page_id=? AND state IN ({placeholders})
+                  AND COALESCE(posted_at,created_at)>=?
+                  AND COALESCE(posted_at,created_at)<?
+                """,
+                (str(page_id), *POSTED_STATES, int(start_at), int(end_at)),
+            ).fetchone()[0])
+
+    def set_next_due_at(self, page_id: str, next_due_at: int, now: Optional[int] = None) -> None:
+        current = int(now or time.time())
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE pages SET next_due_at=?,updated_at=? WHERE page_id=?",
+                (int(next_due_at), current, str(page_id)),
+            )
 
     def page_has_sha(self, page_id: str, sha256: str) -> bool:
         if not sha256:

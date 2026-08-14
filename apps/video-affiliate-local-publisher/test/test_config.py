@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from publisher.config import ConfigError, load_config
+from publisher.config import ConfigError, DEFAULT_LEDGER, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -22,7 +22,14 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.pages[0].enabled)
         self.assertEqual(config.pages[0].posting_source, "facebook_lite_eaad6")
         self.assertTrue(config.pages[0].avatar_enabled)
+        self.assertEqual(config.pages[0].daily_success_limit, 0)
+        self.assertEqual(config.pages[0].reuse_success_from_page_id, "")
         self.assertEqual(config.host, "127.0.0.1")
+
+    def test_example_config_never_points_at_production_ledger(self):
+        example = Path(__file__).resolve().parents[1] / "config.example.json"
+        config = load_config(example)
+        self.assertNotEqual(config.ledger_db, DEFAULT_LEDGER)
 
     def test_page_can_disable_avatar_overlay(self):
         config = self.make({"pages": [{
@@ -40,6 +47,31 @@ class ConfigTests(unittest.TestCase):
     def test_non_loopback_rejected(self):
         with self.assertRaises(ConfigError):
             self.make({"host": "0.0.0.0", "pages": []})
+
+    def test_secondary_page_reuse_and_daily_limit(self):
+        config = self.make({"pages": [
+            {"page_id": "100", "enabled": True},
+            {
+                "page_id": "200", "enabled": True,
+                "interval_minutes": 120,
+                "daily_success_limit": 12,
+                "reuse_success_from_page_id": "100",
+            },
+        ]})
+        secondary = config.pages[1]
+        self.assertEqual(secondary.interval_minutes, 120)
+        self.assertEqual(secondary.daily_success_limit, 12)
+        self.assertEqual(secondary.reuse_success_from_page_id, "100")
+
+    def test_reuse_source_must_be_another_configured_page(self):
+        with self.assertRaisesRegex(ConfigError, "reuse_success_from_page_id_not_configured"):
+            self.make({"pages": [
+                {"page_id": "200", "reuse_success_from_page_id": "100"},
+            ]})
+        with self.assertRaisesRegex(ConfigError, "reuse_success_from_page_id_self"):
+            self.make({"pages": [
+                {"page_id": "200", "reuse_success_from_page_id": "200"},
+            ]})
 
 
     def test_write_config_requires_all_identity_fields(self):
