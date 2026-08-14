@@ -412,7 +412,12 @@ class PublisherEngine:
                 )
                 attempt_dir = self.spool.adopt(probe_id, attempt_id)
                 source_path = attempt_dir / "source.mp4"
+                source = self.spool.inspect(source_path, expected_sha=source.sha256)
                 self.ledger.upsert_source(item, resolved.attachment_id, source.sha256)
+                archived = self.spool.archive_source(item.content_id, source)
+                self.ledger.record_source_archive(
+                    item.content_id, archived.sha256, archived.path, archived.bytes,
+                )
                 self.ledger.transition(attempt_id, "source_resolved")
                 self.ledger.transition(attempt_id, "downloaded", {"source_sha256": source.sha256})
                 avatar_version = self.resolve_avatar_asset(page, self.spool)

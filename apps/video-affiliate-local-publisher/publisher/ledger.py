@@ -80,6 +80,16 @@ CREATE TABLE IF NOT EXISTS source_items(
   last_seen_at INTEGER NOT NULL,
   source_status TEXT NOT NULL DEFAULT 'ready'
 );
+CREATE TABLE IF NOT EXISTS source_archives(
+  studio_content_id INTEGER NOT NULL,
+  source_sha256 TEXT NOT NULL,
+  archive_path TEXT NOT NULL,
+  archive_bytes INTEGER NOT NULL,
+  archived_at INTEGER NOT NULL,
+  PRIMARY KEY(studio_content_id,source_sha256),
+  UNIQUE(archive_path),
+  FOREIGN KEY(studio_content_id) REFERENCES source_items(studio_content_id)
+);
 CREATE TABLE IF NOT EXISTS post_attempts(
   attempt_id TEXT PRIMARY KEY,
   page_id TEXT NOT NULL,
@@ -325,6 +335,36 @@ class Ledger:
                 raise LedgerError("source_item_not_found")
             return dict(row)
 
+    def record_source_archive(self, content_id: int, sha256: str, archive_path: Path,
+                              archive_bytes: int, now: Optional[int] = None) -> None:
+        path = Path(archive_path).expanduser()
+        sha = str(sha256 or "").strip().lower()
+        size = int(archive_bytes)
+        if int(content_id) <= 0 or len(sha) != 64 or not path.is_absolute() or size <= 0:
+            raise LedgerError("source_archive_invalid")
+        archived_at = int(now or time.time())
+        with self.connect() as conn:
+            try:
+                conn.execute("""
+                    INSERT INTO source_archives(studio_content_id,source_sha256,archive_path,
+                      archive_bytes,archived_at)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(studio_content_id,source_sha256) DO UPDATE SET
+                      archive_path=excluded.archive_path,
+                      archive_bytes=excluded.archive_bytes,
+                      archived_at=MIN(source_archives.archived_at,excluded.archived_at)
+                """, (int(content_id), sha, str(path), size, archived_at))
+            except sqlite3.IntegrityError as exc:
+                raise LedgerError("source_archive_conflict") from exc
+
+    def source_archive(self, content_id: int, sha256: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("""
+                SELECT * FROM source_archives
+                WHERE studio_content_id=? AND source_sha256=?
+            """, (int(content_id), str(sha256 or "").strip().lower())).fetchone()
+            return dict(row) if row else None
+
     def attempt(self, attempt_id: str) -> sqlite3.Row:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM post_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -431,10 +471,15 @@ class Ledger:
                 "SELECT state,COUNT(*) FROM post_attempts GROUP BY state"
             )}
             active_leases = int(conn.execute("SELECT COUNT(*) FROM leases WHERE expires_at>?", (int(time.time()),)).fetchone()[0])
+            archive = conn.execute(
+                "SELECT COUNT(*),COALESCE(SUM(archive_bytes),0) FROM source_archives"
+            ).fetchone()
             last = conn.execute("SELECT attempt_id,page_id,studio_content_id,state,updated_at,error_code FROM post_attempts ORDER BY updated_at DESC LIMIT 1").fetchone()
             return {
                 "attempts": sum(states.values()),
                 "states": states,
                 "active_leases": active_leases,
+                "source_archives": int(archive[0]),
+                "source_archive_bytes": int(archive[1]),
                 "last_attempt": dict(last) if last else None,
             }

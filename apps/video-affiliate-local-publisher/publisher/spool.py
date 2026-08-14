@@ -109,6 +109,56 @@ class Spool:
         return VideoFile(path=path, bytes=path.stat().st_size, sha256=sha,
                          duration=duration, width=width, height=height)
 
+    def archive_source(self, content_id: int, source: VideoFile) -> VideoFile:
+        content = int(content_id)
+        sha = str(source.sha256 or "").strip().lower()
+        if content <= 0 or len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            raise SpoolError("source_archive_identity_invalid")
+        if not source.path.is_file() or source.path.stat().st_size != int(source.bytes):
+            raise SpoolError("source_archive_input_invalid")
+
+        archive_root = self.root.parent / "source-archive"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_root.chmod(0o700)
+        target = archive_root / f"content_{content}_{sha}.mp4"
+        if target.exists():
+            if target.stat().st_size != int(source.bytes) or self.sha256(target) != sha:
+                raise SpoolError("source_archive_integrity_failed")
+            target.chmod(0o600)
+            return VideoFile(
+                path=target, bytes=source.bytes, sha256=sha,
+                duration=source.duration, width=source.width, height=source.height,
+            )
+
+        partial = archive_root / f".{target.name}.{os.getpid()}.part"
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with source.path.open("rb") as reader, partial.open("wb") as writer:
+                while True:
+                    chunk = reader.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+            if total != int(source.bytes) or digest.hexdigest() != sha:
+                raise SpoolError("source_archive_integrity_failed")
+            partial.chmod(0o600)
+            os.replace(partial, target)
+        except SpoolError:
+            partial.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            partial.unlink(missing_ok=True)
+            raise SpoolError("source_archive_failed") from exc
+        return VideoFile(
+            path=target, bytes=source.bytes, sha256=sha,
+            duration=source.duration, width=source.width, height=source.height,
+        )
+
     @staticmethod
     def sha256(path: Path) -> str:
         digest = hashlib.sha256()

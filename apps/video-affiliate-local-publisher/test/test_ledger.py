@@ -136,3 +136,27 @@ class LedgerTests(unittest.TestCase):
         columns = {row[1] for row in migrated.connect().execute("PRAGMA table_info(pages)")}
         self.assertIn("daily_success_limit", columns)
         self.assertIn("reuse_success_from_page_id", columns)
+
+    def test_source_archive_is_sql_backed_and_summarized(self):
+        item = SimpleNamespace(
+            content_id=77,
+            editor_message_id="message-77",
+            shopee_url="https://shopee.co.th/product/1/77",
+            lazada_url="https://www.lazada.co.th/products/example-i77.html",
+            caption="caption",
+            ready_at="2026-08-14T00:00:00Z",
+        )
+        sha = "c" * 64
+        self.ledger.upsert_source(item, "attachment-77", sha)
+        path = Path(self.temp.name) / "source-archive" / f"content_77_{sha}.mp4"
+        self.ledger.record_source_archive(77, sha, path, 123456, now=100)
+        self.ledger.record_source_archive(77, sha, path, 123456, now=200)
+        row = self.ledger.source_archive(77, sha)
+        if row is None:
+            self.fail("source archive row missing")
+        self.assertEqual(row["archive_path"], str(path))
+        self.assertEqual(row["archive_bytes"], 123456)
+        self.assertEqual(row["archived_at"], 100)
+        summary = self.ledger.summary()
+        self.assertEqual(summary["source_archives"], 1)
+        self.assertEqual(summary["source_archive_bytes"], 123456)

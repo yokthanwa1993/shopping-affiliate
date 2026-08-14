@@ -26,6 +26,7 @@ class FacebookSourceLookupTests(unittest.TestCase):
                   page_id TEXT NOT NULL,
                   studio_content_id INTEGER NOT NULL,
                   state TEXT NOT NULL,
+                  source_sha256 TEXT NOT NULL DEFAULT '',
                   fb_video_id TEXT NOT NULL DEFAULT '',
                   fb_story_id TEXT NOT NULL DEFAULT '',
                   fb_post_tail TEXT NOT NULL DEFAULT '',
@@ -39,13 +40,24 @@ class FacebookSourceLookupTests(unittest.TestCase):
                   source_sha256 TEXT NOT NULL DEFAULT '',
                   caption TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE source_archives(
+                  studio_content_id INTEGER NOT NULL,
+                  source_sha256 TEXT NOT NULL,
+                  archive_path TEXT NOT NULL,
+                  archive_bytes INTEGER NOT NULL,
+                  archived_at INTEGER NOT NULL,
+                  PRIMARY KEY(studio_content_id,source_sha256)
+                );
                 INSERT INTO post_attempts VALUES(
-                  'attempt-1','1008898512617594',9011,'success','1069164855567107',
+                  'attempt-1','1008898512617594',9011,'success','sha-source','1069164855567107',
                   '1008898512617594_1352962457008449','1352962457008449',
                   'https://www.facebook.com/reel/1069164855567107/',1786412508
                 );
                 INSERT INTO source_items VALUES(
                   9011,'1535481665772716112','1535481664317423707','sha-source','caption'
+                );
+                INSERT INTO source_archives VALUES(
+                  9011,'sha-source','/archive/content_9011_sha-source.mp4',123456,1786412400
                 );
                 """
             )
@@ -116,6 +128,8 @@ class FacebookSourceLookupTests(unittest.TestCase):
             "https://discord.com/channels/1500909618275156070/1518808518176800769/1535481665772716112",
         )
         self.assertFalse(result["editor_pointer_changed"])
+        self.assertEqual(result["archive_path"], "/archive/content_9011_sha-source.mp4")
+        self.assertEqual(result["archive_bytes"], 123456)
 
     def test_lookup_reports_not_found(self):
         ledger, studio = self.make_databases()

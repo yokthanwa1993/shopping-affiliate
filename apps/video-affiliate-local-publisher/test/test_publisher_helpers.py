@@ -291,6 +291,110 @@ class PublisherHelpersTests(unittest.TestCase):
             self.assertEqual(result["daily_posts"], 1)
             self.assertEqual(result["daily_post_limit"], 1)
 
+    def test_source_is_archived_from_adopted_path_before_state_progresses(self):
+        events = []
+        source_sha = "d" * 64
+        item = SimpleNamespace(
+            content_id=88,
+            editor_message_id="message-88",
+            shopee_url="https://shopee.co.th/product/1/88",
+            lazada_url="https://www.lazada.co.th/products/example-i88.html",
+            editor_video_url="https://cdn.example/source.mp4",
+        )
+
+        class FakeStudio:
+            def candidates(self, **_kwargs):
+                return [item]
+
+            def current(self, _content_id):
+                return item
+
+        class FakeDiscord:
+            def fetch(self, *_args):
+                return SimpleNamespace(url="https://cdn.example/source.mp4", attachment_id="att-88")
+
+        class FakeLedger:
+            def used_content_ids(self, *_args, **_kwargs):
+                return set()
+
+            def page_has_sha(self, *_args):
+                return False
+
+            def claim_attempt(self, *_args):
+                events.append("claim")
+                return "attempt-88"
+
+            def upsert_source(self, *_args):
+                events.append("upsert_source")
+
+            def record_source_archive(self, *_args):
+                events.append("record_archive")
+
+            def transition(self, _attempt_id, state, _fields=None):
+                events.append("transition:" + state)
+
+            def advance_page_after_shadow(self, *_args):
+                events.append("advance_shadow")
+
+        class FakeSpool:
+            def download(self, probe_id, *_args, **_kwargs):
+                return SimpleNamespace(
+                    path=Path("/spool") / probe_id / "source.mp4",
+                    bytes=200_000,
+                    sha256=source_sha,
+                    duration=15.0,
+                    width=720,
+                    height=1280,
+                )
+
+            def adopt(self, _probe_id, attempt_id):
+                events.append("adopt")
+                return Path("/spool") / attempt_id
+
+            def inspect(self, path, expected_sha=""):
+                events.append("inspect_adopted")
+                self.assert_adopted_path = path
+                return SimpleNamespace(
+                    path=path, bytes=200_000, sha256=expected_sha,
+                    duration=15.0, width=720, height=1280,
+                )
+
+            def archive_source(self, content_id, source):
+                events.append("archive_source")
+                if source.path != Path("/spool/attempt-88/source.mp4"):
+                    raise AssertionError("archive did not receive adopted source path")
+                return SimpleNamespace(
+                    path=Path("/archive") / f"content_{content_id}_{source.sha256}.mp4",
+                    bytes=source.bytes,
+                    sha256=source.sha256,
+                )
+
+            def cleanup(self, _attempt_id):
+                events.append("cleanup")
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(
+            source_max_bytes=262_144_000,
+            keep_shadow_spool=False,
+        ))
+        engine.ledger = cast(Any, FakeLedger())
+        engine.studio = cast(Any, FakeStudio())
+        engine.discord = cast(Any, FakeDiscord())
+        engine.spool = cast(Any, FakeSpool())
+        page = cast(Any, SimpleNamespace(
+            page_id="page-88",
+            timezone="Asia/Bangkok",
+            daily_success_limit=0,
+            reuse_success_from_page_id="",
+            interval_minutes=120,
+            avatar_enabled=False,
+        ))
+        result = engine._run_locked(page, shadow=True, trigger="manual", at=1_000)
+        self.assertEqual(result["state"], "shadow_ready")
+        self.assertLess(events.index("inspect_adopted"), events.index("archive_source"))
+        self.assertLess(events.index("archive_source"), events.index("record_archive"))
+        self.assertLess(events.index("record_archive"), events.index("transition:source_resolved"))
+
 
 if __name__ == "__main__":
     unittest.main()

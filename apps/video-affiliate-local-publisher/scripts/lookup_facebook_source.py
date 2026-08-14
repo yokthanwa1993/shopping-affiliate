@@ -145,9 +145,12 @@ def lookup_source(
     query = f"""
         SELECT a.attempt_id,a.page_id,a.studio_content_id,a.state,
                a.fb_video_id,a.fb_story_id,a.fb_post_tail,a.permalink,a.completed_at,
-               s.editor_message_id,s.source_attachment_id,s.source_sha256,s.caption
+               s.editor_message_id,s.source_attachment_id,s.source_sha256,s.caption,
+               ar.archive_path,ar.archive_bytes,ar.archived_at
         FROM post_attempts a
         LEFT JOIN source_items s ON s.studio_content_id=a.studio_content_id
+        LEFT JOIN source_archives ar ON ar.studio_content_id=a.studio_content_id
+          AND ar.source_sha256=a.source_sha256
         WHERE a.fb_post_tail IN ({placeholders})
            OR a.fb_video_id IN ({placeholders})
            OR a.fb_story_id IN ({placeholders})
@@ -201,6 +204,9 @@ def lookup_source(
         "editor_pointer_changed": pointer_changed,
         "source_attachment_id": item.get("source_attachment_id") or "",
         "source_sha256": item.get("source_sha256") or "",
+        "archive_path": item.get("archive_path") or "",
+        "archive_bytes": int(item.get("archive_bytes") or 0),
+        "archived_at": item.get("archived_at"),
         "studio_status": studio_item.get("status") or "",
         "source_post_id": studio_item.get("source_post_id") or "",
     }

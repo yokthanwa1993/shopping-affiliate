@@ -23,14 +23,14 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
    - `daily_success_limit` เป็น hard cap จำนวน Reel ที่โพสต์แล้วต่อวันตาม timezone ของ Page; นับตั้งแต่ `post_confirmed` แม้ comment/readback ยังรอ และ scheduler เลื่อนไปรอบวันถัดไปเมื่อครบเพดาน
 3. resolve Discord `#editor` message สดและตรวจ attachment/buttons ตรง Studio DB
 4. ถ้า Page เปิด `avatar_enabled` ให้ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare. Page ที่ปิด Avatar ใช้ source MP4 ตรงๆ
-5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe และ SHA-256
+5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe/SHA-256 แล้ว atomic-copy ต้นฉบับก่อน Avatar ไป `source-archive/` แบบ 0600; archive fail จะหยุดก่อน Facebook write
 6. compose Avatar ผ่าน local merge-rust `127.0.0.1:18080`
 7. preflight source ตาม Page (`facebook_lite_eaad6` หรือ `idbridge_power_editor`) + Power Editor + Shopee CHEARB แบบ account-scoped และ fail closed เมื่อ source/account ไม่ตรง
 8. โพสต์ Reel ผ่าน IDBridge, mint final link Sub1=Campaign/Sub2=Page/Sub3=Post, รอ 30 วินาทีแล้ว comment เป็น Page. Power Editor Page posting ต้อง bind session cookies ของ account เดิมเพื่อ resolve Page token; upload/comment ใช้ Page token เป็น actor และห้าม fallback ข้าม account
 9. Graph readback post/comment ก่อน mark SQLite `success`
-10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup spool
+10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup เฉพาะ spool; source archive คงถาวร
 
-SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap และ recovery states. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
+SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
 
 ## Commands
 
@@ -45,7 +45,7 @@ python3 -m unittest discover -s test -v
 python3 install_launchagent.py
 ```
 
-`lookup_facebook_source.py` เป็น read-only: resolve Facebook share/reel URL ผ่าน HTTP ตรง แล้วไล่ `post_attempts → source_items → Studio content_items` เพื่อคืน Content ID และ Discord Editor jumper ของวิดีโอที่ใช้โพสต์จริง โดยไม่อ่านหรือแสดง token/cookie.
+`lookup_facebook_source.py` เป็น read-only: resolve Facebook share/reel URL ผ่าน HTTP ตรง แล้วไล่ `post_attempts → source_items/source_archives → Studio content_items` เพื่อคืน Content ID, local archive path และ Discord Editor jumper ของวิดีโอที่ใช้โพสต์จริง โดยไม่อ่านหรือแสดง token/cookie.
 
 การ activate production ต้องทำหลัง explicit approval และ cutover owner เดิมแล้ว:
 
@@ -70,6 +70,7 @@ reconcile-attempt --attempt-id ATTEMPT_ID
 Runtime paths:
 
 - config/DB/assets/spool/proof: `~/Library/Application Support/VideoAffiliatePublisher/`
+- ต้นฉบับก่อน Avatar: `~/Library/Application Support/VideoAffiliatePublisher/source-archive/`
 - logs: `~/Library/Logs/VideoAffiliatePublisher/`
 - LaunchAgent: `com.affiliate.video-affiliate-local-publisher`
 - local health/status: `http://127.0.0.1:3110/{health,status}`
