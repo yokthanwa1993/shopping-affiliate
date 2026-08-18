@@ -12,7 +12,7 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 - HTTP write endpoint ปิด
 - โพสต์จริงต้องผ่านทั้ง config + environment `PUBLISHER_ALLOW_WRITES=I_UNDERSTAND_EXTERNAL_SIDE_EFFECTS`
 - scheduler ต้องผ่าน config + environment `PUBLISHER_SCHEDULER_ENABLED=true`
-- หลังเรียก external `/post` แล้วผลไม่ชัดเจนจะเป็น `post_outcome_unknown`, block เพจและไม่ retry Reel
+- หลังเรียก external `/post` แล้วผลไม่ชัดเจนจะเป็น `post_outcome_unknown`, block เพจและไม่ retry Reel; ถ้า process ตายคา `posting` ระบบจะจัดเป็น `stale_posting_review` หลัง 15 นาทีและรอผูก exact existing story เท่านั้น
 - `success` ต้องเห็น Graph post `is_published=true`, comment เป็น Page, ข้อความตรง และ comment อยู่ใน story collection
 
 ## Production flow
@@ -31,6 +31,7 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup เฉพาะ spool; source archive คงถาวร
 11. scheduler ไล่ดู due Page ตามลำดับอย่างยุติธรรม: Page ที่ติด reconcile/lease/source policy ถูกข้ามเฉพาะรอบนั้น แต่ยังเริ่ม post attempt ได้สูงสุดหนึ่ง Page ต่อ tick จึงไม่ burst catch-up
 12. comment-only backlog แยก retry ทีละหนึ่ง attempt ต่อ tick ด้วย exponential backoff 5 นาทีถึง 6 ชั่วโมง; failure ทุกช่วงของ retry จะเลื่อนเวลารอบถัดไป และ Page ที่ lease ไม่ว่างจะถูกข้ามเพื่อไม่กีดกัน backlog อื่น; repair ใช้ story เดิมและไม่เรียก `/post`
+13. startup/tick classifier ย้าย `posting` ที่เก่าและไม่มี Facebook IDs ไป `stale_posting_review`; recovery ต้องอ่าน story+video สด ตรวจ Page, caption digest, attachment target และเวลาใกล้ attempt ก่อน bind IDs เข้ารายการเดิม แล้วเดิน final link/comment/readback เท่านั้น
 
 SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, comment retry count/next retry, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ attempt เดิมเท่านั้น; ห้ามสร้าง Reel ซ้ำ
 
@@ -61,6 +62,16 @@ Recovery หลัง post สำเร็จแต่ comment/readback ล้�
 PUBLISHER_ALLOW_WRITES=I_UNDERSTAND_EXTERNAL_SIDE_EFFECTS \
 python3 main.py --config "$HOME/Library/Application Support/VideoAffiliatePublisher/config.json" \
 reconcile-attempt --attempt-id ATTEMPT_ID
+```
+
+Recovery หลัง process ตายระหว่าง `/post` แต่พบ Reel เดิมแบบ exact:
+
+```bash
+PUBLISHER_ALLOW_WRITES=I_UNDERSTAND_EXTERNAL_SIDE_EFFECTS \
+python3 main.py --config "$HOME/Library/Application Support/VideoAffiliatePublisher/config.json" \
+recover-existing-story --attempt-id ATTEMPT_ID \
+  --story-id PAGEID_POSTTAIL --video-id VIDEO_ID \
+  --expected-caption-sha256 CAPTION_SHA256
 ```
 
 ## Cutover / rollback

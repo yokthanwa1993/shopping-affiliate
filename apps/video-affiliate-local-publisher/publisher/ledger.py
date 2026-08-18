@@ -13,7 +13,7 @@ class LedgerError(RuntimeError):
 
 
 POSTED_STATES = (
-    "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
+    "existing_story_bound", "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
     "post_success_comment_failed", "post_success_verification_failed", "success",
 )
 COMMENT_RETRY_BASE_SECONDS = 5 * 60
@@ -23,7 +23,8 @@ TERMINAL_STATES = (
     "post_success_verification_failed", "blocked_human_gate", "success", "shadow_ready",
 )
 PAGE_BLOCKING_STATES = (
-    "posting", "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
+    "posting", "stale_posting_review", "existing_story_bound", "post_confirmed",
+    "final_shortlink_ok", "comment_pending", "verifying",
     "post_outcome_unknown", "post_success_verification_failed",
 )
 ALLOWED_TRANSITIONS = {
@@ -33,7 +34,9 @@ ALLOWED_TRANSITIONS = {
     "avatar_composing": {"avatar_ready", "failed_pre_post"},
     "avatar_ready": {"shortlink_preflight_ok", "shadow_ready", "failed_pre_post"},
     "shortlink_preflight_ok": {"posting", "failed_pre_post", "blocked_human_gate"},
-    "posting": {"post_confirmed", "post_outcome_unknown"},
+    "posting": {"post_confirmed", "stale_posting_review", "post_outcome_unknown"},
+    "stale_posting_review": {"existing_story_bound", "post_outcome_unknown"},
+    "existing_story_bound": {"final_shortlink_ok", "post_success_comment_failed"},
     "post_confirmed": {"final_shortlink_ok", "post_success_comment_failed"},
     "final_shortlink_ok": {"comment_pending", "post_success_comment_failed"},
     "comment_pending": {"verifying", "post_success_comment_failed"},
@@ -122,11 +125,11 @@ CREATE TABLE IF NOT EXISTS post_attempts(
 DROP INDEX IF EXISTS ux_posted_page_content;
 CREATE UNIQUE INDEX ux_posted_page_content
   ON post_attempts(page_id,studio_content_id)
-  WHERE state IN ('post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
+  WHERE state IN ('existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
 DROP INDEX IF EXISTS ux_posted_page_sha;
 CREATE UNIQUE INDEX ux_posted_page_sha
   ON post_attempts(page_id,source_sha256)
-  WHERE source_sha256!='' AND state IN ('post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
+  WHERE source_sha256!='' AND state IN ('existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
 CREATE TABLE IF NOT EXISTS leases(
   lease_key TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL,
@@ -384,6 +387,73 @@ class Ledger:
                 WHERE studio_content_id=? AND source_sha256=?
             """, (int(content_id), str(sha256 or "").strip().lower())).fetchone()
             return dict(row) if row else None
+
+    def classify_stale_posting(self, stale_after_seconds: int,
+                               now: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Move abandoned Facebook writes to a fail-closed review state."""
+        current = int(now or time.time())
+        threshold = current - max(300, int(stale_after_seconds))
+        classified: List[Dict[str, Any]] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = list(conn.execute("""
+                SELECT attempt_id,page_id,studio_content_id,source_sha256,updated_at
+                FROM post_attempts
+                WHERE state='posting'
+                  AND TRIM(COALESCE(fb_story_id,''))=''
+                  AND TRIM(COALESCE(fb_video_id,''))=''
+                  AND updated_at<=?
+                ORDER BY updated_at,attempt_id
+            """, (threshold,)))
+            for row in rows:
+                fields = {
+                    "error_code": "stale_posting_requires_existing_story_recovery",
+                    "error_detail_redacted": "process_ended_after_post_invocation; repost_forbidden",
+                }
+                cur = conn.execute("""
+                    UPDATE post_attempts
+                    SET state='stale_posting_review',error_code=?,error_detail_redacted=?,
+                        updated_at=?,completed_at=NULL
+                    WHERE attempt_id=? AND state='posting'
+                      AND TRIM(COALESCE(fb_story_id,''))=''
+                      AND TRIM(COALESCE(fb_video_id,''))=''
+                      AND updated_at<=?
+                """, (
+                    fields["error_code"], fields["error_detail_redacted"], current,
+                    str(row["attempt_id"]), threshold,
+                ))
+                if cur.rowcount != 1:
+                    continue
+                conn.execute("""
+                    INSERT INTO events(attempt_id,old_state,new_state,detail_json,created_at)
+                    VALUES(?,?,?,?,?)
+                """, (
+                    str(row["attempt_id"]), "posting", "stale_posting_review",
+                    json.dumps(fields, ensure_ascii=False), current,
+                ))
+                classified.append(dict(row))
+            conn.commit()
+        return classified
+
+    def bind_existing_story(self, attempt_id: str, *, fb_story_id: str,
+                            fb_post_tail: str, fb_video_id: str, permalink: str,
+                            posting_source: str, posted_at: int) -> None:
+        """Audit-bind one verified Facebook story to its original stale attempt."""
+        story_id = str(fb_story_id or "").strip()
+        post_tail = str(fb_post_tail or "").strip()
+        video_id = str(fb_video_id or "").strip()
+        if not story_id or not post_tail.isdigit() or not video_id.isdigit():
+            raise LedgerError("existing_story_identity_invalid")
+        self.transition(attempt_id, "existing_story_bound", {
+            "fb_story_id": story_id,
+            "fb_post_tail": post_tail,
+            "fb_video_id": video_id,
+            "permalink": str(permalink or "").strip(),
+            "posting_source": str(posting_source or "").strip(),
+            "posted_at": int(posted_at),
+            "error_code": "",
+            "error_detail_redacted": "",
+        })
 
     def attempt(self, attempt_id: str) -> sqlite3.Row:
         with self.connect() as conn:

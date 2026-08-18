@@ -110,18 +110,36 @@ class IDBridgeClient:
             raise IDBridgeError("shopee_accounts_invalid")
         return [row for row in data if isinstance(row, dict)]
 
-    def shorten(self, product_url: str, account: str, affiliate_id: str,
-                sub1: str, sub2: str, sub3: str) -> str:
+    def shorten_verified(self, product_url: str, account: str, affiliate_id: str,
+                         sub1: str, sub2: str, sub3: str) -> Dict[str, str]:
         payload = self._request("/shorten", method="POST", timeout=180, body={
             "url": product_url, "account": account, "affiliate_id": affiliate_id,
             "sub1": sub1, "sub2": sub2, "sub3": sub3,
         })
-        if not isinstance(payload, dict) or payload.get("ok") is False:
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
             raise IDBridgeError("shorten_failed")
         link = str(payload.get("shortLink") or payload.get("shortlink") or payload.get("short_link") or "").strip()
         if not link.startswith("https://s.shopee.co.th/"):
             raise IDBridgeError("shorten_result_invalid")
-        return link
+        expected_utm = f"{str(sub1).strip()}-{str(sub2).strip()}-{str(sub3).strip()}--"
+        if payload.get("affiliateVerified") is not True:
+            raise IDBridgeError("shorten_affiliate_unverified")
+        if str(payload.get("utmContent") or "").strip() != expected_utm:
+            raise IDBridgeError("shorten_tracking_mismatch")
+        canonical = str(payload.get("canonicalUrl") or "").strip()
+        if not canonical.startswith("https://shopee.co.th/product/"):
+            raise IDBridgeError("shorten_canonical_invalid")
+        return {
+            "shortlink": link,
+            "canonical_url": canonical,
+            "utm_content": expected_utm,
+        }
+
+    def shorten(self, product_url: str, account: str, affiliate_id: str,
+                sub1: str, sub2: str, sub3: str) -> str:
+        return self.shorten_verified(
+            product_url, account, affiliate_id, sub1, sub2, sub3,
+        )["shortlink"]
 
     def post(self, page_id: str, video_url: str, message: str, account: str,
              expected_source: str = "facebook_lite_eaad6") -> Dict[str, str]:

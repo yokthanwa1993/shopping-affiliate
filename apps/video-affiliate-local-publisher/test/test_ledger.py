@@ -287,3 +287,61 @@ class LedgerTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["next_due_at"], 2_800)
         self.assertIsNone(row["last_success_at"])
+
+    def test_stale_posting_is_classified_fail_closed_without_post_identity(self):
+        attempt = self.ledger.claim_attempt("p1", 120, "stale-slot", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting",
+        ]:
+            self.ledger.transition(attempt, state)
+        with self.ledger.connect() as conn:
+            conn.execute(
+                "UPDATE post_attempts SET updated_at=? WHERE attempt_id=?",
+                (100, attempt),
+            )
+        classified = self.ledger.classify_stale_posting(900, now=1_001)
+        self.assertEqual([row["attempt_id"] for row in classified], [attempt])
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "stale_posting_review")
+        self.assertEqual(row["fb_story_id"], "")
+        self.assertEqual(row["fb_video_id"], "")
+        self.assertIn("repost_forbidden", row["error_detail_redacted"])
+
+    def test_fresh_posting_is_not_classified_stale(self):
+        attempt = self.ledger.claim_attempt("p1", 121, "fresh-slot", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting",
+        ]:
+            self.ledger.transition(attempt, state)
+        with self.ledger.connect() as conn:
+            conn.execute(
+                "UPDATE post_attempts SET updated_at=? WHERE attempt_id=?",
+                (500, attempt),
+            )
+        self.assertEqual(self.ledger.classify_stale_posting(900, now=1_001), [])
+        self.assertEqual(self.ledger.attempt(attempt)["state"], "posting")
+
+    def test_bind_existing_story_is_audited_and_counts_as_posted(self):
+        attempt = self.ledger.claim_attempt("p1", 122, "bound-slot", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "stale_posting_review",
+        ]:
+            fields = {"source_sha256": "e" * 64} if state == "downloaded" else None
+            self.ledger.transition(attempt, state, fields)
+        self.ledger.bind_existing_story(
+            attempt,
+            fb_story_id="p1_987",
+            fb_post_tail="987",
+            fb_video_id="654",
+            permalink="https://facebook.test/reel/654",
+            posting_source="facebook_lite_eaad6",
+            posted_at=1_000,
+        )
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "existing_story_bound")
+        self.assertEqual(row["fb_story_id"], "p1_987")
+        self.assertEqual(self.ledger.used_content_ids("p1"), {122})
+        self.assertTrue(self.ledger.page_has_sha("p1", "e" * 64))

@@ -67,6 +67,7 @@ class AppConfig:
     keep_shadow_spool: bool
     source_max_bytes: int
     comment_delay_seconds: int
+    stale_posting_seconds: int
     pages: List[PageConfig]
 
 
@@ -200,6 +201,7 @@ def load_config(path: Optional[Path] = None) -> AppConfig:
         keep_shadow_spool=_boolean(raw.get("keep_shadow_spool"), True),
         source_max_bytes=max(1_000_000, int(raw.get("source_max_bytes") or 262_144_000)),
         comment_delay_seconds=max(0, int(raw.get("comment_delay_seconds") or 30)),
+        stale_posting_seconds=max(300, int(raw.get("stale_posting_seconds") or 15 * 60)),
         pages=pages,
     )
 

@@ -13,6 +13,7 @@ class Reconciler:
 
     def pending(self) -> Dict[str, List[Dict[str, Any]]]:
         return {
+            "stale_posting_reviews": self.ledger.attempts_in_states(["stale_posting_review"]),
             "unknown_post_outcomes": self.ledger.attempts_in_states(["post_outcome_unknown"]),
             "comment_only_retries": self.ledger.attempts_in_states(["post_success_comment_failed"]),
             "due_comment_only_retries": self.ledger.due_comment_retries(limit=1000),

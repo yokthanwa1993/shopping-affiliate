@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 import uuid
@@ -46,6 +47,7 @@ class PublisherEngine:
         self.notifier = Notifier()
         for page in config.pages:
             self.ledger.sync_page(page)
+        self.ledger.classify_stale_posting(config.stale_posting_seconds)
 
     @property
     def idbridge(self) -> IDBridgeClient:
@@ -177,6 +179,119 @@ class PublisherEngine:
             if str(author.get("id") or "") == page.page_id:
                 return str(row.get("id") or "").strip()
         return ""
+
+    @staticmethod
+    def _caption_digest(value: str) -> str:
+        return hashlib.sha256(str(value or "").strip().encode("utf-8")).hexdigest()
+
+    def recover_existing_story(self, attempt_id: str, *, story_id: str,
+                               video_id: str, expected_caption_sha256: str) -> Dict[str, Any]:
+        """Bind and finish one already-published Reel without calling `/post`."""
+        if not self.config.writes_enabled:
+            raise PublisherError("external_writes_disabled")
+        initial = self.ledger.attempt(attempt_id)
+        if str(initial["state"]) not in {"posting", "stale_posting_review"}:
+            raise PublisherError("existing_story_recovery_state_invalid")
+        page = self.page(str(initial["page_id"]))
+        canonical, post_tail = self.canonical_story(page.page_id, story_id)
+        video_id = str(video_id or "").strip()
+        if not video_id.isdigit():
+            raise PublisherError("existing_story_video_id_invalid")
+        expected_digest = str(expected_caption_sha256 or "").strip().lower()
+        if len(expected_digest) != 64 or any(ch not in "0123456789abcdef" for ch in expected_digest):
+            raise PublisherError("existing_story_caption_digest_invalid")
+
+        source = self.ledger.source_item(int(initial["studio_content_id"]))
+        source_sha256 = str(initial["source_sha256"] or "").strip().lower()
+        if len(source_sha256) != 64 or str(source.get("source_sha256") or "").strip().lower() != source_sha256:
+            raise PublisherError("existing_story_source_identity_mismatch")
+        archive = self.ledger.source_archive(int(initial["studio_content_id"]), source_sha256)
+        if not archive:
+            raise PublisherError("existing_story_source_archive_missing")
+        archived = self.spool.inspect(Path(str(archive["archive_path"])))
+        if archived.sha256 != source_sha256 or archived.bytes != int(archive["archive_bytes"]):
+            raise PublisherError("existing_story_source_archive_mismatch")
+        expected_caption = page.caption_template.format(caption=str(source["caption"])).strip()
+        if not expected_caption or URL_PATTERN.search(expected_caption):
+            raise PublisherError("existing_story_source_caption_invalid")
+        if self._caption_digest(expected_caption) != expected_digest:
+            raise PublisherError("existing_story_expected_caption_changed")
+
+        story = self.idbridge.graph_get(
+            page.power_editor_account, canonical,
+            {"fields": "id,message,created_time,permalink_url,from,is_published,attachments{target{id}}"},
+        )
+        if str(story.get("id") or "") != canonical or story.get("is_published") is not True:
+            raise PublisherError("existing_story_readback_failed")
+        author = story.get("from") if isinstance(story.get("from"), dict) else {}
+        if str(author.get("id") or "") != page.page_id:
+            raise PublisherError("existing_story_author_mismatch")
+        if self._caption_digest(str(story.get("message") or "")) != expected_digest:
+            raise PublisherError("existing_story_caption_mismatch")
+        attachments_raw = story.get("attachments")
+        attachments: Dict[str, Any] = attachments_raw if isinstance(attachments_raw, dict) else {}
+        attachment_rows_raw = attachments.get("data")
+        attachment_rows = attachment_rows_raw if isinstance(attachment_rows_raw, list) else []
+        target_ids = {
+            str((row.get("target") or {}).get("id") or "")
+            for row in attachment_rows
+            if isinstance(row, dict) and isinstance(row.get("target"), dict)
+        }
+        if video_id not in target_ids:
+            raise PublisherError("existing_story_video_mismatch")
+
+        video = self.idbridge.graph_get(
+            page.power_editor_account, video_id,
+            {"fields": "id,description,created_time,permalink_url,from,published"},
+        )
+        video_author_raw = video.get("from")
+        video_author: Dict[str, Any] = video_author_raw if isinstance(video_author_raw, dict) else {}
+        if str(video.get("id") or "") != video_id or video.get("published") is not True:
+            raise PublisherError("existing_video_readback_failed")
+        if str(video_author.get("id") or "") != page.page_id:
+            raise PublisherError("existing_video_author_mismatch")
+        if self._caption_digest(str(video.get("description") or "")) != expected_digest:
+            raise PublisherError("existing_video_caption_mismatch")
+        story_created = str(story.get("created_time") or "")
+        if not story_created or story_created != str(video.get("created_time") or ""):
+            raise PublisherError("existing_story_time_mismatch")
+        try:
+            from datetime import datetime
+            posted_at = int(datetime.fromisoformat(story_created.replace("Z", "+00:00")).timestamp())
+        except (TypeError, ValueError) as exc:
+            raise PublisherError("existing_story_time_invalid") from exc
+        created_at = int(initial["created_at"] or 0)
+        if created_at <= 0 or abs(posted_at - created_at) > 15 * 60:
+            raise PublisherError("existing_story_time_outside_attempt_window")
+
+        owner = "recover-existing-" + uuid.uuid4().hex
+        page_key = "page:" + page.page_id
+        if not self.ledger.acquire_lease(page_key, owner, 900):
+            return {
+                "ok": False, "state": "skipped", "reason": "page_lease_busy",
+                "attempt_id": attempt_id, "page_id": page.page_id,
+            }
+        try:
+            current = self.ledger.attempt(attempt_id)
+            current_state = str(current["state"])
+            if current_state == "posting":
+                self.ledger.transition(attempt_id, "stale_posting_review", {
+                    "error_code": "operator_verified_existing_story",
+                    "error_detail_redacted": "exact_story_readback_passed; repost_forbidden",
+                })
+            elif current_state != "stale_posting_review":
+                raise PublisherError("existing_story_recovery_state_changed")
+            self.ledger.bind_existing_story(
+                attempt_id, fb_story_id=canonical, fb_post_tail=post_tail,
+                fb_video_id=video_id, permalink=str(story.get("permalink_url") or ""),
+                posting_source=page.posting_source, posted_at=posted_at,
+            )
+            self.ledger.advance_page_after_post(
+                page.page_id, page.interval_minutes, now=posted_at,
+            )
+            return self._reconcile_attempt_locked(attempt_id)
+        finally:
+            self.ledger.release_lease(page_key, owner)
 
     def _preflight_identity(self, page: PageConfig) -> None:
         self.idbridge.ensure_page(
@@ -500,7 +615,7 @@ class PublisherEngine:
         row = self.ledger.attempt(attempt_id)
         state = str(row["state"])
         recoverable = {
-            "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
+            "existing_story_bound", "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
             "post_success_comment_failed", "post_success_verification_failed",
         }
         if state not in recoverable:
@@ -511,12 +626,13 @@ class PublisherEngine:
         if not story_id:
             raise PublisherError("reconcile_story_missing")
         final_link = str(row["final_shortlink"] or "")
-        if state == "post_confirmed" or not final_link:
+        if state in {"existing_story_bound", "post_confirmed"} or not final_link:
             source = self.ledger.source_item(int(row["studio_content_id"]))
-            final_link = self.idbridge.shorten(
+            final_link_proof = self.idbridge.shorten_verified(
                 str(source["shopee_url"]), page.shopee_account, page.affiliate_id,
                 page.campaign_sub1, page.page_id, str(row["fb_post_tail"] or ""),
             )
+            final_link = final_link_proof["shortlink"]
             self.ledger.transition(attempt_id, "final_shortlink_ok", {"final_shortlink": final_link})
             state = "final_shortlink_ok"
         comment = page.comment_template.format(shortlink=final_link).strip()
@@ -578,6 +694,7 @@ class PublisherEngine:
         return self.reconcile_attempt(attempt_id)
 
     def run_due_once(self, at: Optional[int] = None) -> Dict[str, Any]:
+        self.ledger.classify_stale_posting(self.config.stale_posting_seconds, now=at)
         due = self.ledger.due_pages(now=at)
         if not due:
             return {"ok": True, "state": "idle", "due_pages": 0}

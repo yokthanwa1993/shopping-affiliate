@@ -24,7 +24,15 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.pages[0].avatar_enabled)
         self.assertEqual(config.pages[0].daily_success_limit, 0)
         self.assertEqual(config.pages[0].reuse_success_from_page_id, "")
+        self.assertEqual(config.stale_posting_seconds, 15 * 60)
         self.assertEqual(config.host, "127.0.0.1")
+
+    def test_stale_posting_threshold_has_conservative_minimum(self):
+        config = self.make({
+            "stale_posting_seconds": 1,
+            "pages": [{"page_id": "1008898512617594"}],
+        })
+        self.assertEqual(config.stale_posting_seconds, 300)
 
     def test_example_config_never_points_at_production_ledger(self):
         example = Path(__file__).resolve().parents[1] / "config.example.json"

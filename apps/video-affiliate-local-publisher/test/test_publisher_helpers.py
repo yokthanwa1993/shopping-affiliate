@@ -334,8 +334,169 @@ class PublisherHelpersTests(unittest.TestCase):
             ("comment_pending", "verifying"),
         ])
 
+    def test_recover_existing_story_binds_exact_story_and_never_reposts(self):
+        caption = "exact caption"
+
+        class FakeBridge:
+            def __init__(self):
+                self.post_calls = 0
+                self.comment_message = ""
+
+            def graph_get(self, account, path, params):
+                del account
+                if path == "100_200":
+                    return {
+                        "id": path, "message": caption,
+                        "created_time": "1970-01-01T00:16:40+00:00",
+                        "permalink_url": "https://facebook.test/reel/300",
+                        "from": {"id": "100"}, "is_published": True,
+                        "attachments": {"data": [{"target": {"id": "300"}}]},
+                    }
+                if path == "300":
+                    return {
+                        "id": "300", "description": caption,
+                        "created_time": "1970-01-01T00:16:40+00:00",
+                        "permalink_url": "https://facebook.test/reel/300",
+                        "from": {"id": "100"}, "published": True,
+                    }
+                if path == "100":
+                    return {"id": "100"}
+                if path == "100_200/comments":
+                    if params.get("fields") == "id,message,from":
+                        return {"data": []}
+                    return {"data": [{"id": "comment-1"}]}
+                if path == "comment-1":
+                    return {
+                        "id": "comment-1", "parent": {"id": "100_200"},
+                        "from": {"id": "100"}, "message": self.comment_message,
+                    }
+                raise AssertionError(path)
+
+            def post(self, *args):
+                self.post_calls += 1
+                raise AssertionError("must_not_repost")
+
+            def ensure_page(self, *args):
+                return None
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def shorten(self, product_url, account, affiliate_id, sub1, sub2, sub3):
+                del product_url, account, affiliate_id, sub1, sub2
+                return "https://s.shopee.co.th/final" if sub3 else "https://s.shopee.co.th/pre"
+
+            def shorten_verified(self, product_url, account, affiliate_id, sub1, sub2, sub3):
+                return {
+                    "shortlink": self.shorten(
+                        product_url, account, affiliate_id, sub1, sub2, sub3,
+                    ),
+                    "canonical_url": "https://shopee.co.th/product/1/124",
+                    "utm_content": f"{sub1}-{sub2}-{sub3}--",
+                }
+
+            def page_comment(self, page_id, story_id, message, account):
+                del page_id, story_id, account
+                self.comment_message = message
+                return "comment-1"
+
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            item = SimpleNamespace(
+                content_id=124, editor_message_id="message-124",
+                shopee_url="https://shopee.co.th/product/1/124",
+                lazada_url="https://www.lazada.co.th/products/example-i124.html",
+                caption=caption, ready_at="1970-01-01T00:00:00Z",
+            )
+            ledger.upsert_source(item, "attachment-124", "f" * 64)
+            archive_path = Path(root) / "archive-124.mp4"
+            ledger.record_source_archive(124, "f" * 64, archive_path, 200_000, now=900)
+            attempt = ledger.claim_attempt("100", 124, "recover-slot", "scheduler")
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting", "stale_posting_review",
+            ]:
+                fields = {"source_sha256": "f" * 64} if state == "downloaded" else None
+                ledger.transition(attempt, state, fields)
+            with ledger.connect() as conn:
+                conn.execute(
+                    "UPDATE post_attempts SET created_at=?,updated_at=? WHERE attempt_id=?",
+                    (995, 1_000, attempt),
+                )
+            page = cast(Any, SimpleNamespace(
+                page_id="100", name="page", enabled=True, interval_minutes=20,
+                facebook_account="uid", power_editor_account="peuid",
+                posting_source="facebook_lite_eaad6",
+                shopee_account="15130770000", affiliate_id="15130770000",
+                campaign_sub1="campaign", caption_template="{caption}",
+                comment_template="{shortlink}\ncomment",
+            ))
+            bridge = FakeBridge()
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.config = cast(Any, SimpleNamespace(
+                writes_enabled=True, pages=[page], comment_delay_seconds=0,
+            ))
+            engine.ledger = ledger
+            engine._idbridge = cast(Any, bridge)
+            engine.spool = cast(Any, SimpleNamespace(
+                inspect=lambda path: SimpleNamespace(
+                    path=path, sha256="f" * 64, bytes=200_000,
+                ),
+                cleanup=lambda _attempt_id: None,
+            ))
+            engine.notifier = cast(Any, SimpleNamespace(send=lambda *args, **kwargs: None))
+            result = engine.recover_existing_story(
+                attempt,
+                story_id="100_200",
+                video_id="300",
+                expected_caption_sha256=PublisherEngine._caption_digest(caption),
+            )
+            self.assertEqual(result["state"], "success")
+            self.assertEqual(bridge.post_calls, 0)
+            recovered = ledger.attempt(attempt)
+            self.assertEqual(recovered["fb_story_id"], "100_200")
+            self.assertEqual(recovered["fb_video_id"], "300")
+            self.assertEqual(recovered["comment_id"], "comment-1")
+
+    def test_recover_existing_story_fails_before_mutation_on_caption_mismatch(self):
+        class FakeLedger:
+            def attempt(self, _attempt_id):
+                return {
+                    "state": "stale_posting_review", "page_id": "100",
+                    "studio_content_id": 1, "source_sha256": "a" * 64,
+                }
+
+            def source_item(self, _content_id):
+                return {
+                    "caption": "expected", "studio_content_id": 1,
+                    "source_sha256": "a" * 64,
+                    "editor_message_id": "message", "shopee_url": "https://shopee.co.th/product/1/1",
+                    "lazada_url": "https://www.lazada.co.th/products/example.html", "ready_at": "",
+                }
+
+            def source_archive(self, _content_id, _sha256):
+                return {"archive_path": "/archive.mp4", "archive_bytes": 200_000}
+
+        page = cast(Any, SimpleNamespace(page_id="100", caption_template="{caption}"))
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(writes_enabled=True, pages=[page]))
+        engine.ledger = cast(Any, FakeLedger())
+        engine.spool = cast(Any, SimpleNamespace(
+            inspect=lambda path: SimpleNamespace(
+                path=path, sha256="a" * 64, bytes=200_000,
+            ),
+        ))
+        with self.assertRaisesRegex(PublisherError, "existing_story_expected_caption_changed"):
+            engine.recover_existing_story(
+                "attempt", story_id="100_200", video_id="300",
+                expected_caption_sha256=PublisherEngine._caption_digest("wrong"),
+            )
+
     def test_scheduler_skips_blocked_oldest_page_and_runs_next_due_page(self):
         class FakeLedger:
+            def classify_stale_posting(self, *args, **kwargs):
+                return []
+
             def due_pages(self, now=None):
                 return [
                     {"page_id": "review", "next_due_at": 100},
@@ -343,7 +504,9 @@ class PublisherHelpersTests(unittest.TestCase):
                 ]
 
         engine = PublisherEngine.__new__(PublisherEngine)
-        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.config = cast(Any, SimpleNamespace(
+            writes_enabled=True, stale_posting_seconds=900,
+        ))
         engine.ledger = cast(Any, FakeLedger())
         calls = []
 
@@ -366,6 +529,9 @@ class PublisherHelpersTests(unittest.TestCase):
 
     def test_scheduler_runs_at_most_one_post_attempt_per_tick(self):
         class FakeLedger:
+            def classify_stale_posting(self, *args, **kwargs):
+                return []
+
             def due_pages(self, now=None):
                 return [
                     {"page_id": "oldest", "next_due_at": 100},
@@ -373,7 +539,9 @@ class PublisherHelpersTests(unittest.TestCase):
                 ]
 
         engine = PublisherEngine.__new__(PublisherEngine)
-        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.config = cast(Any, SimpleNamespace(
+            writes_enabled=True, stale_posting_seconds=900,
+        ))
         engine.ledger = cast(Any, FakeLedger())
         calls = []
 
@@ -389,6 +557,9 @@ class PublisherHelpersTests(unittest.TestCase):
 
     def test_scheduler_does_not_create_a_second_post_after_success(self):
         class FakeLedger:
+            def classify_stale_posting(self, *args, **kwargs):
+                return []
+
             def due_pages(self, now=None):
                 return [
                     {"page_id": "oldest", "next_due_at": 100},
@@ -396,7 +567,9 @@ class PublisherHelpersTests(unittest.TestCase):
                 ]
 
         engine = PublisherEngine.__new__(PublisherEngine)
-        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.config = cast(Any, SimpleNamespace(
+            writes_enabled=True, stale_posting_seconds=900,
+        ))
         engine.ledger = cast(Any, FakeLedger())
         calls = []
 

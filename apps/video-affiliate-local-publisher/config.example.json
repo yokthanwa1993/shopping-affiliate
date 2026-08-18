@@ -13,6 +13,7 @@
   "writes_enabled": false,
   "scheduler_enabled": false,
   "manual_api_enabled": false,
+  "stale_posting_seconds": 900,
   "pages": [
     {
       "page_id": "1008898512617594",

@@ -25,6 +25,11 @@ def parser() -> argparse.ArgumentParser:
     retry.add_argument("--attempt-id", required=True)
     reconcile = commands.add_parser("reconcile-attempt")
     reconcile.add_argument("--attempt-id", required=True)
+    recover = commands.add_parser("recover-existing-story")
+    recover.add_argument("--attempt-id", required=True)
+    recover.add_argument("--story-id", required=True)
+    recover.add_argument("--video-id", required=True)
+    recover.add_argument("--expected-caption-sha256", required=True)
     resolve = commands.add_parser("resolve-no-post")
     resolve.add_argument("--attempt-id", required=True)
     resolve.add_argument("--evidence-code", required=True)
@@ -70,6 +75,15 @@ def main(argv=None) -> int:
             result = engine.reconcile_attempt(args.attempt_id)
             print(json.dumps(result, ensure_ascii=False))
             return 0
+        if args.command == "recover-existing-story":
+            result = engine.recover_existing_story(
+                args.attempt_id,
+                story_id=args.story_id,
+                video_id=args.video_id,
+                expected_caption_sha256=args.expected_caption_sha256,
+            )
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get("ok") else 2
         if args.command == "serve":
             PublisherHTTPServer(engine).serve_forever()
             return 0

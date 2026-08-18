@@ -25,7 +25,13 @@ class IDBridgeClientTests(unittest.TestCase):
                 body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))) or b"{}")
                 if self.path == "/post": return self.reply({"ok":True,"source":"facebook_lite_eaad6","story_id":"p1_post","video_id":"video","post_url":"https://facebook.test/p1_post"})
                 if self.path == "/page-comment": return self.reply({"ok":True,"id":"comment","author_expected":"page"})
-                if self.path == "/shorten": return self.reply({"ok":True,"shortLink":"https://s.shopee.co.th/final"})
+                if self.path == "/shorten": return self.reply({
+                    "ok": True,
+                    "shortLink": "https://s.shopee.co.th/final",
+                    "canonicalUrl": "https://shopee.co.th/product/1/2",
+                    "affiliateVerified": True,
+                    "utmContent": "c-p1-post--",
+                })
                 return self.reply({"error":"not_found"},404)
             def log_message(self,*args): pass
         self.server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
@@ -39,3 +45,20 @@ class IDBridgeClientTests(unittest.TestCase):
         post=self.client.post("p1","http://127.0.0.1/video","caption","uid")
         self.assertEqual(post["source"],"facebook_lite_eaad6")
         self.assertEqual(self.client.page_comment("p1","p1_post","link","uid"),"comment")
+
+    def test_shorten_fails_closed_when_verified_tracking_is_missing(self):
+        class BadClient(IDBridgeClient):
+            def _request(self, *args, **kwargs):
+                return {
+                    "ok": True,
+                    "shortLink": "https://s.shopee.co.th/final",
+                    "canonicalUrl": "https://shopee.co.th/product/1/2",
+                    "affiliateVerified": True,
+                    "utmContent": "wrong",
+                }
+
+        with self.assertRaisesRegex(IDBridgeError, "shorten_tracking_mismatch"):
+            BadClient("http://127.0.0.1:1", "secret").shorten(
+                "https://shopee.co.th/product/1/2",
+                "15130770000", "15130770000", "c", "p1", "post",
+            )
