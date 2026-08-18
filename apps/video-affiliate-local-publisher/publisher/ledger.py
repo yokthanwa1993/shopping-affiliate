@@ -16,6 +16,8 @@ POSTED_STATES = (
     "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
     "post_success_comment_failed", "post_success_verification_failed", "success",
 )
+COMMENT_RETRY_BASE_SECONDS = 5 * 60
+COMMENT_RETRY_MAX_SECONDS = 6 * 60 * 60
 TERMINAL_STATES = (
     "failed_pre_post", "post_outcome_unknown", "post_success_comment_failed",
     "post_success_verification_failed", "blocked_human_gate", "success", "shadow_ready",
@@ -109,6 +111,8 @@ CREATE TABLE IF NOT EXISTS post_attempts(
   posting_source TEXT NOT NULL DEFAULT '',
   error_code TEXT NOT NULL DEFAULT '',
   error_detail_redacted TEXT NOT NULL DEFAULT '',
+  comment_retry_count INTEGER NOT NULL DEFAULT 0,
+  comment_retry_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   posted_at INTEGER,
@@ -165,6 +169,22 @@ class Ledger:
                 conn.execute(
                     "ALTER TABLE pages ADD COLUMN reuse_success_from_page_id TEXT NOT NULL DEFAULT ''"
                 )
+            attempt_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(post_attempts)")
+            }
+            if "comment_retry_count" not in attempt_columns:
+                conn.execute(
+                    "ALTER TABLE post_attempts ADD COLUMN comment_retry_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "comment_retry_at" not in attempt_columns:
+                conn.execute("ALTER TABLE post_attempts ADD COLUMN comment_retry_at INTEGER")
+            conn.execute("""
+                UPDATE post_attempts
+                SET comment_retry_count=CASE
+                      WHEN comment_retry_count<1 THEN 1 ELSE comment_retry_count END,
+                    comment_retry_at=COALESCE(comment_retry_at,updated_at)
+                WHERE state='post_success_comment_failed'
+            """)
         self.path.chmod(0o600)
 
     def sync_page(self, page: Any) -> None:
@@ -380,7 +400,8 @@ class Ledger:
         allowed_fields = {
             "source_sha256", "avatar_version", "fb_video_id", "fb_story_id", "fb_post_tail",
             "permalink", "comment_id", "preflight_shortlink", "final_shortlink", "posting_source",
-            "error_code", "error_detail_redacted", "posted_at", "completed_at",
+            "error_code", "error_detail_redacted", "comment_retry_count", "comment_retry_at",
+            "posted_at", "completed_at",
         }
         if any(key not in allowed_fields for key in fields):
             raise LedgerError("attempt_field_invalid")
@@ -413,6 +434,69 @@ class Ledger:
                          (attempt_id, old_state, new_state, json.dumps(fields, ensure_ascii=False), now))
             conn.commit()
 
+    @staticmethod
+    def comment_retry_delay(retry_count: int) -> int:
+        exponent = max(0, int(retry_count) - 1)
+        return min(COMMENT_RETRY_MAX_SECONDS, COMMENT_RETRY_BASE_SECONDS * (2 ** exponent))
+
+    def record_comment_failure(self, attempt_id: str, code: str, detail: str,
+                               now: Optional[int] = None) -> int:
+        current = int(now or time.time())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("""
+                SELECT state,comment_retry_count FROM post_attempts WHERE attempt_id=?
+            """, (attempt_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise LedgerError("attempt_not_found")
+            old_state = str(row["state"])
+            if old_state == "post_success_comment_failed":
+                new_state = old_state
+            elif "post_success_comment_failed" in ALLOWED_TRANSITIONS.get(old_state, set()):
+                new_state = "post_success_comment_failed"
+            else:
+                conn.rollback()
+                raise LedgerError(f"state_transition_invalid:{old_state}:post_success_comment_failed")
+            retry_count = int(row["comment_retry_count"] or 0) + 1
+            retry_at = current + self.comment_retry_delay(retry_count)
+            fields = {
+                "error_code": str(code)[:100],
+                "error_detail_redacted": str(detail)[:240],
+                "comment_retry_count": retry_count,
+                "comment_retry_at": retry_at,
+            }
+            conn.execute("""
+                UPDATE post_attempts
+                SET state=?,error_code=?,error_detail_redacted=?,comment_retry_count=?,
+                    comment_retry_at=?,updated_at=?,completed_at=?
+                WHERE attempt_id=?
+            """, (
+                new_state, fields["error_code"], fields["error_detail_redacted"],
+                retry_count, retry_at, current, current, attempt_id,
+            ))
+            conn.execute("""
+                INSERT INTO events(attempt_id,old_state,new_state,detail_json,created_at)
+                VALUES(?,?,?,?,?)
+            """, (
+                attempt_id, old_state, new_state,
+                json.dumps(fields, ensure_ascii=False), current,
+            ))
+            conn.commit()
+        return retry_at
+
+    def due_comment_retries(self, now: Optional[int] = None, limit: int = 1) -> List[Dict[str, Any]]:
+        current = int(now or time.time())
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM post_attempts
+                WHERE state='post_success_comment_failed'
+                  AND (comment_retry_at IS NULL OR comment_retry_at<=?)
+                ORDER BY COALESCE(comment_retry_at,updated_at),updated_at,attempt_id
+                LIMIT ?
+            """, (current, max(1, int(limit))))
+            return [dict(row) for row in rows]
+
     def fail_pre_post(self, attempt_id: str, code: str, detail: str) -> None:
         row = self.attempt(attempt_id)
         if row["state"] in TERMINAL_STATES:
@@ -440,8 +524,28 @@ class Ledger:
     def advance_page_after_success(self, page_id: str, interval_minutes: int, now: Optional[int] = None) -> None:
         current = int(now or time.time())
         with self.connect() as conn:
-            conn.execute("UPDATE pages SET last_success_at=?,next_due_at=?,updated_at=? WHERE page_id=?",
-                         (current, current + interval_minutes * 60, current, page_id))
+            conn.execute("""
+                UPDATE pages
+                SET last_success_at=?,
+                    next_due_at=CASE
+                      WHEN next_due_at IS NULL OR next_due_at<=? THEN ?
+                      ELSE next_due_at END,
+                    updated_at=?
+                WHERE page_id=?
+            """, (current, current, current + interval_minutes * 60, current, page_id))
+
+    def advance_page_after_post(self, page_id: str, interval_minutes: int,
+                                now: Optional[int] = None) -> None:
+        current = int(now or time.time())
+        with self.connect() as conn:
+            conn.execute("""
+                UPDATE pages
+                SET next_due_at=CASE
+                      WHEN next_due_at IS NULL OR next_due_at<=? THEN ?
+                      ELSE next_due_at END,
+                    updated_at=?
+                WHERE page_id=?
+            """, (current, current + interval_minutes * 60, current, page_id))
 
     def advance_page_after_shadow(self, page_id: str, interval_minutes: int, now: Optional[int] = None) -> None:
         current = int(now or time.time())
@@ -474,6 +578,11 @@ class Ledger:
             archive = conn.execute(
                 "SELECT COUNT(*),COALESCE(SUM(archive_bytes),0) FROM source_archives"
             ).fetchone()
+            due_comment_retries = int(conn.execute("""
+                SELECT COUNT(*) FROM post_attempts
+                WHERE state='post_success_comment_failed'
+                  AND (comment_retry_at IS NULL OR comment_retry_at<=?)
+            """, (int(time.time()),)).fetchone()[0])
             last = conn.execute("SELECT attempt_id,page_id,studio_content_id,state,updated_at,error_code FROM post_attempts ORDER BY updated_at DESC LIMIT 1").fetchone()
             return {
                 "attempts": sum(states.values()),
@@ -481,5 +590,6 @@ class Ledger:
                 "active_leases": active_leases,
                 "source_archives": int(archive[0]),
                 "source_archive_bytes": int(archive[1]),
+                "due_comment_retries": due_comment_retries,
                 "last_attempt": dict(last) if last else None,
             }

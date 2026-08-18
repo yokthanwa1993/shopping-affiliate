@@ -137,6 +137,48 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("daily_success_limit", columns)
         self.assertIn("reuse_success_from_page_id", columns)
 
+    def test_migrate_adds_comment_retry_columns_and_makes_old_failures_due(self):
+        old_path = Path(self.temp.name) / "old-comment.db"
+        conn = sqlite3.connect(old_path)
+        conn.executescript("""
+            CREATE TABLE pages(
+              page_id TEXT PRIMARY KEY,name TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,
+              interval_minutes INTEGER NOT NULL,daily_success_limit INTEGER NOT NULL DEFAULT 0,
+              reuse_success_from_page_id TEXT NOT NULL DEFAULT '',timezone TEXT NOT NULL,
+              next_due_at INTEGER,campaign_sub1 TEXT NOT NULL DEFAULT '',
+              shopee_account TEXT NOT NULL DEFAULT '',affiliate_id TEXT NOT NULL DEFAULT '',
+              facebook_account TEXT NOT NULL DEFAULT '',avatar_path TEXT NOT NULL DEFAULT '',
+              avatar_version TEXT NOT NULL DEFAULT '',caption_template TEXT NOT NULL DEFAULT '{caption}',
+              last_success_at INTEGER,updated_at INTEGER NOT NULL);
+            CREATE TABLE post_attempts(
+              attempt_id TEXT PRIMARY KEY,page_id TEXT NOT NULL,studio_content_id INTEGER NOT NULL,
+              slot_key TEXT NOT NULL,state TEXT NOT NULL,trigger_source TEXT NOT NULL,
+              source_sha256 TEXT NOT NULL DEFAULT '',avatar_version TEXT NOT NULL DEFAULT '',
+              fb_video_id TEXT NOT NULL DEFAULT '',fb_story_id TEXT NOT NULL DEFAULT '',
+              fb_post_tail TEXT NOT NULL DEFAULT '',permalink TEXT NOT NULL DEFAULT '',
+              comment_id TEXT NOT NULL DEFAULT '',preflight_shortlink TEXT NOT NULL DEFAULT '',
+              final_shortlink TEXT NOT NULL DEFAULT '',posting_source TEXT NOT NULL DEFAULT '',
+              error_code TEXT NOT NULL DEFAULT '',error_detail_redacted TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,posted_at INTEGER,
+              completed_at INTEGER,UNIQUE(page_id,slot_key));
+            CREATE TABLE leases(lease_key TEXT PRIMARY KEY,owner_id TEXT NOT NULL,
+              expires_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL);
+            CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT,attempt_id TEXT NOT NULL,
+              old_state TEXT NOT NULL,new_state TEXT NOT NULL,detail_json TEXT NOT NULL DEFAULT '{}',
+              created_at INTEGER NOT NULL);
+        """)
+        conn.execute("""
+            INSERT INTO post_attempts(
+              attempt_id,page_id,studio_content_id,slot_key,state,trigger_source,created_at,updated_at
+            ) VALUES('old','p1',1,'slot','post_success_comment_failed','scheduler',50,75)
+        """)
+        conn.commit(); conn.close()
+        migrated = Ledger(old_path)
+        row = migrated.attempt("old")
+        self.assertEqual(row["comment_retry_count"], 1)
+        self.assertEqual(row["comment_retry_at"], 75)
+        self.assertEqual([item["attempt_id"] for item in migrated.due_comment_retries(now=75)], ["old"])
+
     def test_source_archive_is_sql_backed_and_summarized(self):
         item = SimpleNamespace(
             content_id=77,
@@ -160,3 +202,88 @@ class LedgerTests(unittest.TestCase):
         summary = self.ledger.summary()
         self.assertEqual(summary["source_archives"], 1)
         self.assertEqual(summary["source_archive_bytes"], 123456)
+
+    def test_comment_retry_backoff_is_persisted_and_due_only_after_delay(self):
+        attempt = self.ledger.claim_attempt("p1", 88, "slot-comment", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.record_comment_failure(attempt, "page_comment_failed", "redacted", now=100)
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "post_success_comment_failed")
+        self.assertEqual(row["comment_retry_count"], 1)
+        self.assertGreater(row["comment_retry_at"], 100)
+        self.assertEqual(self.ledger.due_comment_retries(now=100), [])
+        due = self.ledger.due_comment_retries(now=row["comment_retry_at"])
+        self.assertEqual([item["attempt_id"] for item in due], [attempt])
+
+    def test_comment_retry_backoff_grows_and_is_bounded(self):
+        attempt = self.ledger.claim_attempt("p1", 89, "slot-comment-backoff", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.record_comment_failure(attempt, "first", "redacted", now=100)
+        first = self.ledger.attempt(attempt)
+        first_delay = first["comment_retry_at"] - 100
+        self.ledger.transition(attempt, "comment_pending")
+        self.ledger.record_comment_failure(attempt, "second", "redacted", now=200)
+        second = self.ledger.attempt(attempt)
+        second_delay = second["comment_retry_at"] - 200
+        self.assertGreater(second_delay, first_delay)
+        self.assertLessEqual(second_delay, 6 * 60 * 60)
+
+    def test_failed_comment_retry_can_reschedule_itself_with_longer_backoff(self):
+        attempt = self.ledger.claim_attempt("p1", 90, "slot-comment-reschedule", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.record_comment_failure(attempt, "first", "redacted", now=100)
+        self.ledger.record_comment_failure(attempt, "preflight_failed", "redacted", now=500)
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "post_success_comment_failed")
+        self.assertEqual(row["comment_retry_count"], 2)
+        self.assertEqual(row["comment_retry_at"], 500 + 10 * 60)
+        self.assertEqual(self.ledger.due_comment_retries(now=500), [])
+
+    def test_reconcile_success_does_not_postpone_a_newer_page_schedule(self):
+        page = SimpleNamespace(
+            page_id="p1", name="page", enabled=True, interval_minutes=30,
+            daily_success_limit=0, reuse_success_from_page_id="", timezone="Asia/Bangkok",
+            campaign_sub1="campaign", shopee_account="15130770000",
+            affiliate_id="15130770000", facebook_account="uid",
+            avatar_path=Path("/missing"), avatar_version="none", caption_template="{caption}",
+        )
+        self.ledger.sync_page(page)
+        self.ledger.set_next_due_at("p1", 10_000, now=100)
+        self.ledger.advance_page_after_success("p1", 30, now=1_000)
+        row = self.ledger.connect().execute(
+            "SELECT next_due_at,last_success_at FROM pages WHERE page_id='p1'"
+        ).fetchone()
+        self.assertEqual(row["next_due_at"], 10_000)
+        self.assertEqual(row["last_success_at"], 1_000)
+
+    def test_confirmed_post_advances_due_without_marking_success(self):
+        page = SimpleNamespace(
+            page_id="p2", name="page", enabled=True, interval_minutes=30,
+            daily_success_limit=0, reuse_success_from_page_id="", timezone="Asia/Bangkok",
+            campaign_sub1="campaign", shopee_account="15130770000",
+            affiliate_id="15130770000", facebook_account="uid",
+            avatar_path=Path("/missing"), avatar_version="none", caption_template="{caption}",
+        )
+        self.ledger.sync_page(page)
+        self.ledger.set_next_due_at("p2", 900, now=800)
+        self.ledger.advance_page_after_post("p2", 30, now=1_000)
+        row = self.ledger.connect().execute(
+            "SELECT next_due_at,last_success_at FROM pages WHERE page_id='p2'"
+        ).fetchone()
+        self.assertEqual(row["next_due_at"], 2_800)
+        self.assertIsNone(row["last_success_at"])

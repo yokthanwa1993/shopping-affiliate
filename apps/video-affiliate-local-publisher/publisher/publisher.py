@@ -228,6 +228,7 @@ class PublisherEngine:
             "posting_source": posted["source"],
             "posted_at": int(time.time()),
         })
+        self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
         try:
             final_link = self.idbridge.shorten(
                 item.shopee_url, page.shopee_account, page.affiliate_id,
@@ -255,10 +256,9 @@ class PublisherEngine:
                     "permalink": str(row["permalink"] or posted.get("post_url", "")),
                 }
             if row["state"] != "post_success_comment_failed":
-                self.ledger.transition(attempt_id, "post_success_comment_failed", {
-                    "error_code": _error_code(exc),
-                    "error_detail_redacted": redact_error(exc),
-                })
+                self.ledger.record_comment_failure(
+                    attempt_id, _error_code(exc), redact_error(exc),
+                )
             self._notify_failure(page.page_id, attempt_id, "post_success_comment_failed", exc)
             raise
 
@@ -528,13 +528,13 @@ class PublisherEngine:
             if state == "final_shortlink_ok":
                 self.ledger.transition(attempt_id, "comment_pending")
                 state = "comment_pending"
+            if state == "post_success_comment_failed":
+                self.ledger.transition(attempt_id, "comment_pending")
+                state = "comment_pending"
             if comment_id:
                 self.ledger.transition(attempt_id, "verifying", {"comment_id": comment_id})
                 state = "verifying"
             else:
-                if state == "post_success_comment_failed":
-                    self.ledger.transition(attempt_id, "comment_pending")
-                    state = "comment_pending"
                 try:
                     comment_id = self.idbridge.page_comment(
                         page.page_id, story_id, comment, page.facebook_account,
@@ -542,10 +542,9 @@ class PublisherEngine:
                     self.ledger.transition(attempt_id, "verifying", {"comment_id": comment_id})
                     state = "verifying"
                 except Exception as exc:
-                    self.ledger.transition(attempt_id, "post_success_comment_failed", {
-                        "error_code": _error_code(exc),
-                        "error_detail_redacted": redact_error(exc),
-                    })
+                    self.ledger.record_comment_failure(
+                        attempt_id, _error_code(exc), redact_error(exc),
+                    )
                     self._notify_failure(page.page_id, attempt_id, "post_success_comment_failed", exc)
                     raise
         if not comment_id:
@@ -582,14 +581,74 @@ class PublisherEngine:
         due = self.ledger.due_pages(now=at)
         if not due:
             return {"ok": True, "state": "idle", "due_pages": 0}
-        # Startup catch-up is deliberately capped at one slot; never burst.
-        page_id = str(due[0]["page_id"])
-        return self.run_page(
-            page_id,
-            shadow=not self.config.writes_enabled,
-            trigger="scheduler",
-            at=at,
-        )
+        # Scan all due pages fairly, but permit at most one source/post attempt per tick.
+        # A page-local reconciliation blocker or lease must not starve later pages.
+        deferred_reasons = {
+            "page_reconciliation_required", "page_lease_busy", "reuse_source_success_empty",
+            "reuse_source_success_exhausted", "strict_ready_exhausted",
+            "candidate_budget_exhausted", "slot_already_claimed",
+        }
+        deferred = []
+        for index, due_page in enumerate(due):
+            page_id = str(due_page["page_id"])
+            result = self.run_page(
+                page_id,
+                shadow=not self.config.writes_enabled,
+                trigger="scheduler",
+                at=at,
+            )
+            result["due_pages"] = len(due)
+            result["pages_considered"] = index + 1
+            result["pages_deferred"] = len(deferred)
+            reason = str(result.get("reason") or "")
+            if result.get("attempt_id") or result.get("ok") or reason not in deferred_reasons:
+                return result
+            deferred.append({"page_id": page_id, "reason": reason})
+        return {
+            "ok": False,
+            "state": "blocked",
+            "reason": "all_due_pages_deferred",
+            "due_pages": len(due),
+            "pages_considered": len(due),
+            "pages_deferred": len(deferred),
+            "deferred": deferred,
+        }
+
+    def run_due_comment_retry_once(self, at: Optional[int] = None) -> Dict[str, Any]:
+        due = self.ledger.due_comment_retries(now=at, limit=1000)
+        if not due:
+            return {"ok": True, "state": "idle", "due_comment_retries": 0}
+        deferred = []
+        for index, due_attempt in enumerate(due):
+            attempt_id = str(due_attempt["attempt_id"])
+            try:
+                result = self.reconcile_attempt(attempt_id)
+            except Exception as exc:
+                current = self.ledger.attempt(attempt_id)
+                if str(current["state"]) in {
+                    "post_confirmed", "final_shortlink_ok", "comment_pending",
+                    "post_success_comment_failed",
+                }:
+                    self.ledger.record_comment_failure(
+                        attempt_id, _error_code(exc), redact_error(exc), now=at,
+                    )
+                raise
+            if str(result.get("reason") or "") == "page_lease_busy":
+                deferred.append({"attempt_id": attempt_id, "reason": "page_lease_busy"})
+                continue
+            result["due_comment_retries"] = len(due)
+            result["comment_retries_considered"] = index + 1
+            result["comment_retries_deferred"] = len(deferred)
+            return result
+        return {
+            "ok": False,
+            "state": "skipped",
+            "reason": "all_comment_retry_pages_busy",
+            "due_comment_retries": len(due),
+            "comment_retries_considered": len(due),
+            "comment_retries_deferred": len(deferred),
+            "deferred": deferred,
+        }
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -599,6 +658,7 @@ class PublisherEngine:
             "ledger": self.ledger.summary(),
             "unknown_outcomes": len(self.ledger.attempts_in_states(["post_outcome_unknown"])),
             "comment_backlog": len(self.ledger.attempts_in_states(["post_success_comment_failed"])),
+            "due_comment_retries": len(self.ledger.due_comment_retries(limit=1000)),
             "verification_backlog": len(self.ledger.attempts_in_states(["post_success_verification_failed"])),
             "page_blockers": len(self.ledger.attempts_in_states(PAGE_BLOCKING_STATES)),
         }

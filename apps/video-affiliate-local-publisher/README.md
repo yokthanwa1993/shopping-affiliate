@@ -29,8 +29,10 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 8. โพสต์ Reel ผ่าน IDBridge, mint final link Sub1=Campaign/Sub2=Page/Sub3=Post, รอ 30 วินาทีแล้ว comment เป็น Page. Power Editor Page posting ต้อง bind session cookies ของ account เดิมเพื่อ resolve Page token; upload/comment ใช้ Page token เป็น actor และห้าม fallback ข้าม account
 9. Graph readback post/comment ก่อน mark SQLite `success`
 10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup เฉพาะ spool; source archive คงถาวร
+11. scheduler ไล่ดู due Page ตามลำดับอย่างยุติธรรม: Page ที่ติด reconcile/lease/source policy ถูกข้ามเฉพาะรอบนั้น แต่ยังเริ่ม post attempt ได้สูงสุดหนึ่ง Page ต่อ tick จึงไม่ burst catch-up
+12. comment-only backlog แยก retry ทีละหนึ่ง attempt ต่อ tick ด้วย exponential backoff 5 นาทีถึง 6 ชั่วโมง; failure ทุกช่วงของ retry จะเลื่อนเวลารอบถัดไป และ Page ที่ lease ไม่ว่างจะถูกข้ามเพื่อไม่กีดกัน backlog อื่น; repair ใช้ story เดิมและไม่เรียก `/post`
 
-SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ `reconcile-attempt`; ห้ามสร้าง Reel ซ้ำ
+SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, comment retry count/next retry, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ attempt เดิมเท่านั้น; ห้ามสร้าง Reel ซ้ำ
 
 ## Commands
 

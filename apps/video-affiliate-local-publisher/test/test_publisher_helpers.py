@@ -260,6 +260,257 @@ class PublisherHelpersTests(unittest.TestCase):
             self.assertEqual(recovered["comment_id"], "comment-existing")
             self.assertEqual(recovered["error_code"], "")
 
+    def test_reconcile_existing_comment_moves_failed_state_through_pending(self):
+        class FakeLedger:
+            def __init__(self):
+                self.state = "post_success_comment_failed"
+                self.transitions = []
+
+            def attempt(self, _attempt_id):
+                return {
+                    "attempt_id": "attempt", "page_id": "100", "studio_content_id": 3,
+                    "state": self.state, "fb_story_id": "100_200", "fb_post_tail": "200",
+                    "final_shortlink": "https://s.shopee.co.th/final",
+                    "comment_id": "", "permalink": "", "fb_video_id": "video-1",
+                }
+
+            def transition(self, _attempt_id, state, _fields=None):
+                allowed = {
+                    "post_success_comment_failed": {"comment_pending"},
+                    "comment_pending": {"verifying"},
+                    "verifying": {"success"},
+                }
+                if state not in allowed.get(self.state, set()):
+                    raise AssertionError(f"invalid transition {self.state}->{state}")
+                self.transitions.append((self.state, state))
+                self.state = state
+
+            def advance_page_after_success(self, *_args):
+                return None
+
+        final_link = "https://s.shopee.co.th/final"
+        message = final_link + "\ncomment"
+
+        class FakeBridge:
+            def ensure_page(self, *args):
+                return None
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def graph_get(self, account, path, params):
+                if path == "100":
+                    return {"id": "100"}
+                if path == "100_200/comments":
+                    if params.get("fields") == "id,message,from":
+                        return {"data": [{"id": "comment-existing", "message": message,
+                                          "from": {"id": "100"}}]}
+                    return {"data": [{"id": "comment-existing"}]}
+                if path == "100_200":
+                    return {"id": path, "is_published": True, "permalink_url": "https://fb.test"}
+                if path == "comment-existing":
+                    return {"id": path, "from": {"id": "100"}, "message": message}
+                raise AssertionError(path)
+
+            def page_comment(self, *args):
+                raise AssertionError("must_not_create_comment")
+
+        page = cast(Any, SimpleNamespace(
+            page_id="100", interval_minutes=20, facebook_account="uid",
+            power_editor_account="peuid", posting_source="facebook_lite_eaad6",
+            shopee_account="15130770000", affiliate_id="15130770000",
+            campaign_sub1="campaign", comment_template="{shortlink}\ncomment",
+        ))
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(writes_enabled=True, pages=[page]))
+        engine.ledger = cast(Any, FakeLedger())
+        engine._idbridge = cast(Any, FakeBridge())
+        engine.spool = cast(Any, SimpleNamespace(cleanup=lambda _attempt_id: None))
+        engine.notifier = cast(Any, SimpleNamespace(send=lambda *args, **kwargs: None))
+        result = engine._reconcile_attempt_locked("attempt")
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(engine.ledger.transitions[:2], [
+            ("post_success_comment_failed", "comment_pending"),
+            ("comment_pending", "verifying"),
+        ])
+
+    def test_scheduler_skips_blocked_oldest_page_and_runs_next_due_page(self):
+        class FakeLedger:
+            def due_pages(self, now=None):
+                return [
+                    {"page_id": "review", "next_due_at": 100},
+                    {"page_id": "chearb", "next_due_at": 200},
+                ]
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.ledger = cast(Any, FakeLedger())
+        calls = []
+
+        def run_page(page_id, **kwargs):
+            calls.append((page_id, kwargs))
+            if page_id == "review":
+                return {
+                    "ok": False,
+                    "state": "skipped",
+                    "reason": "slot_already_claimed",
+                }
+            return {"ok": True, "state": "success", "page_id": page_id}
+
+        engine.run_page = run_page
+        result = engine.run_due_once(at=300)
+        self.assertEqual(result["page_id"], "chearb")
+        self.assertEqual([page_id for page_id, _kwargs in calls], ["review", "chearb"])
+        self.assertEqual(result["pages_considered"], 2)
+        self.assertEqual(result["pages_deferred"], 1)
+
+    def test_scheduler_runs_at_most_one_post_attempt_per_tick(self):
+        class FakeLedger:
+            def due_pages(self, now=None):
+                return [
+                    {"page_id": "oldest", "next_due_at": 100},
+                    {"page_id": "next", "next_due_at": 200},
+                ]
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.ledger = cast(Any, FakeLedger())
+        calls = []
+
+        def run_page(page_id, **kwargs):
+            calls.append(page_id)
+            return {"ok": False, "state": "failed", "attempt_id": "attempt-1"}
+
+        engine.run_page = run_page
+        result = engine.run_due_once(at=300)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(calls, ["oldest"])
+        self.assertEqual(result["pages_considered"], 1)
+
+    def test_scheduler_does_not_create_a_second_post_after_success(self):
+        class FakeLedger:
+            def due_pages(self, now=None):
+                return [
+                    {"page_id": "oldest", "next_due_at": 100},
+                    {"page_id": "next", "next_due_at": 200},
+                ]
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+        engine.ledger = cast(Any, FakeLedger())
+        calls = []
+
+        def run_page(page_id, **kwargs):
+            calls.append(page_id)
+            return {"ok": True, "state": "success", "page_id": page_id}
+
+        engine.run_page = run_page
+        result = engine.run_due_once(at=300)
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(calls, ["oldest"])
+        self.assertEqual(result["pages_considered"], 1)
+
+    def test_comment_retry_scheduler_repairs_only_one_existing_attempt(self):
+        class FakeLedger:
+            def due_comment_retries(self, now=None, limit=1):
+                self.request = (now, limit)
+                return [
+                    {"attempt_id": "old-comment"},
+                    {"attempt_id": "new-comment"},
+                ][:limit]
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.ledger = cast(Any, FakeLedger())
+        reconciled = []
+
+        def reconcile_attempt(attempt_id):
+            reconciled.append(attempt_id)
+            return {"ok": True, "state": "success", "attempt_id": attempt_id}
+
+        engine.reconcile_attempt = reconcile_attempt
+        result = engine.run_due_comment_retry_once(at=500)
+        self.assertEqual(reconciled, ["old-comment"])
+        self.assertEqual(result["attempt_id"], "old-comment")
+        self.assertEqual(result["due_comment_retries"], 2)
+
+    def test_comment_retry_scheduler_reschedules_failure_before_comment_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            attempt = ledger.claim_attempt("100", 91, "slot-comment-preflight", "scheduler")
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting", "post_confirmed",
+                "final_shortlink_ok", "comment_pending",
+            ]:
+                ledger.transition(attempt, state)
+            ledger.record_comment_failure(attempt, "first", "redacted", now=100)
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.ledger = ledger
+
+            def fail_before_pending(attempt_id):
+                del attempt_id
+                raise PublisherError("power_editor_page_readback_failed")
+
+            engine.reconcile_attempt = fail_before_pending
+            with self.assertRaisesRegex(PublisherError, "power_editor_page_readback_failed"):
+                engine.run_due_comment_retry_once(at=400)
+            row = ledger.attempt(attempt)
+            self.assertEqual(row["state"], "post_success_comment_failed")
+            self.assertEqual(row["comment_retry_count"], 2)
+            self.assertEqual(row["comment_retry_at"], 400 + 10 * 60)
+
+    def test_comment_retry_scheduler_reschedules_failure_after_final_link_transition(self):
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            attempt = ledger.claim_attempt("100", 92, "slot-comment-final-link", "scheduler")
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting", "post_confirmed",
+                "final_shortlink_ok", "comment_pending",
+            ]:
+                ledger.transition(attempt, state)
+            ledger.record_comment_failure(attempt, "first", "redacted", now=100)
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.ledger = ledger
+
+            def fail_after_final_link(attempt_id):
+                ledger.transition(attempt_id, "final_shortlink_ok")
+                raise PublisherError("comment_template_missing_shortlink")
+
+            engine.reconcile_attempt = fail_after_final_link
+            with self.assertRaisesRegex(PublisherError, "comment_template_missing_shortlink"):
+                engine.run_due_comment_retry_once(at=400)
+            row = ledger.attempt(attempt)
+            self.assertEqual(row["state"], "post_success_comment_failed")
+            self.assertEqual(row["comment_retry_count"], 2)
+            self.assertEqual(row["comment_retry_at"], 400 + 10 * 60)
+
+    def test_comment_retry_scheduler_skips_busy_page_and_repairs_next_attempt(self):
+        class FakeLedger:
+            def due_comment_retries(self, now=None, limit=1):
+                self.request = (now, limit)
+                return [
+                    {"attempt_id": "busy-comment"},
+                    {"attempt_id": "repairable-comment"},
+                ]
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.ledger = cast(Any, FakeLedger())
+        reconciled = []
+
+        def reconcile_attempt(attempt_id):
+            reconciled.append(attempt_id)
+            if attempt_id == "busy-comment":
+                return {"ok": False, "state": "skipped", "reason": "page_lease_busy"}
+            return {"ok": True, "state": "success", "attempt_id": attempt_id}
+
+        engine.reconcile_attempt = reconcile_attempt
+        result = engine.run_due_comment_retry_once(at=500)
+        self.assertEqual(reconciled, ["busy-comment", "repairable-comment"])
+        self.assertEqual(result["attempt_id"], "repairable-comment")
+        self.assertEqual(result["comment_retries_considered"], 2)
+        self.assertEqual(result["comment_retries_deferred"], 1)
+
     def test_slot_key_stable(self):
         self.assertEqual(slot_key("100", 20, at=1234), slot_key("100", 20, at=2399))
 

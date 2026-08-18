@@ -15,6 +15,7 @@ class Reconciler:
         return {
             "unknown_post_outcomes": self.ledger.attempts_in_states(["post_outcome_unknown"]),
             "comment_only_retries": self.ledger.attempts_in_states(["post_success_comment_failed"]),
+            "due_comment_only_retries": self.ledger.due_comment_retries(limit=1000),
         }
 
     def assert_no_unknown_outcomes(self) -> None:

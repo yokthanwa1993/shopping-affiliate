@@ -34,6 +34,15 @@ class PublisherHTTPServer:
                 pass
             finally:
                 self.run_lock.release()
+            if not self.run_lock.acquire(blocking=False):
+                continue
+            try:
+                self.engine.run_due_comment_retry_once()
+            except Exception:
+                # Comment-only repair has persisted retry/backoff and never reposts.
+                pass
+            finally:
+                self.run_lock.release()
 
     def serve_forever(self) -> None:
         parent = self
