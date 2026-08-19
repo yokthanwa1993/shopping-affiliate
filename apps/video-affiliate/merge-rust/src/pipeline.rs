@@ -2447,21 +2447,20 @@ fn build_atempo_filter(mut factor: f64) -> String {
 mod tests {
     use super::{
         AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_OUTPUT_FPS, AVATAR_COMPOSE_VIDEO_CRF,
-        AVATAR_COMPOSE_VIDEO_PRESET,
-        FINAL_COMPRESS_AUDIO_BITRATE_KBPS, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS,
-        GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
-        GeminiPreflightError, GeminiTranscodeProfile, PipelineRequest,
-        VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS, VERTEX_GENERATION_INLINE_MAX_BYTES,
-        build_avatar_compose_ffmpeg_args, build_avatar_compose_filter_complex,
-        build_final_compress_ffmpeg_args, build_final_merge_ffmpeg_args,
-        build_flip_fallback_remux_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
-        build_gemini_inline_video_part, build_gemini_transcode_ffmpeg_args,
-        build_gemini_transcode_filter, build_srt_from_lines_with_timing, build_tts_payload,
-        convert_to_ass, extract_speech_srt_time_span, extract_srt_payload,
-        ffmpeg_nonzero_status_reason, final_compress_video_bitrate_kbps,
-        format_gemini_preflight_info, normalize_srt_blocks, parse_gemini_preflight_info,
-        parse_srt_time_range, pipeline_error_category, should_skip_subtitles,
-        validate_gemini_safe_output,
+        AVATAR_COMPOSE_VIDEO_PRESET, FINAL_COMPRESS_AUDIO_BITRATE_KBPS,
+        FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS, GEMINI_PREFLIGHT_MAX_DURATION_SECS,
+        GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES, GeminiPreflightError,
+        GeminiTranscodeProfile, PipelineRequest, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
+        VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
+        build_avatar_compose_filter_complex, build_final_compress_ffmpeg_args,
+        build_final_merge_ffmpeg_args, build_flip_fallback_remux_ffmpeg_args,
+        build_flip_processing_input_ffmpeg_args, build_gemini_inline_video_part,
+        build_gemini_transcode_ffmpeg_args, build_gemini_transcode_filter,
+        build_srt_from_lines_with_timing, build_tts_payload, convert_to_ass,
+        extract_speech_srt_time_span, extract_srt_payload, ffmpeg_nonzero_status_reason,
+        final_compress_video_bitrate_kbps, format_gemini_preflight_info, normalize_srt_blocks,
+        parse_gemini_preflight_info, parse_srt_time_range, pipeline_error_category,
+        should_skip_subtitles, validate_gemini_safe_output,
     };
     use serde_json::json;
 
@@ -3060,11 +3059,21 @@ mod tests {
     }
 
     #[test]
-    fn avatar_compose_filter_uses_high_quality_scaling_without_hidden_frame_conversion() {
-        let filter = build_avatar_compose_filter_complex(0.30, 0.10);
-        assert!(!filter.contains("fps="));
+    fn avatar_compose_filter_matches_approved_minimal_green_edge_method() {
+        let filter = build_avatar_compose_filter_complex(0.14, 0.02);
         assert_eq!(filter.matches("flags=lanczos").count(), 2);
-        assert!(!filter.contains("despill="));
+        assert_eq!(filter.matches("fps=30").count(), 2);
+        assert!(filter.contains("colorkey=0x00b712:0.2200:0.0400"));
+        assert!(filter.contains(
+            "despill=green:mix=0.12:expand=0:red=0:green=-0.20:blue=0:brightness=0:alpha=0"
+        ));
+        assert!(filter.contains("overlay=0:0"));
+        assert!(!filter.contains("colorkey=0x00c800"));
+        assert_eq!(
+            filter,
+            build_avatar_compose_filter_complex(0.99, 0.99),
+            "page-specific legacy key values must not drift the approved global method"
+        );
     }
 
     // Minimal PipelineRequest used to exercise the skip_subtitles gate without a network.
@@ -4270,6 +4279,14 @@ const AVATAR_COMPOSE_OUTPUT_FPS: &str = "30";
 const AVATAR_COMPOSE_VIDEO_PRESET: &str = "slow";
 const AVATAR_COMPOSE_VIDEO_CRF: &str = "16";
 const AVATAR_COMPOSE_AUDIO_BITRATE: &str = "128k";
+// Exact method selected by Thanwa from the Review Cham full-file sample on
+// 2026-08-19. Keep these values centralized so every page uses the same keying
+// method while retaining its own page-scoped avatar asset.
+const AVATAR_COMPOSE_KEY_COLOR: &str = "0x00b712";
+const AVATAR_COMPOSE_KEY_SIMILARITY: f64 = 0.22;
+const AVATAR_COMPOSE_KEY_BLEND: f64 = 0.04;
+const AVATAR_COMPOSE_DESPILL_FILTER: &str =
+    "despill=green:mix=0.12:expand=0:red=0:green=-0.20:blue=0:brightness=0:alpha=0";
 
 #[derive(Clone)]
 struct AvatarComposeInput {
@@ -4413,12 +4430,19 @@ async fn download_avatar_compose_video(
     Ok(bytes.to_vec())
 }
 
-fn build_avatar_compose_filter_complex(chromakey_similarity: f64, chromakey_blend: f64) -> String {
+fn build_avatar_compose_filter_complex(
+    _chromakey_similarity: f64,
+    _chromakey_blend: f64,
+) -> String {
     format!(
-        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=rgba[base];\
-         [1:v]scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
+        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={output_fps},format=rgba[base];\
+         [1:v]scale=720:1280:flags=lanczos,fps={output_fps},format=rgba,colorkey={key_color}:{key_similarity:.4}:{key_blend:.4},{despill},format=rgba[avatar];\
          [base][avatar]overlay=0:0:format=auto:eof_action=pass:repeatlast=0,format=yuv420p[outv]",
-        chromakey_similarity, chromakey_blend,
+        output_fps = AVATAR_COMPOSE_OUTPUT_FPS,
+        key_color = AVATAR_COMPOSE_KEY_COLOR,
+        key_similarity = AVATAR_COMPOSE_KEY_SIMILARITY,
+        key_blend = AVATAR_COMPOSE_KEY_BLEND,
+        despill = AVATAR_COMPOSE_DESPILL_FILTER,
     )
 }
 
@@ -4487,12 +4511,11 @@ async fn compose_avatar_video(
     let base_path_str = base_path.to_str().ok_or("base_video_path_invalid")?;
     let avatar_path_str = avatar_path.to_str().ok_or("avatar_video_path_invalid")?;
     let output_path_str = output_path.to_str().ok_or("output_path_invalid")?;
-    // Use an RGBA colorkey pipeline for the full-canvas green-screen avatar.
-    // The previous yuv420p+chromakey pipeline produced a broken alpha mask on
-    // compressed green-screen MP4s, darkening the whole base video during FB posting.
-    let effective_similarity = input.chromakey_similarity.max(0.30);
-    let effective_blend = input.chromakey_blend.max(0.10);
-    let filter_complex = build_avatar_compose_filter_complex(effective_similarity, effective_blend);
+    // Apply the one production-wide compose method selected from the exact
+    // visual gold-standard sample. Request values remain accepted for API
+    // compatibility but cannot silently drift one Page away from this method.
+    let filter_complex =
+        build_avatar_compose_filter_complex(input.chromakey_similarity, input.chromakey_blend);
 
     let duration = format!("{:.3}", base_duration);
     let ffmpeg_args = build_avatar_compose_ffmpeg_args(
