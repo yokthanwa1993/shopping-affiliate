@@ -2446,8 +2446,7 @@ fn build_atempo_filter(mut factor: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_VIDEO_BITRATE, AVATAR_COMPOSE_VIDEO_BUFSIZE,
-        AVATAR_COMPOSE_VIDEO_MAXRATE, AVATAR_COMPOSE_VIDEO_PRESET,
+        AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_VIDEO_CRF, AVATAR_COMPOSE_VIDEO_PRESET,
         FINAL_COMPRESS_AUDIO_BITRATE_KBPS, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS,
         GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
         GeminiPreflightError, GeminiTranscodeProfile, PipelineRequest,
@@ -3023,13 +3022,13 @@ mod tests {
         };
 
         assert_eq!(value_after("-preset"), Some(AVATAR_COMPOSE_VIDEO_PRESET));
-        assert_eq!(value_after("-b:v"), Some(AVATAR_COMPOSE_VIDEO_BITRATE));
-        assert_eq!(value_after("-maxrate"), Some(AVATAR_COMPOSE_VIDEO_MAXRATE));
-        assert_eq!(value_after("-bufsize"), Some(AVATAR_COMPOSE_VIDEO_BUFSIZE));
+        assert_eq!(value_after("-crf"), Some(AVATAR_COMPOSE_VIDEO_CRF));
+        assert_eq!(value_after("-b:v"), None);
+        assert_eq!(value_after("-maxrate"), None);
+        assert_eq!(value_after("-bufsize"), None);
         assert_eq!(value_after("-b:a"), Some(AVATAR_COMPOSE_AUDIO_BITRATE));
         assert_eq!(value_after("-movflags"), Some("+faststart"));
         assert!(!args.iter().any(|arg| arg == "ultrafast"));
-        assert!(!args.iter().any(|arg| arg == "-crf"));
 
         let avatar_input_index = args
             .iter()
@@ -3056,6 +3055,14 @@ mod tests {
         assert!(filter.contains("repeatlast=0"));
         assert!(!filter.contains("eof_action=repeat"));
         assert!(!filter.contains("repeatlast=1"));
+    }
+
+    #[test]
+    fn avatar_compose_filter_preserves_base_frame_rate_and_uses_high_quality_scaling() {
+        let filter = build_avatar_compose_filter_complex(0.30, 0.10);
+        assert!(!filter.contains("fps=30"));
+        assert_eq!(filter.matches("flags=lanczos").count(), 2);
+        assert!(!filter.contains("despill="));
     }
 
     // Minimal PipelineRequest used to exercise the skip_subtitles gate without a network.
@@ -4252,10 +4259,11 @@ async fn rust_pipeline(
 
 const AVATAR_COMPOSE_OUTPUT_MIN_BYTES: usize = 1024;
 const AVATAR_COMPOSE_JOB_TTL_SECS: u64 = 600;
-const AVATAR_COMPOSE_VIDEO_PRESET: &str = "veryfast";
-const AVATAR_COMPOSE_VIDEO_BITRATE: &str = "2500k";
-const AVATAR_COMPOSE_VIDEO_MAXRATE: &str = "3000k";
-const AVATAR_COMPOSE_VIDEO_BUFSIZE: &str = "6000k";
+// Avatar compose must preserve source detail through the unavoidable re-encode.
+// CRF 18 + medium avoids the former 2.5 Mbps ceiling, while the filter keeps
+// the base clip frame rate and uses Lanczos when scaling to the 720x1280 contract.
+const AVATAR_COMPOSE_VIDEO_PRESET: &str = "medium";
+const AVATAR_COMPOSE_VIDEO_CRF: &str = "18";
 const AVATAR_COMPOSE_AUDIO_BITRATE: &str = "128k";
 
 #[derive(Clone)]
@@ -4402,8 +4410,8 @@ async fn download_avatar_compose_video(
 
 fn build_avatar_compose_filter_complex(chromakey_similarity: f64, chromakey_blend: f64) -> String {
     format!(
-        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=rgba[base];\
-         [1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,fps=30,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
+        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=rgba[base];\
+         [1:v]scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
          [base][avatar]overlay=0:0:format=auto:eof_action=pass:repeatlast=0,format=yuv420p[outv]",
         chromakey_similarity, chromakey_blend,
     )
@@ -4436,12 +4444,8 @@ fn build_avatar_compose_ffmpeg_args(
         "libx264".to_string(),
         "-preset".to_string(),
         AVATAR_COMPOSE_VIDEO_PRESET.to_string(),
-        "-b:v".to_string(),
-        AVATAR_COMPOSE_VIDEO_BITRATE.to_string(),
-        "-maxrate".to_string(),
-        AVATAR_COMPOSE_VIDEO_MAXRATE.to_string(),
-        "-bufsize".to_string(),
-        AVATAR_COMPOSE_VIDEO_BUFSIZE.to_string(),
+        "-crf".to_string(),
+        AVATAR_COMPOSE_VIDEO_CRF.to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-c:a".to_string(),
