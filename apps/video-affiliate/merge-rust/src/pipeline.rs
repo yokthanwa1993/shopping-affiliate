@@ -2446,7 +2446,8 @@ fn build_atempo_filter(mut factor: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_VIDEO_CRF, AVATAR_COMPOSE_VIDEO_PRESET,
+        AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_OUTPUT_FPS, AVATAR_COMPOSE_VIDEO_CRF,
+        AVATAR_COMPOSE_VIDEO_PRESET,
         FINAL_COMPRESS_AUDIO_BITRATE_KBPS, FINAL_COMPRESS_MIN_VIDEO_BITRATE_KBPS,
         GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
         GeminiPreflightError, GeminiTranscodeProfile, PipelineRequest,
@@ -3028,6 +3029,7 @@ mod tests {
         assert_eq!(value_after("-bufsize"), None);
         assert_eq!(value_after("-b:a"), Some(AVATAR_COMPOSE_AUDIO_BITRATE));
         assert_eq!(value_after("-movflags"), Some("+faststart"));
+        assert_eq!(value_after("-r"), Some(AVATAR_COMPOSE_OUTPUT_FPS));
         assert!(!args.iter().any(|arg| arg == "ultrafast"));
 
         let avatar_input_index = args
@@ -3058,9 +3060,9 @@ mod tests {
     }
 
     #[test]
-    fn avatar_compose_filter_preserves_base_frame_rate_and_uses_high_quality_scaling() {
+    fn avatar_compose_filter_uses_high_quality_scaling_without_hidden_frame_conversion() {
         let filter = build_avatar_compose_filter_complex(0.30, 0.10);
-        assert!(!filter.contains("fps=30"));
+        assert!(!filter.contains("fps="));
         assert_eq!(filter.matches("flags=lanczos").count(), 2);
         assert!(!filter.contains("despill="));
     }
@@ -4259,11 +4261,14 @@ async fn rust_pipeline(
 
 const AVATAR_COMPOSE_OUTPUT_MIN_BYTES: usize = 1024;
 const AVATAR_COMPOSE_JOB_TTL_SECS: u64 = 600;
-// Avatar compose must preserve source detail through the unavoidable re-encode.
-// CRF 18 + medium avoids the former 2.5 Mbps ceiling, while the filter keeps
-// the base clip frame rate and uses Lanczos when scaling to the 720x1280 contract.
-const AVATAR_COMPOSE_VIDEO_PRESET: &str = "medium";
-const AVATAR_COMPOSE_VIDEO_CRF: &str = "18";
+// Avatar compose is uploaded to Facebook immediately after this encode. The
+// 30 fps output is the measured compromise for a common 24 fps base + 60 fps
+// avatar pair: it keeps more avatar motion than 24 fps without padding the
+// whole base to 60 fps. CRF 16 + slow leaves enough detail for Meta's second
+// transcode, while Lanczos handles the fixed 720x1280 canvas resize.
+const AVATAR_COMPOSE_OUTPUT_FPS: &str = "30";
+const AVATAR_COMPOSE_VIDEO_PRESET: &str = "slow";
+const AVATAR_COMPOSE_VIDEO_CRF: &str = "16";
 const AVATAR_COMPOSE_AUDIO_BITRATE: &str = "128k";
 
 #[derive(Clone)]
@@ -4446,6 +4451,8 @@ fn build_avatar_compose_ffmpeg_args(
         AVATAR_COMPOSE_VIDEO_PRESET.to_string(),
         "-crf".to_string(),
         AVATAR_COMPOSE_VIDEO_CRF.to_string(),
+        "-r".to_string(),
+        AVATAR_COMPOSE_OUTPUT_FPS.to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-c:a".to_string(),
