@@ -110,12 +110,35 @@ class IDBridgeClient:
             raise IDBridgeError("shopee_accounts_invalid")
         return [row for row in data if isinstance(row, dict)]
 
-    def shorten_verified(self, product_url: str, account: str, affiliate_id: str,
-                         sub1: str, sub2: str, sub3: str) -> Dict[str, str]:
-        payload = self._request("/shorten", method="POST", timeout=180, body={
+    def reseed_shopee_account(self, account: str) -> None:
+        if not account:
+            raise IDBridgeError("shopee_account_missing")
+        payload = self._request("/reseed", query={"account": account}, timeout=30)
+        if not isinstance(payload, dict) or payload.get("ok") != "reseeded":
+            raise IDBridgeError("shopee_reseed_failed")
+
+    def _shorten_request(self, product_url: str, account: str, affiliate_id: str,
+                         sub1: str, sub2: str, sub3: str) -> Any:
+        return self._request("/shorten", method="POST", timeout=180, body={
             "url": product_url, "account": account, "affiliate_id": affiliate_id,
             "sub1": sub1, "sub2": sub2, "sub3": sub3,
         })
+
+    def shorten_verified(self, product_url: str, account: str, affiliate_id: str,
+                         sub1: str, sub2: str, sub3: str) -> Dict[str, str]:
+        payload = self._shorten_request(
+            product_url, account, affiliate_id, sub1, sub2, sub3,
+        )
+        # After a Mac restart the hidden WKWebView can finish loading before its stored
+        # Shopee session is usable. IDBridge reports the stable error_not_found code in
+        # that case. Reload only the requested account from IDBridge's secure store and
+        # retry this pre-Facebook mint once; never loop or fall back across accounts.
+        if (isinstance(payload, dict) and payload.get("ok") is not True
+                and str(payload.get("code") or payload.get("error") or "") == "error_not_found"):
+            self.reseed_shopee_account(account)
+            payload = self._shorten_request(
+                product_url, account, affiliate_id, sub1, sub2, sub3,
+            )
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             raise IDBridgeError("shorten_failed")
         link = str(payload.get("shortLink") or payload.get("shortlink") or payload.get("short_link") or "").strip()
