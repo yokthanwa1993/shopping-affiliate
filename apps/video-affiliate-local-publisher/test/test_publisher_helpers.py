@@ -403,7 +403,7 @@ class PublisherHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             ledger = Ledger(Path(root) / "publisher.db")
             item = SimpleNamespace(
-                content_id=124, editor_message_id="message-124",
+                content_id=124, ready_message_id="message-124",
                 shopee_url="https://shopee.co.th/product/1/124",
                 lazada_url="https://www.lazada.co.th/products/example-i124.html",
                 caption=caption, ready_at="1970-01-01T00:00:00Z",
@@ -720,10 +720,10 @@ class PublisherHelpersTests(unittest.TestCase):
         source_sha = "d" * 64
         item = SimpleNamespace(
             content_id=88,
-            editor_message_id="message-88",
+            ready_message_id="message-88",
             shopee_url="https://shopee.co.th/product/1/88",
             lazada_url="https://www.lazada.co.th/products/example-i88.html",
-            editor_video_url="https://cdn.example/source.mp4",
+            ready_video_url="https://cdn.example/source.mp4",
         )
 
         class FakeStudio:

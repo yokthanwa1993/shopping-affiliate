@@ -54,7 +54,7 @@ class AppConfig:
     ledger_db: Path
     spool_root: Path
     log_root: Path
-    editor_channel_id: str
+    ready_channel_id: str
     discord_env_file: Path
     idbridge_auth_file: Path
     idbridge_url: str
@@ -188,7 +188,7 @@ def load_config(path: Optional[Path] = None) -> AppConfig:
         ledger_db=_path(raw.get("ledger_db"), DEFAULT_LEDGER),
         spool_root=_path(raw.get("spool_root"), DEFAULT_SPOOL),
         log_root=_path(raw.get("log_root"), DEFAULT_LOGS),
-        editor_channel_id=_text(raw.get("editor_channel_id")) or "1518808518176800769",
+        ready_channel_id=_text(raw.get("ready_channel_id")),
         discord_env_file=_path(raw.get("discord_env_file"), DEFAULT_DISCORD_ENV),
         idbridge_auth_file=_path(raw.get("idbridge_auth_file"), DEFAULT_IDBRIDGE_AUTH),
         idbridge_url=(_text(raw.get("idbridge_url")) or "http://127.0.0.1:8798").rstrip("/"),
@@ -213,6 +213,7 @@ def safe_config_summary(config: AppConfig) -> Dict[str, Any]:
         "writes_enabled": config.writes_enabled,
         "scheduler_enabled": config.scheduler_enabled,
         "studio_db_present": config.studio_db.exists(),
+        "ready_channel_configured": bool(config.ready_channel_id),
         "page_count": len(config.pages),
         "enabled_page_count": sum(1 for page in config.pages if page.enabled),
         "pages": [

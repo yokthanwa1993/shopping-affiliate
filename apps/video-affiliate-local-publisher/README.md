@@ -18,10 +18,12 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 ## Production flow
 
 1. อ่าน Studio SQLite ด้วย URI `mode=ro`
-2. เลือก `content_items.status='ready'` ที่มี Editor Message ID, video attachment, Shopee URL และ caption ครบ
+2. เลือกเฉพาะ `content_items.status='ready'` ที่มี Ready Message ID, Ready video attachment, Shopee/Lazada URL และ metadata แยกครบ
+   - Studio source of truth คือ `ai_caption_text` (วลีชื่อสินค้า) + `ai_hashtags_json` (4 อัน); publisher ประกอบข้อความพร้อมโพสต์ตรง boundary ก่อนส่ง Facebook
+   - `ai_post_caption` เป็น legacy/deprecated และห้ามใช้เป็น source of truth
    - Page ที่ตั้ง `reuse_success_from_page_id` จะเลือกได้เฉพาะ Content ID ที่ Page ต้นทางมี SQLite state=`success` แล้ว
    - `daily_success_limit` เป็น hard cap จำนวน Reel ที่โพสต์แล้วต่อวันตาม timezone ของ Page; นับตั้งแต่ `post_confirmed` แม้ comment/readback ยังรอ และ scheduler เลื่อนไปรอบวันถัดไปเมื่อครบเพดาน
-3. resolve Discord `#editor` message สดและตรวจ attachment/buttons ตรง Studio DB
+3. resolve Discord `#ready` message สดจาก `ready_channel_id` และตรวจ attachment/buttons ตรง Studio DB; ไม่มี fallback ไป `#editor`
 4. ถ้า Page เปิด `avatar_enabled` ให้ตรวจ Avatar local จาก `avatar_path` ด้วย ffprobe; ถ้าไฟล์หายหรือเสียให้ fail closed โดยไม่ fallback ไป Cloudflare. Page ที่ปิด Avatar ใช้ source MP4 ตรงๆ
 5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe/SHA-256 แล้ว atomic-copy ต้นฉบับก่อน Avatar ไป `source-archive/` แบบ 0600; archive fail จะหยุดก่อน Facebook write
 6. compose Avatar ผ่าน local merge-rust `127.0.0.1:18080`
@@ -48,7 +50,7 @@ python3 -m unittest discover -s test -v
 python3 install_launchagent.py
 ```
 
-`lookup_facebook_source.py` เป็น read-only: resolve Facebook share/reel URL ผ่าน HTTP ตรง แล้วไล่ `post_attempts → source_items/source_archives → Studio content_items` เพื่อคืน Content ID, local archive path และ Discord Editor jumper ของวิดีโอที่ใช้โพสต์จริง โดยไม่อ่านหรือแสดง token/cookie.
+`lookup_facebook_source.py` เป็น read-only: resolve Facebook share/reel URL ผ่าน HTTP ตรง แล้วไล่ `post_attempts → source_items/source_archives → Studio content_items` เพื่อคืน Content ID และ local archive path ของวิดีโอที่ใช้โพสต์จริง โดยไม่อ่านหรือแสดง token/cookie.
 
 การ activate production ต้องทำหลัง explicit approval และ cutover owner เดิมแล้ว:
 

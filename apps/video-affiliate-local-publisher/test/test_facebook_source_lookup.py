@@ -68,15 +68,18 @@ class FacebookSourceLookupTests(unittest.TestCase):
                 CREATE TABLE content_items(
                   id INTEGER PRIMARY KEY,
                   status TEXT,
-                  edited_message_id TEXT,
+                  ready_message_id TEXT,
                   source_post_id TEXT,
                   source_link TEXT,
                   reel_url TEXT,
-                  ai_post_caption TEXT
+                  ai_caption_text TEXT,
+                  ai_hashtags_json TEXT
                 );
                 INSERT INTO content_items VALUES(
                   9011,'ready','1535481665772716112','legacy-r2:8107b39c',
-                  'https://s.shopee.co.th/example','https://example.invalid/original','caption'
+                  'https://s.shopee.co.th/example','https://example.invalid/original',
+                  'เครื่องทำน้ำแข็งพกพา',
+                  '["#เครื่องทำน้ำแข็ง","#ทำน้ำแข็ง","#เครื่องครัว","#ของใช้"]'
                 );
                 """
             )
@@ -111,23 +114,23 @@ class FacebookSourceLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(FacebookLookupError, "facebook_url_required"):
             resolve_input("https://example.com/share/r/test")
 
-    def test_lookup_returns_exact_editor_jumper(self):
+    def test_lookup_returns_exact_ready_jumper(self):
         ledger, studio = self.make_databases()
         result = lookup_source(
             ledger,
             studio,
             ["1352962457008449", "100068841215950"],
             guild_id="1500909618275156070",
-            editor_channel_id="1518808518176800769",
+            ready_channel_id="1518808518176800769",
         )
         self.assertTrue(result["found"])
         self.assertEqual(result["studio_content_id"], 9011)
-        self.assertEqual(result["editor_message_id"], "1535481665772716112")
+        self.assertEqual(result["ready_message_id"], "1535481665772716112")
         self.assertEqual(
-            result["editor_jump_url"],
+            result["ready_jump_url"],
             "https://discord.com/channels/1500909618275156070/1518808518176800769/1535481665772716112",
         )
-        self.assertFalse(result["editor_pointer_changed"])
+        self.assertFalse(result["ready_pointer_changed"])
         self.assertEqual(result["archive_path"], "/archive/content_9011_sha-source.mp4")
         self.assertEqual(result["archive_bytes"], 123456)
 
@@ -138,7 +141,7 @@ class FacebookSourceLookupTests(unittest.TestCase):
             studio,
             ["999"],
             guild_id="1500909618275156070",
-            editor_channel_id="1518808518176800769",
+            ready_channel_id="1518808518176800769",
         )
         self.assertEqual(result, {"found": False, "candidate_ids": ["999"]})
 

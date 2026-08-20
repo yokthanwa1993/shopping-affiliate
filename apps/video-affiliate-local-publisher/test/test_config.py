@@ -26,6 +26,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.pages[0].reuse_success_from_page_id, "")
         self.assertEqual(config.stale_posting_seconds, 15 * 60)
         self.assertEqual(config.host, "127.0.0.1")
+        self.assertEqual(config.ready_channel_id, "")
+
+    def test_ready_channel_is_explicit(self):
+        config = self.make({
+            "ready_channel_id": "1234567890",
+            "pages": [{"page_id": "1008898512617594"}],
+        })
+        self.assertEqual(config.ready_channel_id, "1234567890")
+        self.assertFalse(hasattr(config, "editor_channel_id"))
 
     def test_stale_posting_threshold_has_conservative_minimum(self):
         config = self.make({

@@ -39,8 +39,10 @@ class PublisherEngine:
         self.ledger = Ledger(config.ledger_db)
         self.studio = StudioSource(config.studio_db)
         self.spool = Spool(config.spool_root)
+        if not config.ready_channel_id:
+            raise PublisherError("ready_channel_not_configured")
         self.discord = DiscordSource(
-            config.editor_channel_id,
+            config.ready_channel_id,
             discord_bot_token(config.discord_env_file),
         )
         self._idbridge: Optional[IDBridgeClient] = None
@@ -401,10 +403,9 @@ class PublisherEngine:
                     "comment_id": str(current["comment_id"] or comment_id),
                     "permalink": str(current["permalink"] or posted.get("post_url", "")),
                 }
-            self.ledger.transition(attempt_id, "post_success_verification_failed", {
-                "error_code": _error_code(exc),
-                "error_detail_redacted": redact_error(exc),
-            })
+            self.ledger.record_verification_failure(
+                attempt_id, _error_code(exc), redact_error(exc),
+            )
             self._notify_failure(page.page_id, attempt_id, "post_success_verification_failed", exc)
             raise
         self.ledger.transition(attempt_id, "success", {
@@ -507,8 +508,8 @@ class PublisherEngine:
                     candidate_errors.append("source_no_longer_ready")
                     continue
                 resolved = self.discord.fetch(
-                    item.editor_message_id, item.shopee_url, item.lazada_url,
-                    item.editor_video_url,
+                    item.ready_message_id, item.shopee_url, item.lazada_url,
+                    item.ready_video_url,
                 )
                 source = self.spool.download(
                     probe_id, resolved.url, "source.mp4",
@@ -669,10 +670,13 @@ class PublisherEngine:
             readback = self._verify_live_readback(page, story_id, comment_id, comment)
         except Exception as exc:
             if state == "verifying":
-                self.ledger.transition(attempt_id, "post_success_verification_failed", {
-                    "error_code": _error_code(exc),
-                    "error_detail_redacted": redact_error(exc),
-                })
+                self.ledger.record_verification_failure(
+                    attempt_id, _error_code(exc), redact_error(exc),
+                )
+            elif state == "post_success_verification_failed":
+                self.ledger.record_verification_failure(
+                    attempt_id, _error_code(exc), redact_error(exc),
+                )
             self._notify_failure(page.page_id, attempt_id, "post_success_verification_failed", exc)
             raise
         self.ledger.transition(attempt_id, "success", {
@@ -747,6 +751,10 @@ class PublisherEngine:
                     "post_success_comment_failed",
                 }:
                     self.ledger.record_comment_failure(
+                        attempt_id, _error_code(exc), redact_error(exc), now=at,
+                    )
+                elif str(current["state"]) == "post_success_verification_failed":
+                    self.ledger.record_verification_failure(
                         attempt_id, _error_code(exc), redact_error(exc), now=at,
                     )
                 raise

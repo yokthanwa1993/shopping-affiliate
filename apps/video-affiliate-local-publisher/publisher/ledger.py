@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS pages(
   last_success_at INTEGER,
   updated_at INTEGER NOT NULL
 );
+-- editor_message_id is a legacy SQLite column name retained for compatibility;
+-- new writes store the canonical Ready message identity in it.
 CREATE TABLE IF NOT EXISTS source_items(
   studio_content_id INTEGER PRIMARY KEY,
   editor_message_id TEXT NOT NULL UNIQUE,
@@ -187,6 +189,13 @@ class Ledger:
                       WHEN comment_retry_count<1 THEN 1 ELSE comment_retry_count END,
                     comment_retry_at=COALESCE(comment_retry_at,updated_at)
                 WHERE state='post_success_comment_failed'
+            """)
+            conn.execute("""
+                UPDATE post_attempts
+                SET comment_retry_count=CASE
+                      WHEN comment_retry_count<1 THEN 1 ELSE comment_retry_count END,
+                    comment_retry_at=COALESCE(comment_retry_at,updated_at)
+                WHERE state='post_success_verification_failed'
             """)
         self.path.chmod(0o600)
 
@@ -345,7 +354,7 @@ class Ledger:
                   source_sha256=CASE WHEN excluded.source_sha256!='' THEN excluded.source_sha256 ELSE source_items.source_sha256 END,
                   shopee_url=excluded.shopee_url,lazada_url=excluded.lazada_url,caption=excluded.caption,
                   ready_at=excluded.ready_at,last_seen_at=excluded.last_seen_at,source_status='ready'
-            """, (item.content_id, item.editor_message_id, attachment_id, sha256,
+            """, (item.content_id, item.ready_message_id, attachment_id, sha256,
                   item.shopee_url, item.lazada_url, item.caption, item.ready_at, now))
 
     def source_item(self, content_id: int) -> Dict[str, Any]:
@@ -555,12 +564,60 @@ class Ledger:
             conn.commit()
         return retry_at
 
+    def record_verification_failure(self, attempt_id: str, code: str, detail: str,
+                                    now: Optional[int] = None) -> int:
+        current = int(now or time.time())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("""
+                SELECT state,comment_retry_count FROM post_attempts WHERE attempt_id=?
+            """, (attempt_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise LedgerError("attempt_not_found")
+            old_state = str(row["state"])
+            if old_state == "post_success_verification_failed":
+                new_state = old_state
+            elif "post_success_verification_failed" in ALLOWED_TRANSITIONS.get(old_state, set()):
+                new_state = "post_success_verification_failed"
+            else:
+                conn.rollback()
+                raise LedgerError(
+                    f"state_transition_invalid:{old_state}:post_success_verification_failed"
+                )
+            retry_count = int(row["comment_retry_count"] or 0) + 1
+            retry_at = current + self.comment_retry_delay(retry_count)
+            fields = {
+                "error_code": str(code)[:100],
+                "error_detail_redacted": str(detail)[:240],
+                "comment_retry_count": retry_count,
+                "comment_retry_at": retry_at,
+            }
+            conn.execute("""
+                UPDATE post_attempts
+                SET state=?,error_code=?,error_detail_redacted=?,comment_retry_count=?,
+                    comment_retry_at=?,updated_at=?,completed_at=?
+                WHERE attempt_id=?
+            """, (
+                new_state, fields["error_code"], fields["error_detail_redacted"],
+                retry_count, retry_at, current, current, attempt_id,
+            ))
+            conn.execute("""
+                INSERT INTO events(attempt_id,old_state,new_state,detail_json,created_at)
+                VALUES(?,?,?,?,?)
+            """, (
+                attempt_id, old_state, new_state,
+                json.dumps(fields, ensure_ascii=False), current,
+            ))
+            conn.commit()
+        return retry_at
+
     def due_comment_retries(self, now: Optional[int] = None, limit: int = 1) -> List[Dict[str, Any]]:
         current = int(now or time.time())
         with self.connect() as conn:
             rows = conn.execute("""
                 SELECT * FROM post_attempts
-                WHERE state='post_success_comment_failed'
+                WHERE state IN ('post_success_comment_failed','post_success_verification_failed')
                   AND (comment_retry_at IS NULL OR comment_retry_at<=?)
                 ORDER BY COALESCE(comment_retry_at,updated_at),updated_at,attempt_id
                 LIMIT ?
@@ -650,7 +707,7 @@ class Ledger:
             ).fetchone()
             due_comment_retries = int(conn.execute("""
                 SELECT COUNT(*) FROM post_attempts
-                WHERE state='post_success_comment_failed'
+                WHERE state IN ('post_success_comment_failed','post_success_verification_failed')
                   AND (comment_retry_at IS NULL OR comment_retry_at<=?)
             """, (int(time.time()),)).fetchone()[0])
             last = conn.execute("SELECT attempt_id,page_id,studio_content_id,state,updated_at,error_code FROM post_attempts ORDER BY updated_at DESC LIMIT 1").fetchone()

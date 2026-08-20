@@ -182,7 +182,7 @@ class LedgerTests(unittest.TestCase):
     def test_source_archive_is_sql_backed_and_summarized(self):
         item = SimpleNamespace(
             content_id=77,
-            editor_message_id="message-77",
+            ready_message_id="message-77",
             shopee_url="https://shopee.co.th/product/1/77",
             lazada_url="https://www.lazada.co.th/products/example-i77.html",
             caption="caption",
@@ -216,6 +216,22 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(row["state"], "post_success_comment_failed")
         self.assertEqual(row["comment_retry_count"], 1)
         self.assertGreater(row["comment_retry_at"], 100)
+        self.assertEqual(self.ledger.due_comment_retries(now=100), [])
+        due = self.ledger.due_comment_retries(now=row["comment_retry_at"])
+        self.assertEqual([item["attempt_id"] for item in due], [attempt])
+
+    def test_verification_failure_is_retried_without_reposting(self):
+        attempt = self.ledger.claim_attempt("p1", 188, "slot-verify", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending", "verifying",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.record_verification_failure(attempt, "rate_limited", "redacted", now=100)
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "post_success_verification_failed")
+        self.assertEqual(row["comment_retry_count"], 1)
         self.assertEqual(self.ledger.due_comment_retries(now=100), [])
         due = self.ledger.due_comment_retries(now=row["comment_retry_at"])
         self.assertEqual([item["attempt_id"] for item in due], [attempt])

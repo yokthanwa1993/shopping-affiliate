@@ -21,8 +21,8 @@ class DiscordSourceTests(unittest.TestCase):
     def test_custom_id_buttons_are_bound_by_labels_and_video_path(self):
         payload = self.payload()
         payload["components"] = [{"components": [
-            {"type": 2, "custom_id": "shopee:1", "label": "SHOPEE"},
-            {"type": 2, "custom_id": "lazada:1", "label": "LAZADA"},
+            {"type": 2, "style": 4, "custom_id": "editshopee_v1", "label": "SHOPEE"},
+            {"type": 2, "style": 1, "custom_id": "editlazada_v1", "label": "LAZADA"},
         ]}]
         video = parse_editor_message(
             payload, "123", "https://s.shopee.co.th/abc", "https://s.lazada.co.th/xyz",

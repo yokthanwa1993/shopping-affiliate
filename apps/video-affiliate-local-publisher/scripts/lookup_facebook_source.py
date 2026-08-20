@@ -133,7 +133,7 @@ def lookup_source(
     studio_db: Path,
     candidate_ids: List[str],
     guild_id: str,
-    editor_channel_id: str,
+    ready_channel_id: str,
 ) -> Dict[str, object]:
     ids = _dedupe([value for value in candidate_ids if DIGITS.fullmatch(str(value))])
     if not ids:
@@ -174,7 +174,8 @@ def lookup_source(
     with _readonly(studio_db) as studio:
         studio_row = studio.execute(
             """
-            SELECT id,status,edited_message_id,source_post_id,source_link,reel_url,ai_post_caption
+            SELECT id,status,ready_message_id,source_post_id,source_link,reel_url,
+                   ai_caption_text,ai_hashtags_json
             FROM content_items WHERE id=?
             """,
             (item["studio_content_id"],),
@@ -182,7 +183,7 @@ def lookup_source(
     studio_item = dict(studio_row) if studio_row else {}
 
     message_at_post = str(item.get("editor_message_id") or "").strip()
-    message_current = str(studio_item.get("edited_message_id") or "").strip()
+    message_current = str(studio_item.get("ready_message_id") or "").strip()
     message_id = message_at_post or message_current
     pointer_changed = bool(message_at_post and message_current and message_at_post != message_current)
 
@@ -198,10 +199,10 @@ def lookup_source(
         "fb_post_tail": item["fb_post_tail"],
         "permalink": item["permalink"],
         "completed_at": item["completed_at"],
-        "editor_message_id": message_id,
-        "editor_message_id_at_post": message_at_post,
-        "editor_message_id_current": message_current,
-        "editor_pointer_changed": pointer_changed,
+        "ready_message_id": message_id,
+        "ready_message_id_at_post": message_at_post,
+        "ready_message_id_current": message_current,
+        "ready_pointer_changed": pointer_changed,
         "source_attachment_id": item.get("source_attachment_id") or "",
         "source_sha256": item.get("source_sha256") or "",
         "archive_path": item.get("archive_path") or "",
@@ -211,19 +212,19 @@ def lookup_source(
         "source_post_id": studio_item.get("source_post_id") or "",
     }
     if message_id:
-        result["editor_jump_url"] = (
-            f"https://discord.com/channels/{guild_id}/{editor_channel_id}/{message_id}"
+        result["ready_jump_url"] = (
+            f"https://discord.com/channels/{guild_id}/{ready_channel_id}/{message_id}"
         )
     if pointer_changed:
-        result["editor_current_jump_url"] = (
-            f"https://discord.com/channels/{guild_id}/{editor_channel_id}/{message_current}"
+        result["ready_current_jump_url"] = (
+            f"https://discord.com/channels/{guild_id}/{ready_channel_id}/{message_current}"
         )
     return result
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Resolve a Facebook Reel/share URL back to its Studio Editor source"
+        description="Resolve a Facebook Reel/share URL back to its Studio Ready source"
     )
     result.add_argument("facebook_url_or_id")
     result.add_argument("--config", type=Path, default=None)
@@ -241,7 +242,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             config.studio_db,
             resolved["candidate_ids"],
             guild_id=args.guild_id,
-            editor_channel_id=config.editor_channel_id,
+            ready_channel_id=config.ready_channel_id,
         )
         result["resolved_urls"] = resolved["urls"]
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -3,7 +3,7 @@
   "ledger_db": "~/Library/Application Support/VideoAffiliatePublisher/example-publisher.db",
   "spool_root": "~/Library/Application Support/VideoAffiliatePublisher/example-spool",
   "log_root": "~/Library/Logs/VideoAffiliatePublisher/example",
-  "editor_channel_id": "1518808518176800769",
+  "ready_channel_id": "",
   "discord_env_file": "~/Developer/shopping-affiliate/apps/admin-media-drive/.env",
   "idbridge_auth_file": "~/Library/Application Support/IDBridge/service-auth",
   "idbridge_url": "http://127.0.0.1:8798",
