@@ -37,9 +37,10 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 
 ### แคปชั่นเพจเฉียบสำหรับโพสต์ใหม่
 
-- เฉพาะ Page ID `1008898512617594` วาง Shopee shortlink ที่ผ่าน preflight ของสินค้าที่บรรทัดแรกในรูป `📌พิกัด : <link>`
-- เว้นหนึ่งบรรทัดก่อนข้อความสินค้า และเว้นอีกหนึ่งบรรทัดก่อนแฮชแท็ก
-- ใช้แฮชแท็กจาก Studio ตามลำดับเดิมไม่เกิน 3 อัน
+- เฉพาะ Page ID `1008898512617594` วาง Shopee shortlink ที่ผ่าน preflight ของสินค้าที่บรรทัดแรกในรูป `📌 พิกัด : <link>`
+- บังคับ 3 บรรทัดติดกันโดยไม่มีบรรทัดว่าง: ลิงก์, ข้อความสินค้าสั้น, แฮชแท็ก 3 อัน
+- ใช้ metadata แยกของ Studio เดิมแบบ read-only; เริ่มจาก 3 แฮชแท็กแรก และย่อแฮชแท็กแบบ deterministic เฉพาะเมื่อจำเป็นเพื่อให้ข้อความรวมไม่เกิน 130 ตัวอักษร
+- ถ้ายังประกอบ 3 แฮชแท็กภายใน 130 ตัวอักษรไม่ได้ ให้หยุดก่อนเรียก Facebook `/post`
 - Page อื่นยังใช้แคปชั่น link-free เดิม และการเปลี่ยนนี้ไม่แก้โพสต์เก่า
 
 SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, comment retry count/next retry, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ attempt เดิมเท่านั้น; ห้ามสร้าง Reel ซ้ำ

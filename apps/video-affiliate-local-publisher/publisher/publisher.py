@@ -26,8 +26,16 @@ class PublisherError(RuntimeError):
 
 URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 CHEARB_PAGE_ID = "1008898512617594"
-CAPTION_LINK_PIN_PREFIX = "📌พิกัด : "
+CAPTION_LINK_PIN_PREFIX = "📌 พิกัด : "
 CHEARB_CAPTION_HASHTAG_LIMIT = 3
+CHEARB_CAPTION_MAX_CHARS = 130
+CHEARB_HASHTAG_REDUCTIONS = (
+    "จัดระเบียบ", "มีลิ้นชัก", "สำหรับ", "อัตโนมัติ", "แบบ",
+    "เพื่อ", "เสริม", "นั่ง", "ติด", "เก็บ", "พกพา",
+)
+CHEARB_HASHTAG_SUFFIXES = (
+    "มอเตอร์ไซค์", "เครื่องสำอาง", "เครื่องแป้ง", "สกู๊ตเตอร์",
+)
 
 
 def _error_code(error: Exception) -> str:
@@ -88,23 +96,96 @@ class PublisherEngine:
             shopee_link = str(item.shopee_url or "").strip()
             if not shopee_link or not URL_PATTERN.match(shopee_link):
                 raise PublisherError("caption_shopee_link_missing")
-            lines = caption.splitlines()
-            hashtag_line = ""
-            if lines and lines[-1].lstrip().startswith("#"):
+            lines = [line.strip() for line in caption.splitlines() if line.strip()]
+            hashtags = []
+            if lines and lines[-1].startswith("#"):
                 hashtags = [token for token in lines.pop().split() if token.startswith("#")]
-                hashtag_line = " ".join(hashtags[:CHEARB_CAPTION_HASHTAG_LIMIT])
-            product_text = "\n".join(lines).strip()
+            if len(hashtags) < CHEARB_CAPTION_HASHTAG_LIMIT:
+                raise PublisherError("caption_hashtags_incomplete")
+            product_text = " ".join(lines).strip()
             if not product_text:
                 raise PublisherError("caption_product_text_missing")
             if URL_PATTERN.search(product_text):
                 raise PublisherError("caption_product_text_link_forbidden")
-            sections = [f"{CAPTION_LINK_PIN_PREFIX}{shopee_link}", product_text]
-            if hashtag_line:
-                sections.append(hashtag_line)
-            return "\n\n".join(sections)
+            link_line = f"{CAPTION_LINK_PIN_PREFIX}{shopee_link}"
+            hashtag_line = PublisherEngine._chearb_hashtag_line(
+                link_line, product_text, hashtags,
+            )
+            value = "\n".join((link_line, product_text, hashtag_line))
+            if len(value) > CHEARB_CAPTION_MAX_CHARS:
+                raise PublisherError("caption_too_long")
+            return value
         if URL_PATTERN.search(caption):
             raise PublisherError("caption_visible_link_forbidden")
         return caption
+
+    @staticmethod
+    def _chearb_hashtag_line(link_line: str, product_text: str,
+                             hashtags: list[str]) -> str:
+        limit = CHEARB_CAPTION_MAX_CHARS - len(link_line) - len(product_text) - 2
+        selected = [str(tag).strip() for tag in hashtags[:CHEARB_CAPTION_HASHTAG_LIMIT]]
+        if len(" ".join(selected)) <= limit:
+            return " ".join(selected)
+
+        candidates: list[tuple[int, int, str]] = []
+        for index, raw in enumerate(hashtags):
+            for priority, candidate in enumerate(PublisherEngine._hashtag_variants(raw)):
+                candidates.append((priority, index, candidate))
+        candidates.sort(key=lambda value: (value[0], value[1], len(value[2])))
+
+        fits: list[tuple[int, int, int, list[str]]] = []
+        for first in range(len(candidates)):
+            for second in range(first + 1, len(candidates)):
+                for third in range(second + 1, len(candidates)):
+                    picks = [candidates[first], candidates[second], candidates[third]]
+                    proposal = [value[2] for value in picks]
+                    if len({value[1] for value in picks}) != CHEARB_CAPTION_HASHTAG_LIMIT:
+                        continue
+                    if len({token.casefold() for token in proposal}) != CHEARB_CAPTION_HASHTAG_LIMIT:
+                        continue
+                    total = len(" ".join(proposal))
+                    if total <= limit:
+                        fits.append((sum(value[0] for value in picks), total,
+                                     sum(value[1] for value in picks), proposal))
+        if fits:
+            proposal = min(fits, key=lambda value: (value[0], value[1], value[2]))[3]
+            return " ".join(proposal)
+
+        raise PublisherError("caption_too_long")
+
+    @staticmethod
+    def _hashtag_variants(raw: str) -> list[str]:
+        tag = str(raw or "").strip()
+        if not tag.startswith("#") or any(ch.isspace() for ch in tag):
+            return []
+        body = tag[1:]
+        variants = [tag]
+        for reduction in CHEARB_HASHTAG_REDUCTIONS:
+            if reduction in body:
+                reduced = body.replace(reduction, "", 1).strip()
+                if len(reduced) >= 4:
+                    variants.append(f"#{reduced}")
+        compact = body
+        for reduction in CHEARB_HASHTAG_REDUCTIONS:
+            compact = compact.replace(reduction, "")
+        compact = compact.strip()
+        if len(compact) >= 4:
+            variants.append(f"#{compact}")
+        for suffix in CHEARB_HASHTAG_SUFFIXES:
+            pos = body.find(suffix)
+            if pos > 3:
+                prefix = body[:pos].strip()
+                if len(prefix) >= 4:
+                    variants.append(f"#{prefix}")
+                variants.append(f"#{suffix}")
+        deduped = []
+        seen = set()
+        for candidate in variants:
+            key = candidate.casefold()
+            if key not in seen and len(candidate) >= 3:
+                deduped.append(candidate)
+                seen.add(key)
+        return deduped
 
     @staticmethod
     def canonical_story(page_id: str, story_id: str) -> tuple[str, str]:

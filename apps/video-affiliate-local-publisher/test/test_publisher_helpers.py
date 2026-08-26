@@ -21,32 +21,66 @@ class PublisherHelpersTests(unittest.TestCase):
             shopee_url="https://s.shopee.co.th/example",
             caption="ราวตากผ้าแบบพับได้\n\n#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน #จัดระเบียบบ้าน",
         )
+        value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
         self.assertEqual(
-            PublisherEngine.caption(cast(Any, self.page), cast(Any, item)),
-            "📌พิกัด : https://s.shopee.co.th/example\n\n"
-            "ราวตากผ้าแบบพับได้\n\n"
+            value,
+            "📌 พิกัด : https://s.shopee.co.th/example\n"
+            "ราวตากผ้าแบบพับได้\n"
             "#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน",
         )
+        self.assertEqual(len(value.splitlines()), 3)
+        self.assertNotIn("\n\n", value)
+        self.assertLessEqual(len(value), 130)
 
     def test_chearb_caption_requires_a_shopee_link(self):
         item = SimpleNamespace(shopee_url="", caption="สินค้าน่าใช้\n\n#รีวิว")
         with self.assertRaisesRegex(PublisherError, "caption_shopee_link_missing"):
             PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
 
-    def test_chearb_caption_without_hashtags_keeps_link_and_product_only(self):
+    def test_chearb_caption_requires_at_least_three_hashtags(self):
         item = SimpleNamespace(
             shopee_url="https://s.shopee.co.th/example",
-            caption="สินค้าน่าใช้",
+            caption="สินค้าน่าใช้\n\n#หนึ่ง #สอง",
         )
+        with self.assertRaisesRegex(PublisherError, "caption_hashtags_incomplete"):
+            PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+
+    def test_chearb_caption_compacts_ready_hashtags_to_hard_limit(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/3ViCVKSEo9",
+            caption=(
+                "ชั้นวางเครื่องสำอางมีลิ้นชัก\n\n"
+                "#ชั้นวางเครื่องสำอางมีลิ้นชัก #จัดระเบียบโต๊ะเครื่องแป้ง "
+                "#กล่องเก็บเครื่องสำอาง #ของใช้ในบ้าน"
+            ),
+        )
+        value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
         self.assertEqual(
-            PublisherEngine.caption(cast(Any, self.page), cast(Any, item)),
-            "📌พิกัด : https://s.shopee.co.th/example\n\nสินค้าน่าใช้",
+            value,
+            "📌 พิกัด : https://s.shopee.co.th/3ViCVKSEo9\n"
+            "ชั้นวางเครื่องสำอางมีลิ้นชัก\n"
+            "#กล่องเก็บเครื่องสำอาง #ของใช้ในบ้าน #โต๊ะเครื่องแป้ง",
         )
+        self.assertEqual(len(value.splitlines()), 3)
+        self.assertEqual(len(value.splitlines()[2].split()), 3)
+        self.assertLessEqual(len(value), 130)
+
+    def test_chearb_caption_fails_closed_when_three_tags_cannot_fit(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption=(
+                f"{'สินค้า' * 10}\n\n"
+                f"#{'รายละเอียด' * 8} #{'รูปแบบ' * 8} "
+                f"#{'หมวดหมู่' * 8} #{'ลักษณะ' * 8}"
+            ),
+        )
+        with self.assertRaisesRegex(PublisherError, "caption_too_long"):
+            PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
 
     def test_chearb_caption_rejects_visible_link_inside_product_text(self):
         item = SimpleNamespace(
             shopee_url="https://s.shopee.co.th/example",
-            caption="ดูเพิ่ม https://example.com\n\n#รีวิว",
+            caption="ดูเพิ่ม https://example.com\n\n#รีวิว #สินค้า #ของใช้",
         )
         with self.assertRaisesRegex(PublisherError, "caption_product_text_link_forbidden"):
             PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
@@ -297,8 +331,8 @@ class PublisherHelpersTests(unittest.TestCase):
             engine._publish_real(page, item, attempt, video)
             self.assertEqual(
                 bridge.post_caption,
-                "📌พิกัด : https://s.shopee.co.th/preflight\n\n"
-                "ราวตากผ้าแบบพับได้\n\n#หนึ่ง #สอง #สาม",
+                "📌 พิกัด : https://s.shopee.co.th/preflight\n"
+                "ราวตากผ้าแบบพับได้\n#หนึ่ง #สอง #สาม",
             )
 
     def test_reconcile_reuses_existing_comment_without_reposting(self):
