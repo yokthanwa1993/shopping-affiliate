@@ -16,14 +16,51 @@ class PublisherHelpersTests(unittest.TestCase):
     def setUp(self):
         self.page = SimpleNamespace(page_id="1008898512617594", caption_template="{caption}")
 
-    def test_caption_rejects_visible_link(self):
-        item = SimpleNamespace(caption="ซื้อเลย https://example.com")
-        with self.assertRaises(PublisherError):
+    def test_chearb_caption_adds_product_link_first_and_limits_hashtags(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="ราวตากผ้าแบบพับได้\n\n#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน #จัดระเบียบบ้าน",
+        )
+        self.assertEqual(
+            PublisherEngine.caption(cast(Any, self.page), cast(Any, item)),
+            "📌พิกัด : https://s.shopee.co.th/example\n\n"
+            "ราวตากผ้าแบบพับได้\n\n"
+            "#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน",
+        )
+
+    def test_chearb_caption_requires_a_shopee_link(self):
+        item = SimpleNamespace(shopee_url="", caption="สินค้าน่าใช้\n\n#รีวิว")
+        with self.assertRaisesRegex(PublisherError, "caption_shopee_link_missing"):
+            PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+
+    def test_chearb_caption_without_hashtags_keeps_link_and_product_only(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="สินค้าน่าใช้",
+        )
+        self.assertEqual(
+            PublisherEngine.caption(cast(Any, self.page), cast(Any, item)),
+            "📌พิกัด : https://s.shopee.co.th/example\n\nสินค้าน่าใช้",
+        )
+
+    def test_chearb_caption_rejects_visible_link_inside_product_text(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="ดูเพิ่ม https://example.com\n\n#รีวิว",
+        )
+        with self.assertRaisesRegex(PublisherError, "caption_product_text_link_forbidden"):
             PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
 
     def test_caption_preserves_link_free_text(self):
-        item = SimpleNamespace(caption="สินค้าน่าใช้ #รีวิว")
-        self.assertEqual(PublisherEngine.caption(cast(Any, self.page), cast(Any, item)), "สินค้าน่าใช้ #รีวิว")
+        other_page = SimpleNamespace(page_id="200", caption_template="{caption}")
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="สินค้าน่าใช้ #รีวิว",
+        )
+        self.assertEqual(
+            PublisherEngine.caption(cast(Any, other_page), cast(Any, item)),
+            "สินค้าน่าใช้ #รีวิว",
+        )
 
     def test_canonical_story(self):
         story, tail = PublisherEngine.canonical_story("100", "200")
@@ -187,6 +224,82 @@ class PublisherHelpersTests(unittest.TestCase):
             self.assertEqual(ledger.attempt(attempt)["state"], "success")
             self.assertEqual(bridge.shorten_calls[-1], ("campaign", "100", "200"))
             self.assertIn("https://s.shopee.co.th/final", bridge.comment_message)
+
+    def test_chearb_publish_uses_preflight_shortlink_in_caption(self):
+        class FakeBridge:
+            def __init__(self):
+                self.post_caption = ""
+                self.comment_message = ""
+
+            def ensure_page(self, *args):
+                return None
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def shorten(self, product_url, account, affiliate_id, sub1, sub2, sub3):
+                del product_url, account, affiliate_id, sub1, sub2
+                return "https://s.shopee.co.th/final" if sub3 else "https://s.shopee.co.th/preflight?lp=aff"
+
+            def post(self, page_id, video_url, caption, account, source):
+                del page_id, video_url, account, source
+                self.post_caption = caption
+                return {
+                    "source": "facebook_lite_eaad6", "story_id": "200",
+                    "video_id": "video-1", "post_url": "https://facebook.test/1008898512617594_200",
+                }
+
+            def page_comment(self, page_id, story_id, message, account):
+                del page_id, story_id, account
+                self.comment_message = message
+                return "comment-1"
+
+            def graph_get(self, account, path, params):
+                del account, params
+                if path == "1008898512617594":
+                    return {"id": path}
+                if path == "1008898512617594_200":
+                    return {"id": path, "is_published": True, "permalink_url": "https://facebook.test/reel/200"}
+                if path == "comment-1":
+                    return {"id": path, "from": {"id": "1008898512617594"}, "message": self.comment_message}
+                if path == "1008898512617594_200/comments":
+                    return {"data": [{"id": "comment-1"}]}
+                raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            ledger = Ledger(root_path / "publisher.db")
+            attempt = ledger.claim_attempt("1008898512617594", 4, "slot-chearb-caption", "test")
+            for state in ["source_resolved", "downloaded", "avatar_composing", "avatar_ready"]:
+                ledger.transition(attempt, state)
+            video = root_path / "video.mp4"
+            video.write_bytes(b"video")
+            page = cast(Any, SimpleNamespace(
+                page_id="1008898512617594", name="เฉียบ", enabled=True, interval_minutes=30,
+                facebook_account="uid", power_editor_account="peuid",
+                posting_source="facebook_lite_eaad6", shopee_account="15130770000",
+                affiliate_id="15130770000", campaign_sub1="campaign",
+                caption_template="{caption}", comment_template="{shortlink}\ncomment",
+            ))
+            bridge = FakeBridge()
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.config = cast(Any, SimpleNamespace(
+                writes_enabled=True, comment_delay_seconds=0, pages=[page],
+            ))
+            engine.ledger = ledger
+            engine._idbridge = cast(Any, bridge)
+            engine.spool = cast(Any, SimpleNamespace(cleanup=lambda attempt_id: None))
+            item = cast(Any, SimpleNamespace(
+                content_id=4, ready_message_id="ready-4", ready_video_url="https://cdn/4.mp4",
+                shopee_url="https://shopee.co.th/product/1/4", lazada_url="https://lazada.test/4",
+                caption="ราวตากผ้าแบบพับได้\n\n#หนึ่ง #สอง #สาม #สี่", ready_at="now",
+            ))
+            engine._publish_real(page, item, attempt, video)
+            self.assertEqual(
+                bridge.post_caption,
+                "📌พิกัด : https://s.shopee.co.th/preflight\n\n"
+                "ราวตากผ้าแบบพับได้\n\n#หนึ่ง #สอง #สาม",
+            )
 
     def test_reconcile_reuses_existing_comment_without_reposting(self):
         class FakeBridge:

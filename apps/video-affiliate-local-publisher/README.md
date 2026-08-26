@@ -35,6 +35,13 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 12. comment-only backlog แยก retry ทีละหนึ่ง attempt ต่อ tick ด้วย exponential backoff 5 นาทีถึง 6 ชั่วโมง; failure ทุกช่วงของ retry จะเลื่อนเวลารอบถัดไป และ Page ที่ lease ไม่ว่างจะถูกข้ามเพื่อไม่กีดกัน backlog อื่น; repair ใช้ story เดิมและไม่เรียก `/post`
 13. startup/tick classifier ย้าย `posting` ที่เก่าและไม่มี Facebook IDs ไป `stale_posting_review`; recovery ต้องอ่าน story+video สด ตรวจ Page, caption digest, attachment target และเวลาใกล้ attempt ก่อน bind IDs เข้ารายการเดิม แล้วเดิน final link/comment/readback เท่านั้น
 
+### แคปชั่นเพจเฉียบสำหรับโพสต์ใหม่
+
+- เฉพาะ Page ID `1008898512617594` วาง Shopee shortlink ที่ผ่าน preflight ของสินค้าที่บรรทัดแรกในรูป `📌พิกัด : <link>`
+- เว้นหนึ่งบรรทัดก่อนข้อความสินค้า และเว้นอีกหนึ่งบรรทัดก่อนแฮชแท็ก
+- ใช้แฮชแท็กจาก Studio ตามลำดับเดิมไม่เกิน 3 อัน
+- Page อื่นยังใช้แคปชั่น link-free เดิม และการเปลี่ยนนี้ไม่แก้โพสต์เก่า
+
 SQLite เก็บ leases, state transitions, source/media hash, post/comment IDs, failure ที่ redact แล้ว, duplicate guard ต่อ `(page_id, studio_content_id)`, per-Page reuse policy/daily cap, comment retry count/next retry, recovery states และ `source_archives` keyed by `(studio_content_id, source_sha256)`. Comment/verification failure ใช้ attempt เดิมเท่านั้น; ห้ามสร้าง Reel ซ้ำ
 
 ## Commands

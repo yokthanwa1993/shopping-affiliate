@@ -25,6 +25,9 @@ class PublisherError(RuntimeError):
 
 
 URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+CHEARB_PAGE_ID = "1008898512617594"
+CAPTION_LINK_PIN_PREFIX = "📌พิกัด : "
+CHEARB_CAPTION_HASHTAG_LIMIT = 3
 
 
 def _error_code(error: Exception) -> str:
@@ -81,6 +84,24 @@ class PublisherEngine:
         caption = page.caption_template.format(caption=item.caption).strip()
         if not caption:
             raise PublisherError("caption_empty")
+        if page.page_id == CHEARB_PAGE_ID:
+            shopee_link = str(item.shopee_url or "").strip()
+            if not shopee_link or not URL_PATTERN.match(shopee_link):
+                raise PublisherError("caption_shopee_link_missing")
+            lines = caption.splitlines()
+            hashtag_line = ""
+            if lines and lines[-1].lstrip().startswith("#"):
+                hashtags = [token for token in lines.pop().split() if token.startswith("#")]
+                hashtag_line = " ".join(hashtags[:CHEARB_CAPTION_HASHTAG_LIMIT])
+            product_text = "\n".join(lines).strip()
+            if not product_text:
+                raise PublisherError("caption_product_text_missing")
+            if URL_PATTERN.search(product_text):
+                raise PublisherError("caption_product_text_link_forbidden")
+            sections = [f"{CAPTION_LINK_PIN_PREFIX}{shopee_link}", product_text]
+            if hashtag_line:
+                sections.append(hashtag_line)
+            return "\n\n".join(sections)
         if URL_PATTERN.search(caption):
             raise PublisherError("caption_visible_link_forbidden")
         return caption
@@ -213,9 +234,31 @@ class PublisherEngine:
         archived = self.spool.inspect(Path(str(archive["archive_path"])))
         if archived.sha256 != source_sha256 or archived.bytes != int(archive["archive_bytes"]):
             raise PublisherError("existing_story_source_archive_mismatch")
-        expected_caption = page.caption_template.format(caption=str(source["caption"])).strip()
-        if not expected_caption or URL_PATTERN.search(expected_caption):
-            raise PublisherError("existing_story_source_caption_invalid")
+        try:
+            preflight_link = str(initial["preflight_shortlink"] or "").strip()
+        except (KeyError, IndexError):
+            preflight_link = ""
+        if page.page_id == CHEARB_PAGE_ID and not preflight_link:
+            raise PublisherError("existing_story_preflight_shortlink_missing")
+        try:
+            expected_caption = self.caption(
+                page,
+                StudioItem(
+                    content_id=int(initial["studio_content_id"]),
+                    ready_message_id=str(source.get("editor_message_id") or ""),
+                    ready_video_url="",
+                    shopee_url=(
+                        preflight_link
+                        if page.page_id == CHEARB_PAGE_ID
+                        else str(source.get("shopee_url") or "")
+                    ),
+                    lazada_url=str(source.get("lazada_url") or ""),
+                    caption=str(source["caption"]),
+                    ready_at="",
+                ),
+            )
+        except PublisherError as exc:
+            raise PublisherError("existing_story_source_caption_invalid") from exc
         if self._caption_digest(expected_caption) != expected_digest:
             raise PublisherError("existing_story_expected_caption_changed")
 
@@ -313,12 +356,27 @@ class PublisherEngine:
         if not self.config.writes_enabled:
             raise PublisherError("external_writes_disabled")
         self._preflight_identity(page)
-        preflight = self.idbridge.shorten(
+        preflight_raw = self.idbridge.shorten(
             item.shopee_url, page.shopee_account, page.affiliate_id,
             page.campaign_sub1, page.page_id, "",
         )
+        preflight = (
+            preflight_raw.removesuffix("?lp=aff")
+            .removesuffix("&lp=aff")
+        )
         self.ledger.transition(attempt_id, "shortlink_preflight_ok", {"preflight_shortlink": preflight})
-        caption = self.caption(page, item)
+        caption_item = item
+        if page.page_id == CHEARB_PAGE_ID:
+            caption_item = StudioItem(
+                content_id=item.content_id,
+                ready_message_id=item.ready_message_id,
+                ready_video_url=item.ready_video_url,
+                shopee_url=preflight,
+                lazada_url=item.lazada_url,
+                caption=item.caption,
+                ready_at=item.ready_at,
+            )
+        caption = self.caption(page, caption_item)
         with AssetServer() as server:
             video_url = server.register(composed_path)
             self.ledger.transition(attempt_id, "posting")
