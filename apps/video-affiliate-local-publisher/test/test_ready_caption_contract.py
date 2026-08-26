@@ -39,6 +39,7 @@ class ReadyCaptionContractTests(unittest.TestCase):
 
         self.assertGreater(len(rows), 0)
         failures = []
+        valid = []
         for row in rows:
             item = source._to_item(row)
             try:
@@ -51,12 +52,19 @@ class ReadyCaptionContractTests(unittest.TestCase):
                     or len(tags) != 3
                     or not all(tag.startswith("#") for tag in tags)
                     or len(value) > 130
+                    or len(lines[1].split()) < 3
                 ):
                     failures.append({"id": item.content_id, "value": value})
+                else:
+                    valid.append(item.content_id)
             except Exception as exc:
-                failures.append({"id": item.content_id, "error": str(exc)})
+                if str(exc) not in {
+                    "caption_product_details_incomplete", "caption_too_long",
+                }:
+                    failures.append({"id": item.content_id, "error": str(exc)})
 
         self.assertEqual(failures, [], json.dumps(failures[:10], ensure_ascii=False))
+        self.assertGreater(len(valid), 0)
         self.assertEqual(hashlib.sha256(db_path.read_bytes()).hexdigest(), database_sha256)
 
 

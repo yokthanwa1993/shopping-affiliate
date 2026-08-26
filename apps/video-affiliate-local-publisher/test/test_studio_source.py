@@ -61,6 +61,11 @@ class StudioSourceTests(unittest.TestCase):
             "เครื่องทำน้ำแข็งพกพา\n\n"
             "#เครื่องทำน้ำแข็ง #ทำน้ำแข็ง #เครื่องครัว #ของใช้",
         )
+        self.assertEqual(item.product_name, "เครื่องทำน้ำแข็งพกพา")
+        self.assertEqual(
+            item.hashtags,
+            ("#เครื่องทำน้ำแข็ง", "#ทำน้ำแข็ง", "#เครื่องครัว", "#ของใช้"),
+        )
         self.assertNotEqual(item.caption, "legacy caption")
 
     def test_caption_boundary_rejects_invalid_separated_metadata(self):

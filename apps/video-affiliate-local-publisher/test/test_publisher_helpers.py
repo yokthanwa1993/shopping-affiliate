@@ -20,13 +20,15 @@ class PublisherHelpersTests(unittest.TestCase):
         item = SimpleNamespace(
             shopee_url="https://s.shopee.co.th/example",
             caption="ราวตากผ้าแบบพับได้\n\n#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน #จัดระเบียบบ้าน",
+            product_name="ราวตากผ้าแบบพับได้",
+            hashtags=("#ราวตากผ้า", "#ตากผ้า", "#พับเก็บ", "#ของใช้ในบ้าน"),
         )
         value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
         self.assertEqual(
             value,
             "📌 พิกัด : https://s.shopee.co.th/example\n"
-            "ราวตากผ้าแบบพับได้\n"
-            "#ราวตากผ้า #ราวตากผ้าพับได้ #ของใช้ในบ้าน",
+            "ราวตากผ้า พับได้ ใช้ในบ้าน\n"
+            "#ราวตากผ้า #ตากผ้า #พับเก็บ",
         )
         self.assertEqual(len(value.splitlines()), 3)
         self.assertNotIn("\n\n", value)
@@ -45,7 +47,7 @@ class PublisherHelpersTests(unittest.TestCase):
         with self.assertRaisesRegex(PublisherError, "caption_hashtags_incomplete"):
             PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
 
-    def test_chearb_caption_compacts_ready_hashtags_to_hard_limit(self):
+    def test_chearb_caption_compacts_name_details_and_tags_to_fit(self):
         item = SimpleNamespace(
             shopee_url="https://s.shopee.co.th/3ViCVKSEo9",
             caption=(
@@ -53,16 +55,19 @@ class PublisherHelpersTests(unittest.TestCase):
                 "#ชั้นวางเครื่องสำอางมีลิ้นชัก #จัดระเบียบโต๊ะเครื่องแป้ง "
                 "#กล่องเก็บเครื่องสำอาง #ของใช้ในบ้าน"
             ),
+            product_name="ชั้นวางเครื่องสำอางมีลิ้นชัก",
+            hashtags=(
+                "#ชั้นวางเครื่องสำอางมีลิ้นชัก", "#จัดระเบียบโต๊ะเครื่องแป้ง",
+                "#กล่องเก็บเครื่องสำอาง", "#ของใช้ในบ้าน",
+            ),
         )
         value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
         self.assertEqual(
             value,
             "📌 พิกัด : https://s.shopee.co.th/3ViCVKSEo9\n"
-            "ชั้นวางเครื่องสำอางมีลิ้นชัก\n"
-            "#กล่องเก็บเครื่องสำอาง #ของใช้ในบ้าน #โต๊ะเครื่องแป้ง",
+            "ชั้นวางเครื่องสำอาง มีลิ้นชัก โต๊ะเครื่องแป้ง\n"
+            "#ของใช้ในบ้าน #โต๊ะเครื่องแป้ง #ชั้นวาง",
         )
-        self.assertEqual(len(value.splitlines()), 3)
-        self.assertEqual(len(value.splitlines()[2].split()), 3)
         self.assertLessEqual(len(value), 130)
 
     def test_chearb_caption_fails_closed_when_three_tags_cannot_fit(self):
@@ -84,6 +89,36 @@ class PublisherHelpersTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PublisherError, "caption_product_text_link_forbidden"):
             PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+
+    def test_chearb_caption_can_use_two_safe_context_details(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="พัดลมพกพา\n\n#พัดลมพกพา #ของใช้ในบ้าน #สินค้า #รีวิว",
+            product_name="พัดลมพกพา",
+            hashtags=("#พัดลมพกพา", "#ของใช้ในบ้าน", "#สินค้า", "#รีวิว"),
+        )
+        value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+        self.assertEqual(value.splitlines()[1], "พัดลม พกพา ใช้ในบ้าน")
+
+    def test_chearb_caption_moves_name_feature_to_a_distinct_detail(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="รอกคาราบิเนอร์พกพา\n\n#รอกคาราบิเนอร์ #ผ่อนแรงดึง #เครื่องมือช่าง #อุปกรณ์ช่าง",
+            product_name="รอกคาราบิเนอร์พกพา",
+            hashtags=("#รอกคาราบิเนอร์", "#ผ่อนแรงดึง", "#เครื่องมือช่าง", "#อุปกรณ์ช่าง"),
+        )
+        value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+        self.assertEqual(value.splitlines()[1], "รอกคาราบิเนอร์ พกพา ผ่อนแรงดึง")
+
+    def test_chearb_caption_prefers_electric_feature_over_category(self):
+        item = SimpleNamespace(
+            shopee_url="https://s.shopee.co.th/example",
+            caption="จักรยานเสือภูเขาไฟฟ้า\n\n#จักรยานเสือภูเขาไฟฟ้า #ปั่นจักรยาน #จักรยานไฟฟ้า #อุปกรณ์กีฬา",
+            product_name="จักรยานเสือภูเขาไฟฟ้า",
+            hashtags=("#จักรยานเสือภูเขาไฟฟ้า", "#ปั่นจักรยาน", "#จักรยานไฟฟ้า", "#อุปกรณ์กีฬา"),
+        )
+        value = PublisherEngine.caption(cast(Any, self.page), cast(Any, item))
+        self.assertEqual(value.splitlines()[1], "จักรยานเสือภูเขา ระบบไฟฟ้า ปั่นจักรยาน")
 
     def test_caption_preserves_link_free_text(self):
         other_page = SimpleNamespace(page_id="200", caption_template="{caption}")
@@ -329,12 +364,15 @@ class PublisherHelpersTests(unittest.TestCase):
                 content_id=4, ready_message_id="ready-4", ready_video_url="https://cdn/4.mp4",
                 shopee_url="https://shopee.co.th/product/1/4", lazada_url="https://lazada.test/4",
                 caption="ราวตากผ้าแบบพับได้\n\n#หนึ่ง #สอง #สาม #สี่", ready_at="now",
+                product_name="ราวตากผ้าแบบพับได้",
+                hashtags=("#ตากผ้า", "#พับเก็บ", "#ประหยัดพื้นที่", "#ของใช้ในบ้าน"),
             ))
             engine._publish_real(page, item, attempt, video)
             self.assertEqual(
                 bridge.post_caption,
                 "📌 พิกัด : https://s.shopee.co.th/preflight\n"
-                "ราวตากผ้าแบบพับได้\n#หนึ่ง #สอง #สาม",
+                "ราวตากผ้า พับได้ ประหยัดพื้นที่\n"
+                "#ตากผ้า #พับเก็บ #ประหยัดพื้นที่",
             )
             self.assertEqual(bridge.shorten_calls, [""])
             self.assertEqual(

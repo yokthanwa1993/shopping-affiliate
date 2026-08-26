@@ -29,6 +29,31 @@ CHEARB_PAGE_ID = "1008898512617594"
 CAPTION_LINK_PIN_PREFIX = "📌 พิกัด : "
 CHEARB_CAPTION_HASHTAG_LIMIT = 3
 CHEARB_CAPTION_MAX_CHARS = 130
+CHEARB_GENERIC_PRODUCT_TAGS = {
+    "ของใช้", "ของใช้ในบ้าน", "เครื่องมือช่าง", "อุปกรณ์ช่าง", "งานช่าง",
+    "เฟอร์นิเจอร์", "ยานยนต์", "กีฬา", "อุปกรณ์กีฬา",
+    "สินค้า", "รีวิว", "ช้อปปิ้ง",
+}
+CHEARB_GENERIC_DETAIL_LABELS = {
+    "ของใช้": "ใช้ทั่วไป", "ของใช้ในบ้าน": "ใช้ในบ้าน",
+    "เครื่องมือช่าง": "งานช่าง", "อุปกรณ์ช่าง": "งานช่าง",
+    "งานช่าง": "งานช่าง", "เฟอร์นิเจอร์": "แต่งบ้าน",
+    "ยานยนต์": "ใช้กับรถ", "กีฬา": "ใช้เล่นกีฬา",
+    "อุปกรณ์กีฬา": "ใช้เล่นกีฬา",
+}
+CHEARB_DETAIL_PREFIXES = (
+    "อุปกรณ์", "เครื่องมือ", "ของใช้", "ของแต่ง", "สำหรับ", "แบบ",
+)
+CHEARB_NAME_FEATURES = (
+    "ปรับระดับ", "ปรับได้", "พับเก็บ", "พับได้", "กางได้", "พกพา",
+    "ไร้สาย", "มือหมุน", "อัตโนมัติ", "มีล้อ", "บานเลื่อน", "ติดผนัง",
+    "ติดเพดาน", "พร้อมไฟ", "พร้อมแผงโซลาร์", "พร้อมถ้วยซอส", "สองทาง",
+    "หลายชั้น", "มีลิ้นชัก", "หมุนได้", "เคลื่อนที่", "แม่เหล็ก",
+    "ไฟฟ้า", "ดิจิตอล", "สแตนเลส",
+)
+CHEARB_NAME_FEATURE_LABELS = {
+    "ไฟฟ้า": "ระบบไฟฟ้า", "ดิจิตอล": "ระบบดิจิตอล",
+}
 CHEARB_HASHTAG_REDUCTIONS = (
     "จัดระเบียบ", "มีลิ้นชัก", "สำหรับ", "อัตโนมัติ", "แบบ",
     "เพื่อ", "เสริม", "นั่ง", "ติด", "เก็บ", "พกพา",
@@ -102,15 +127,35 @@ class PublisherEngine:
                 hashtags = [token for token in lines.pop().split() if token.startswith("#")]
             if len(hashtags) < CHEARB_CAPTION_HASHTAG_LIMIT:
                 raise PublisherError("caption_hashtags_incomplete")
-            product_text = " ".join(lines).strip()
-            if not product_text:
+            product_name = str(getattr(item, "product_name", "") or "").strip()
+            if not product_name:
+                product_name = " ".join(lines).strip()
+            if not product_name:
                 raise PublisherError("caption_product_text_missing")
-            if URL_PATTERN.search(product_text):
+            if URL_PATTERN.search(product_name):
                 raise PublisherError("caption_product_text_link_forbidden")
+            separated_hashtags = getattr(item, "hashtags", ())
+            if separated_hashtags:
+                hashtags = [str(tag).strip() for tag in separated_hashtags]
             link_line = f"{CAPTION_LINK_PIN_PREFIX}{shopee_link}"
-            hashtag_line = PublisherEngine._chearb_hashtag_line(
-                link_line, product_text, hashtags,
+            product_text = ""
+            hashtag_line = ""
+            product_copy_name, detail_pairs = PublisherEngine._chearb_product_details(
+                product_name, hashtags,
             )
+            for details in detail_pairs:
+                proposal = " ".join((product_copy_name, *details))
+                try:
+                    proposal_hashtags = PublisherEngine._chearb_hashtag_line(
+                        link_line, proposal, hashtags,
+                    )
+                except PublisherError:
+                    continue
+                product_text = proposal
+                hashtag_line = proposal_hashtags
+                break
+            if not product_text:
+                raise PublisherError("caption_too_long")
             value = "\n".join((link_line, product_text, hashtag_line))
             if len(value) > CHEARB_CAPTION_MAX_CHARS:
                 raise PublisherError("caption_too_long")
@@ -118,6 +163,117 @@ class PublisherEngine:
         if URL_PATTERN.search(caption):
             raise PublisherError("caption_visible_link_forbidden")
         return caption
+
+    @staticmethod
+    def _chearb_product_details(product_name: str,
+                                hashtags: list[str]) -> tuple[str, list[tuple[str, str]]]:
+        name = re.sub(r"\s+", " ", str(product_name or "")).strip()
+        if not name or "\n" in name or "\r" in name or URL_PATTERN.search(name):
+            raise PublisherError("caption_product_text_invalid")
+        tag_pools: list[tuple[int, list[str]]] = []
+        for raw in hashtags:
+            detail = re.sub(r"\s+", " ", str(raw or "").lstrip("#")).strip()
+            if not detail:
+                continue
+            if detail in CHEARB_GENERIC_PRODUCT_TAGS:
+                label = CHEARB_GENERIC_DETAIL_LABELS.get(detail, "")
+                if label:
+                    tag_pools.append((2, [label]))
+                continue
+            variants = PublisherEngine._chearb_detail_variants(name, detail)
+            if variants:
+                tag_pools.append((1, variants))
+        name_features = []
+        name_pools: list[tuple[int, list[str]]] = []
+        for feature in CHEARB_NAME_FEATURES:
+            if feature in name:
+                name_features.append(feature)
+                label = CHEARB_NAME_FEATURE_LABELS.get(feature, feature)
+                name_pools.append((0, [label]))
+        copy_name = name
+        for feature in sorted(name_features, key=len, reverse=True):
+            copy_name = copy_name.replace(feature, " ")
+        copy_name = re.sub(r"แบบ\s*$", "", copy_name)
+        copy_name = re.sub(r"\s+", " ", copy_name).strip(" -") or name
+        pools = name_pools + tag_pools
+        results: list[tuple[int, int, int, tuple[str, str]]] = []
+        for left_index, (left_priority, left_pool) in enumerate(pools):
+            for right_priority, right_pool in pools[left_index + 1:]:
+                for left in left_pool:
+                    for right in right_pool:
+                        if (
+                            PublisherEngine._chearb_text_overlaps(left, right)
+                            or PublisherEngine._chearb_detail_key(left)
+                            == PublisherEngine._chearb_detail_key(right)
+                        ):
+                            continue
+                        results.append((
+                            left_priority + right_priority,
+                            len(left) + len(right), left_index, (left, right),
+                        ))
+        if not results:
+            raise PublisherError("caption_product_details_incomplete")
+        deduped: list[tuple[str, str]] = []
+        seen = set()
+        for _priority, _length, _index, pair in sorted(
+            results, key=lambda value: (value[0], value[1], value[2]),
+        ):
+            key = tuple(value.casefold() for value in pair)
+            if key not in seen:
+                deduped.append(pair)
+                seen.add(key)
+        return copy_name, deduped
+
+    @staticmethod
+    def _chearb_detail_key(value: str) -> str:
+        compact = re.sub(r"[^0-9A-Za-zก-๙]", "", str(value or "")).casefold()
+        concepts = (
+            ("พับ", "fold"), ("ไฟฟ้า", "electric"), ("พกพา", "portable"),
+            ("ปรับ", "adjustable"), ("ลิ้นชัก", "drawer"),
+            ("แม่เหล็ก", "magnetic"), ("ดิจิตอล", "digital"),
+            ("สแตนเลส", "stainless"),
+        )
+        for needle, concept in concepts:
+            if needle in compact:
+                return concept
+        return compact
+
+    @staticmethod
+    def _chearb_detail_variants(product_name: str, detail: str) -> list[str]:
+        variants = [detail]
+        for prefix in CHEARB_DETAIL_PREFIXES:
+            if detail.startswith(prefix) and len(detail) - len(prefix) >= 3:
+                variants.append(detail[len(prefix):].strip())
+        for reduction in CHEARB_HASHTAG_REDUCTIONS:
+            if reduction in detail:
+                reduced = detail.replace(reduction, "", 1).strip()
+                if len(reduced) >= 3:
+                    variants.append(reduced)
+        deduped: list[str] = []
+        seen = set()
+        for variant in sorted(variants, key=len):
+            value = variant.strip()
+            key = value.casefold()
+            if (
+                not value or value in CHEARB_GENERIC_PRODUCT_TAGS or key in seen
+                or PublisherEngine._chearb_text_overlaps(product_name, value)
+            ):
+                continue
+            deduped.append(value)
+            seen.add(key)
+        return deduped
+
+    @staticmethod
+    def _chearb_text_overlaps(left: str, right: str) -> bool:
+        compact = lambda value: re.sub(
+            r"[^0-9A-Za-zก-๙]", "", str(value or ""),
+        ).casefold()
+        left_value = compact(left)
+        right_value = compact(right)
+        return bool(
+            left_value and right_value
+            and (left_value in right_value or right_value in left_value)
+        )
 
     @staticmethod
     def _chearb_hashtag_line(link_line: str, product_text: str,
@@ -336,6 +492,8 @@ class PublisherEngine:
                     lazada_url=str(source.get("lazada_url") or ""),
                     caption=str(source["caption"]),
                     ready_at="",
+                    product_name="",
+                    hashtags=(),
                 ),
             )
         except PublisherError as exc:
@@ -467,6 +625,8 @@ class PublisherEngine:
                 lazada_url=item.lazada_url,
                 caption=item.caption,
                 ready_at=item.ready_at,
+                product_name=str(getattr(item, "product_name", "") or ""),
+                hashtags=tuple(getattr(item, "hashtags", ()) or ()),
             )
         caption = self.caption(page, caption_item)
         with AssetServer() as server:

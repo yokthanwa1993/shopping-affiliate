@@ -22,6 +22,8 @@ class StudioItem:
     lazada_url: str
     caption: str
     ready_at: str
+    product_name: str = ""
+    hashtags: tuple[str, ...] = ()
 
 
 REQUIRED_COLUMNS = {
@@ -32,7 +34,8 @@ REQUIRED_COLUMNS = {
 CAPTION_MAX_CHARS = 32
 
 
-def compose_caption(caption_text: object, hashtags_json: object) -> str:
+def separated_metadata(caption_text: object,
+                       hashtags_json: object) -> tuple[str, tuple[str, ...]]:
     caption = str(caption_text or "").strip()
     try:
         hashtags = json.loads(str(hashtags_json or "[]"))
@@ -47,6 +50,11 @@ def compose_caption(caption_text: object, hashtags_json: object) -> str:
         or any(not tag.startswith("#") or any(ch.isspace() for ch in tag) for tag in tags)
     ):
         raise StudioSourceError("studio_metadata_invalid")
+    return caption, tuple(tags)
+
+
+def compose_caption(caption_text: object, hashtags_json: object) -> str:
+    caption, tags = separated_metadata(caption_text, hashtags_json)
     return f"{caption}\n\n{' '.join(tags)}"
 
 
@@ -70,14 +78,19 @@ class StudioSource:
 
     @staticmethod
     def _to_item(row: sqlite3.Row) -> StudioItem:
+        product_name, hashtags = separated_metadata(
+            row["ai_caption_text"], row["ai_hashtags_json"],
+        )
         return StudioItem(
             content_id=int(row["id"]),
             ready_message_id=str(row["ready_message_id"] or "").strip(),
             ready_video_url=str(row["ready_video_url"] or "").strip(),
             shopee_url=str(row["shopee_link"] or "").strip(),
             lazada_url=str(row["lazada_link"] or "").strip(),
-            caption=compose_caption(row["ai_caption_text"], row["ai_hashtags_json"]),
+            caption=f"{product_name}\n\n{' '.join(hashtags)}",
             ready_at=str(row["ready_at"] or "").strip(),
+            product_name=product_name,
+            hashtags=hashtags,
         )
 
     def strict_ready_count(self) -> int:
