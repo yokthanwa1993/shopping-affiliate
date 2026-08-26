@@ -432,6 +432,17 @@ class PublisherEngine:
         if not any(str(row.get("account") or row.get("spc_u") or "") == page.shopee_account for row in accounts):
             raise PublisherError("shopee_account_unavailable")
 
+    def _final_shortlink(self, page: PageConfig, source_url: str,
+                         preflight_link: str, post_tail: str) -> str:
+        if page.page_id == CHEARB_PAGE_ID:
+            if not preflight_link:
+                raise PublisherError("chearb_shared_shortlink_missing")
+            return preflight_link
+        return self.idbridge.shorten(
+            source_url, page.shopee_account, page.affiliate_id,
+            page.campaign_sub1, page.page_id, post_tail,
+        )
+
     def _publish_real(self, page: PageConfig, item: StudioItem, attempt_id: str,
                       composed_path: Path) -> Dict[str, Any]:
         if not self.config.writes_enabled:
@@ -486,9 +497,8 @@ class PublisherEngine:
         })
         self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
         try:
-            final_link = self.idbridge.shorten(
-                item.shopee_url, page.shopee_account, page.affiliate_id,
-                page.campaign_sub1, page.page_id, post_tail,
+            final_link = self._final_shortlink(
+                page, item.shopee_url, preflight, post_tail,
             )
             self.ledger.transition(attempt_id, "final_shortlink_ok", {"final_shortlink": final_link})
             comment = page.comment_template.format(shortlink=final_link).strip()
@@ -767,12 +777,14 @@ class PublisherEngine:
             raise PublisherError("reconcile_story_missing")
         final_link = str(row["final_shortlink"] or "")
         if state in {"existing_story_bound", "post_confirmed"} or not final_link:
-            source = self.ledger.source_item(int(row["studio_content_id"]))
-            final_link_proof = self.idbridge.shorten_verified(
-                str(source["shopee_url"]), page.shopee_account, page.affiliate_id,
-                page.campaign_sub1, page.page_id, str(row["fb_post_tail"] or ""),
+            preflight_link = str(row["preflight_shortlink"] or "").strip()
+            source_url = ""
+            if page.page_id != CHEARB_PAGE_ID:
+                source = self.ledger.source_item(int(row["studio_content_id"]))
+                source_url = str(source["shopee_url"])
+            final_link = self._final_shortlink(
+                page, source_url, preflight_link, str(row["fb_post_tail"] or ""),
             )
-            final_link = final_link_proof["shortlink"]
             self.ledger.transition(attempt_id, "final_shortlink_ok", {"final_shortlink": final_link})
             state = "final_shortlink_ok"
         comment = page.comment_template.format(shortlink=final_link).strip()

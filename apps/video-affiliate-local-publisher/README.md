@@ -28,7 +28,7 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 5. ดาวน์โหลด source เข้า durable spool, ตรวจ MP4 ด้วย ffprobe/SHA-256 แล้ว atomic-copy ต้นฉบับก่อน Avatar ไป `source-archive/` แบบ 0600; archive fail จะหยุดก่อน Facebook write
 6. compose Avatar ผ่าน local merge-rust `127.0.0.1:18080`
 7. preflight source ตาม Page (`facebook_lite_eaad6` หรือ `idbridge_power_editor`) + Power Editor + Shopee CHEARB แบบ account-scoped และ fail closed เมื่อ source/account ไม่ตรง
-8. โพสต์ Reel ผ่าน IDBridge, mint final link Sub1=Campaign/Sub2=Page/Sub3=Post, รอ 30 วินาทีแล้ว comment เป็น Page. Power Editor Page posting ต้อง bind session cookies ของ account เดิมเพื่อ resolve Page token; upload/comment ใช้ Page token เป็น actor และห้าม fallback ข้าม account
+8. โพสต์ Reel ผ่าน IDBridge แล้ว comment เป็น Page หลังรอ 30 วินาที. เพจเฉียบสร้าง Shopee shortlink ครั้งเดียวก่อนโพสต์และใช้ URL เดียวกันทั้งแคปชั่นกับคอมเมนต์ จึงเก็บ Sub1=Campaign/Sub2=Page และเว้น Sub3; Page อื่นยัง mint final link หลังได้ Post ID ด้วย Sub1=Campaign/Sub2=Page/Sub3=Post ตามเดิม. Power Editor Page posting ต้อง bind session cookies ของ account เดิมเพื่อ resolve Page token; upload/comment ใช้ Page token เป็น actor และห้าม fallback ข้าม account
 9. Graph readback post/comment ก่อน mark SQLite `success`
 10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup เฉพาะ spool; source archive คงถาวร
 11. scheduler ไล่ดู due Page ตามลำดับอย่างยุติธรรม: Page ที่ติด reconcile/lease/source policy ถูกข้ามเฉพาะรอบนั้น แต่ยังเริ่ม post attempt ได้สูงสุดหนึ่ง Page ต่อ tick จึงไม่ burst catch-up
@@ -37,7 +37,8 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 
 ### แคปชั่นเพจเฉียบสำหรับโพสต์ใหม่
 
-- เฉพาะ Page ID `1008898512617594` วาง Shopee shortlink ที่ผ่าน preflight ของสินค้าที่บรรทัดแรกในรูป `📌 พิกัด : <link>`
+- เฉพาะ Page ID `1008898512617594` สร้าง Shopee shortlink หนึ่งครั้งก่อนโพสต์ วาง URL นั้นที่บรรทัดแรกในรูป `📌 พิกัด : <link>` และใช้ URL เดียวกันในคอมเมนต์หลังโพสต์
+- การใช้ URL เดียวกันหมายถึง tracking ของเพจเฉียบคง `Sub1=Campaign` และ `Sub2=Page` แต่ไม่มี `Sub3=Post ID`; ระบบห้ามสร้าง URL ตัวที่สองเพื่อเติม Sub3
 - บังคับ 3 บรรทัดติดกันโดยไม่มีบรรทัดว่าง: ลิงก์, ข้อความสินค้าสั้น, แฮชแท็ก 3 อัน
 - ใช้ metadata แยกของ Studio เดิมแบบ read-only; เริ่มจาก 3 แฮชแท็กแรก และย่อแฮชแท็กแบบ deterministic เฉพาะเมื่อจำเป็นเพื่อให้ข้อความรวมไม่เกิน 130 ตัวอักษร
 - ถ้ายังประกอบ 3 แฮชแท็กภายใน 130 ตัวอักษรไม่ได้ ให้หยุดก่อนเรียก Facebook `/post`

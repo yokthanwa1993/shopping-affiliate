@@ -62,6 +62,53 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(row["error_code"], "")
         self.assertEqual(row["error_detail_redacted"], "")
 
+    def test_align_success_shortlink_is_scoped_and_audited(self):
+        attempt = self.ledger.claim_attempt("p1", 109, "slot-align-link", "test")
+        shared = "https://s.shopee.co.th/shared"
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending", "verifying", "success",
+        ]:
+            fields = None
+            if state == "shortlink_preflight_ok":
+                fields = {"preflight_shortlink": shared}
+            elif state == "final_shortlink_ok":
+                fields = {"final_shortlink": "https://s.shopee.co.th/old"}
+            self.ledger.transition(attempt, state, fields)
+        self.ledger.align_success_shortlink(
+            attempt, shared, "facebook_comment_readback_same_as_caption", now=1234,
+        )
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "success")
+        self.assertEqual(row["final_shortlink"], shared)
+        with self.ledger.connect() as conn:
+            event = conn.execute(
+                "SELECT old_state,new_state,detail_json FROM events "
+                "WHERE attempt_id=? ORDER BY id DESC LIMIT 1",
+                (attempt,),
+            ).fetchone()
+        self.assertEqual((event["old_state"], event["new_state"]), ("success", "success"))
+        self.assertIn("facebook_comment_readback_same_as_caption", event["detail_json"])
+
+    def test_align_success_shortlink_requires_exact_preflight_link(self):
+        attempt = self.ledger.claim_attempt("p1", 110, "slot-align-link-reject", "test")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_confirmed",
+            "final_shortlink_ok", "comment_pending", "verifying", "success",
+        ]:
+            fields = None
+            if state == "shortlink_preflight_ok":
+                fields = {"preflight_shortlink": "https://s.shopee.co.th/pre"}
+            elif state == "final_shortlink_ok":
+                fields = {"final_shortlink": "https://s.shopee.co.th/final"}
+            self.ledger.transition(attempt, state, fields)
+        with self.assertRaisesRegex(LedgerError, "success_shortlink_preflight_mismatch"):
+            self.ledger.align_success_shortlink(
+                attempt, "https://s.shopee.co.th/other", "must_not_apply",
+            )
+
     def test_operator_can_close_unknown_only_with_allowlisted_no_post_evidence(self):
         attempt = self.ledger.claim_attempt("p1", 10, "slot-unknown", "scheduler")
         for state in [

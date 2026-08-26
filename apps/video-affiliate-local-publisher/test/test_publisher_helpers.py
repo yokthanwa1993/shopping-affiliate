@@ -264,6 +264,7 @@ class PublisherHelpersTests(unittest.TestCase):
             def __init__(self):
                 self.post_caption = ""
                 self.comment_message = ""
+                self.shorten_calls = []
 
             def ensure_page(self, *args):
                 return None
@@ -273,6 +274,7 @@ class PublisherHelpersTests(unittest.TestCase):
 
             def shorten(self, product_url, account, affiliate_id, sub1, sub2, sub3):
                 del product_url, account, affiliate_id, sub1, sub2
+                self.shorten_calls.append(sub3)
                 return "https://s.shopee.co.th/final" if sub3 else "https://s.shopee.co.th/preflight?lp=aff"
 
             def post(self, page_id, video_url, caption, account, source):
@@ -334,6 +336,93 @@ class PublisherHelpersTests(unittest.TestCase):
                 "📌 พิกัด : https://s.shopee.co.th/preflight\n"
                 "ราวตากผ้าแบบพับได้\n#หนึ่ง #สอง #สาม",
             )
+            self.assertEqual(bridge.shorten_calls, [""])
+            self.assertEqual(
+                bridge.comment_message,
+                "https://s.shopee.co.th/preflight\ncomment",
+            )
+            saved = ledger.attempt(attempt)
+            self.assertEqual(saved["preflight_shortlink"], saved["final_shortlink"])
+
+    def test_chearb_reconcile_reuses_preflight_shortlink_without_second_mint(self):
+        class FakeBridge:
+            def __init__(self):
+                self.shorten_calls = 0
+                self.comment_message = ""
+
+            def ensure_page(self, *args):
+                return None
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def shorten(self, *args):
+                self.shorten_calls += 1
+                raise AssertionError("must_not_mint_again")
+
+            def graph_get(self, account, path, params):
+                del account
+                if path == "1008898512617594":
+                    return {"id": path}
+                if path == "1008898512617594_200/comments":
+                    if params.get("fields") == "id,message,from":
+                        return {"data": []}
+                    return {"data": [{"id": "comment-1"}]}
+                if path == "1008898512617594_200":
+                    return {"id": path, "is_published": True,
+                            "permalink_url": "https://facebook.test/reel/300"}
+                if path == "comment-1":
+                    return {"id": path, "from": {"id": "1008898512617594"},
+                            "message": self.comment_message}
+                raise AssertionError(path)
+
+            def page_comment(self, page_id, story_id, message, account):
+                del page_id, story_id, account
+                self.comment_message = message
+                return "comment-1"
+
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            attempt = ledger.claim_attempt(
+                "1008898512617594", 5, "slot-chearb-reconcile", "test",
+            )
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting",
+            ]:
+                fields = (
+                    {"preflight_shortlink": "https://s.shopee.co.th/shared"}
+                    if state == "shortlink_preflight_ok" else None
+                )
+                ledger.transition(attempt, state, fields)
+            ledger.transition(attempt, "post_confirmed", {
+                "fb_story_id": "1008898512617594_200", "fb_post_tail": "200",
+                "fb_video_id": "300",
+            })
+            page = cast(Any, SimpleNamespace(
+                page_id="1008898512617594", name="เฉียบ", enabled=True,
+                interval_minutes=30, facebook_account="uid",
+                power_editor_account="peuid", posting_source="facebook_lite_eaad6",
+                shopee_account="15130770000", affiliate_id="15130770000",
+                campaign_sub1="campaign", caption_template="{caption}",
+                comment_template="{shortlink}\ncomment",
+            ))
+            bridge = FakeBridge()
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.config = cast(Any, SimpleNamespace(writes_enabled=True, pages=[page]))
+            engine.ledger = ledger
+            engine._idbridge = cast(Any, bridge)
+            engine.spool = cast(Any, SimpleNamespace(cleanup=lambda _attempt_id: None))
+            engine.notifier = cast(Any, SimpleNamespace(send=lambda *args, **kwargs: None))
+            result = engine.reconcile_attempt(attempt)
+            self.assertEqual(result["state"], "success")
+            self.assertEqual(bridge.shorten_calls, 0)
+            self.assertEqual(
+                bridge.comment_message,
+                "https://s.shopee.co.th/shared\ncomment",
+            )
+            saved = ledger.attempt(attempt)
+            self.assertEqual(saved["final_shortlink"], "https://s.shopee.co.th/shared")
 
     def test_reconcile_reuses_existing_comment_without_reposting(self):
         class FakeBridge:

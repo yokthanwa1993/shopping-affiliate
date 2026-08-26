@@ -513,6 +513,45 @@ class Ledger:
                          (attempt_id, old_state, new_state, json.dumps(fields, ensure_ascii=False), now))
             conn.commit()
 
+    def align_success_shortlink(self, attempt_id: str, shortlink: str,
+                                reason: str, now: Optional[int] = None) -> None:
+        """Audit one verified historical comment repair without changing post state."""
+        link = str(shortlink or "").strip()
+        if not link.startswith("https://s.shopee.co.th/"):
+            raise LedgerError("success_shortlink_invalid")
+        detail = str(reason or "").strip()
+        if not detail:
+            raise LedgerError("success_shortlink_reason_missing")
+        current = int(now or time.time())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state,preflight_shortlink FROM post_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                raise LedgerError("attempt_not_found")
+            if str(row["state"]) != "success":
+                conn.rollback()
+                raise LedgerError("success_shortlink_state_invalid")
+            if str(row["preflight_shortlink"] or "").strip() != link:
+                conn.rollback()
+                raise LedgerError("success_shortlink_preflight_mismatch")
+            conn.execute(
+                "UPDATE post_attempts SET final_shortlink=?,updated_at=? WHERE attempt_id=?",
+                (link, current, attempt_id),
+            )
+            conn.execute("""
+                INSERT INTO events(attempt_id,old_state,new_state,detail_json,created_at)
+                VALUES(?,?,?,?,?)
+            """, (
+                attempt_id, "success", "success",
+                json.dumps({"final_shortlink": link, "repair": detail}, ensure_ascii=False),
+                current,
+            ))
+            conn.commit()
+
     @staticmethod
     def comment_retry_delay(retry_count: int) -> int:
         exponent = max(0, int(retry_count) - 1)
