@@ -47,6 +47,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 NO_POST_EVIDENCE_CODES = {
+    "idbridge_rejected_before_upload",
     "idbridge_rejected_before_upload_and_graph_no_post",
     "facebook_upload_rejected_and_graph_no_post",
 }

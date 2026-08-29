@@ -13,6 +13,13 @@ class IDBridgeError(RuntimeError):
     pass
 
 
+class IDBridgeHTTPError(IDBridgeError):
+    def __init__(self, status: int, code: str):
+        self.status = int(status)
+        self.code = str(code or "failed")
+        super().__init__(f"idbridge_http_{self.status}:{redact_error(self.code)}")
+
+
 class IDBridgeClient:
     def __init__(self, base_url: str, service_auth: str):
         self.base_url = base_url.rstrip("/")
@@ -49,7 +56,7 @@ class IDBridgeClient:
             raise IDBridgeError(f"idbridge_http_{status}_invalid_json") from exc
         if status < 200 or status >= 300:
             code = payload.get("code") or payload.get("error") if isinstance(payload, dict) else ""
-            raise IDBridgeError(f"idbridge_http_{status}:{redact_error(code or 'failed')}")
+            raise IDBridgeHTTPError(status, str(code or "failed"))
         return payload
 
     def token_info(self, account: str) -> Dict[str, Any]:

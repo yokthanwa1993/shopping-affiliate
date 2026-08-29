@@ -11,7 +11,7 @@ from .asset_server import AssetServer
 from .avatar_client import AvatarClient
 from .config import AppConfig, PageConfig
 from .discord_source import DiscordSource
-from .idbridge_client import IDBridgeClient, IDBridgeError
+from .idbridge_client import IDBridgeClient, IDBridgeError, IDBridgeHTTPError
 from .ledger import Ledger, LedgerError, PAGE_BLOCKING_STATES
 from .notifier import Notifier
 from .scheduler import local_day_window, manual_slot_key, slot_key
@@ -637,6 +637,31 @@ class PublisherEngine:
                     page.page_id, video_url, caption, page.facebook_account,
                     page.posting_source,
                 )
+            except IDBridgeHTTPError as exc:
+                if exc.status == 403 and exc.code == "page_token_not_found":
+                    self.ledger.transition(attempt_id, "post_outcome_unknown", {
+                        "error_code": "post_outcome_unknown",
+                        "error_detail_redacted": "idbridge_http_403:page_token_not_found",
+                    })
+                    self.ledger.resolve_unknown_no_post(
+                        attempt_id,
+                        "idbridge_rejected_before_upload",
+                    )
+                    self._notify_failure(
+                        page.page_id,
+                        attempt_id,
+                        "operator_confirmed_no_post",
+                        exc,
+                    )
+                    raise
+                # Once /post may have reached Facebook, every other HTTP error remains
+                # outcome-unknown until reconciled. Never classify it as safe to retry.
+                self.ledger.transition(attempt_id, "post_outcome_unknown", {
+                    "error_code": "post_outcome_unknown",
+                    "error_detail_redacted": redact_error(exc),
+                })
+                self._notify_failure(page.page_id, attempt_id, "post_outcome_unknown", exc)
+                raise
             except IDBridgeError as exc:
                 # Once /post has been invoked, every transport or application error is
                 # outcome-unknown until reconciled. Never classify it as safe to retry.

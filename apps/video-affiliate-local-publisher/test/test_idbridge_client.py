@@ -3,7 +3,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from publisher.idbridge_client import IDBridgeClient, IDBridgeError
+from publisher.idbridge_client import IDBridgeClient, IDBridgeError, IDBridgeHTTPError
 
 
 class IDBridgeClientTests(unittest.TestCase):
@@ -45,6 +45,13 @@ class IDBridgeClientTests(unittest.TestCase):
         post=self.client.post("p1","http://127.0.0.1/video","caption","uid")
         self.assertEqual(post["source"],"facebook_lite_eaad6")
         self.assertEqual(self.client.page_comment("p1","p1_post","link","uid"),"comment")
+
+    def test_http_error_preserves_sanitized_status_and_code(self):
+        with self.assertRaises(IDBridgeHTTPError) as caught:
+            self.client._request("/missing")
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual(caught.exception.code, "not_found")
+        self.assertEqual(str(caught.exception), "idbridge_http_404:not_found")
 
     def test_shorten_fails_closed_when_verified_tracking_is_missing(self):
         class BadClient(IDBridgeClient):

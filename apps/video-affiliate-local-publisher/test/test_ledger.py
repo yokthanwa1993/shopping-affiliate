@@ -132,6 +132,18 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(event["new_state"], "failed_pre_post")
         self.assertIn("idbridge_rejected_before_upload_and_graph_no_post", event["detail_json"])
 
+    def test_operator_can_close_unknown_when_idbridge_rejects_before_upload(self):
+        attempt = self.ledger.claim_attempt("p1", 11, "slot-rejected-before-upload", "scheduler")
+        for state in [
+            "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+            "shortlink_preflight_ok", "posting", "post_outcome_unknown",
+        ]:
+            self.ledger.transition(attempt, state)
+        self.ledger.resolve_unknown_no_post(attempt, "idbridge_rejected_before_upload")
+        row = self.ledger.attempt(attempt)
+        self.assertEqual(row["state"], "failed_pre_post")
+        self.assertIn("idbridge_rejected_before_upload", row["error_detail_redacted"])
+
     def test_operator_can_close_rejected_upload_after_graph_confirms_no_post(self):
         attempt = self.ledger.claim_attempt("p1", 11, "slot-upload-rejected", "manual")
         for state in [

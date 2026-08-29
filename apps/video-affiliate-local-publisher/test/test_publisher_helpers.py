@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-from publisher.idbridge_client import IDBridgeError
+from publisher.idbridge_client import IDBridgeError, IDBridgeHTTPError
 from publisher.ledger import Ledger
 from publisher.publisher import PublisherEngine, PublisherError
 from publisher.scheduler import slot_key
@@ -223,6 +223,55 @@ class PublisherHelpersTests(unittest.TestCase):
             with self.assertRaises(IDBridgeError):
                 engine._publish_real(page, item, attempt, video)
             self.assertEqual(ledger.attempt(attempt)["state"], "post_outcome_unknown")
+
+    def test_page_token_not_found_before_upload_is_safe_pre_post_failure(self):
+        class RejectingBridge:
+            def ensure_page(self, *args):
+                return None
+
+            def graph_get(self, account, path, params):
+                return {"id": path}
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def shorten(self, *args):
+                return "https://s.shopee.co.th/preflight"
+
+            def post(self, *args):
+                raise IDBridgeHTTPError(403, "page_token_not_found")
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            ledger = Ledger(root_path / "publisher.db")
+            attempt = ledger.claim_attempt("100", 1, "slot-page-token", "test")
+            for state in ["source_resolved", "downloaded", "avatar_composing", "avatar_ready"]:
+                ledger.transition(attempt, state)
+            video = root_path / "video.mp4"
+            video.write_bytes(b"video")
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.config = cast(Any, SimpleNamespace(writes_enabled=True))
+            engine.ledger = ledger
+            engine._idbridge = cast(Any, RejectingBridge())
+            page = cast(Any, SimpleNamespace(
+                page_id="100", facebook_account="uid", power_editor_account="peuid",
+                posting_source="idbridge_power_editor",
+                shopee_account="15130770000",
+                affiliate_id="15130770000", campaign_sub1="campaign",
+                caption_template="{caption}", comment_template="{shortlink}",
+            ))
+            item = cast(Any, SimpleNamespace(
+                shopee_url="https://shopee.co.th/product/1/2", caption="caption",
+            ))
+            with self.assertRaises(IDBridgeHTTPError):
+                engine._publish_real(page, item, attempt, video)
+            saved = ledger.attempt(attempt)
+            self.assertEqual(saved["state"], "failed_pre_post")
+            self.assertEqual(saved["error_code"], "operator_confirmed_no_post")
+            self.assertIn(
+                "idbridge_rejected_before_upload",
+                saved["error_detail_redacted"],
+            )
 
     def test_success_requires_live_post_and_page_comment_readback(self):
         class FakeBridge:
