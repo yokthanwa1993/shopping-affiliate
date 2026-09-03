@@ -43,7 +43,7 @@ ALLOWED_TRANSITIONS = {
     "verifying": {"success", "post_success_verification_failed"},
     "post_success_comment_failed": {"final_shortlink_ok", "comment_pending", "verifying"},
     "post_success_verification_failed": {"success"},
-    "post_outcome_unknown": {"failed_pre_post"},
+    "post_outcome_unknown": {"existing_story_bound", "failed_pre_post"},
 }
 
 NO_POST_EVIDENCE_CODES = {

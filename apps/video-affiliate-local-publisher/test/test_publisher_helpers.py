@@ -131,6 +131,46 @@ class PublisherHelpersTests(unittest.TestCase):
             "สินค้าน่าใช้ #รีวิว",
         )
 
+    def test_candidate_caption_preflight_rejects_before_shortlink_mint(self):
+        item = SimpleNamespace(
+            content_id=19869,
+            ready_message_id="message-19869",
+            ready_video_url="https://cdn.example/source.mp4",
+            shopee_url="https://shopee.co.th/product/1/19869",
+            lazada_url="https://www.lazada.co.th/products/example-i19869.html",
+            caption=(
+                "แม่พิมพ์หล่อราวระเบียงคอนกรีต\n\n"
+                "#แม่พิมพ์ราวระเบียง #หล่อปูนระเบียง "
+                "#แม่พิมพ์คอนกรีต #เครื่องมือช่าง"
+            ),
+            ready_at="",
+            product_name="แม่พิมพ์หล่อราวระเบียงคอนกรีต",
+            hashtags=(
+                "#แม่พิมพ์ราวระเบียง", "#หล่อปูนระเบียง",
+                "#แม่พิมพ์คอนกรีต", "#เครื่องมือช่าง",
+            ),
+        )
+        with self.assertRaisesRegex(PublisherError, "caption_too_long"):
+            PublisherEngine.validate_candidate_caption(
+                cast(Any, self.page), cast(Any, item),
+            )
+
+    def test_candidate_caption_preflight_accepts_a_valid_chearb_item(self):
+        item = SimpleNamespace(
+            content_id=1,
+            ready_message_id="message-1",
+            ready_video_url="https://cdn.example/source.mp4",
+            shopee_url="https://shopee.co.th/product/1/1",
+            lazada_url="https://www.lazada.co.th/products/example-i1.html",
+            caption="พัดลมพกพา\n\n#พัดลมพกพา #ของใช้ในบ้าน #สินค้า #รีวิว",
+            ready_at="",
+            product_name="พัดลมพกพา",
+            hashtags=("#พัดลมพกพา", "#ของใช้ในบ้าน", "#สินค้า", "#รีวิว"),
+        )
+        self.assertIsNone(PublisherEngine.validate_candidate_caption(
+            cast(Any, self.page), cast(Any, item),
+        ))
+
     def test_canonical_story(self):
         story, tail = PublisherEngine.canonical_story("100", "200")
         self.assertEqual(story, "100_200")
@@ -781,6 +821,110 @@ class PublisherHelpersTests(unittest.TestCase):
             self.assertEqual(recovered["fb_video_id"], "300")
             self.assertEqual(recovered["comment_id"], "comment-1")
 
+    def test_recover_unknown_outcome_accepts_bounded_video_story_time_difference(self):
+        source_caption = "exact caption"
+        final_caption = source_caption
+
+        class FakeBridge:
+            def graph_get(self, _account, path, params):
+                if path == "100_200":
+                    return {
+                        "id": path, "message": final_caption,
+                        "created_time": "1970-01-01T00:16:40+00:00",
+                        "permalink_url": "https://facebook.test/reel/300",
+                        "from": {"id": "100"}, "is_published": True,
+                        "attachments": {"data": [{"target": {"id": "300"}}]},
+                    }
+                if path == "300":
+                    return {
+                        "id": "300", "description": final_caption,
+                        "created_time": "1970-01-01T00:16:18+00:00",
+                        "permalink_url": "https://facebook.test/reel/300",
+                        "from": {"id": "100"}, "published": True,
+                    }
+                if path == "100":
+                    return {"id": "100"}
+                if path == "100_200/comments":
+                    if params.get("fields") == "id,message,from":
+                        return {"data": []}
+                    return {"data": [{"id": "comment-1"}]}
+                if path == "comment-1":
+                    return {
+                        "id": "comment-1", "parent": {"id": "100_200"},
+                        "from": {"id": "100"}, "message": self.comment_message,
+                    }
+                raise AssertionError((path, params))
+
+            def ensure_page(self, *_args):
+                return None
+
+            def shopee_accounts(self):
+                return [{"account": "15130770000"}]
+
+            def shorten(self, *_args):
+                return "https://s.shopee.co.th/final"
+
+            def page_comment(self, _page_id, _story_id, message, _account):
+                self.comment_message = message
+                return "comment-1"
+
+        with tempfile.TemporaryDirectory() as root:
+            ledger = Ledger(Path(root) / "publisher.db")
+            item = SimpleNamespace(
+                content_id=1, ready_message_id="message-1",
+                shopee_url="https://shopee.co.th/product/1/1",
+                lazada_url="https://www.lazada.co.th/products/example.html",
+                caption=source_caption, ready_at="",
+            )
+            ledger.upsert_source(item, "attachment-1", "f" * 64)
+            archive_path = Path(root) / "archive.mp4"
+            archive_path.write_bytes(b"video")
+            ledger.record_source_archive(1, "f" * 64, archive_path, 5, now=900)
+            attempt = ledger.claim_attempt("100", 1, "slot", "scheduler")
+            for state in [
+                "source_resolved", "downloaded", "avatar_composing", "avatar_ready",
+                "shortlink_preflight_ok", "posting", "post_outcome_unknown",
+            ]:
+                fields = None
+                if state == "downloaded":
+                    fields = {"source_sha256": "f" * 64}
+                elif state == "shortlink_preflight_ok":
+                    fields = {"preflight_shortlink": "https://s.shopee.co.th/XXXXXXXXXX"}
+                ledger.transition(attempt, state, fields)
+            with ledger.connect() as conn:
+                conn.execute(
+                    "UPDATE post_attempts SET created_at=?,updated_at=? WHERE attempt_id=?",
+                    (995, 1_000, attempt),
+                )
+            page = cast(Any, SimpleNamespace(
+                page_id="100", name="page", enabled=True, interval_minutes=30,
+                facebook_account="lite", power_editor_account="power",
+                posting_source="facebook_lite_eaad6",
+                shopee_account="15130770000", affiliate_id="15130770000",
+                campaign_sub1="campaign", caption_template="{caption}",
+                comment_template="{shortlink}",
+            ))
+            bridge = FakeBridge()
+            engine = PublisherEngine.__new__(PublisherEngine)
+            engine.config = cast(Any, SimpleNamespace(
+                writes_enabled=True, pages=[page], comment_delay_seconds=0,
+            ))
+            engine.ledger = ledger
+            engine._idbridge = cast(Any, bridge)
+            engine.spool = cast(Any, SimpleNamespace(
+                inspect=lambda path: SimpleNamespace(
+                    path=path, sha256="f" * 64, bytes=5,
+                ),
+                cleanup=lambda _attempt_id: None,
+            ))
+            engine.notifier = cast(Any, SimpleNamespace(send=lambda *args, **kwargs: None))
+            result = engine.recover_existing_story(
+                attempt, story_id="100_200", video_id="300",
+                expected_caption_sha256=PublisherEngine._caption_digest(final_caption),
+            )
+            self.assertEqual(result["state"], "success")
+            self.assertEqual(ledger.attempt(attempt)["fb_story_id"], "100_200")
+
     def test_recover_existing_story_fails_before_mutation_on_caption_mismatch(self):
         class FakeLedger:
             def attempt(self, _attempt_id):
@@ -1038,6 +1182,119 @@ class PublisherHelpersTests(unittest.TestCase):
             self.assertEqual(result["daily_posts"], 1)
             self.assertEqual(result["daily_post_limit"], 1)
 
+    def test_invalid_chearb_caption_is_skipped_before_download_and_slot_claim(self):
+        invalid = SimpleNamespace(
+            content_id=19869,
+            ready_message_id="message-invalid",
+            ready_video_url="https://cdn.example/invalid.mp4",
+            shopee_url="https://shopee.co.th/product/1/19869",
+            lazada_url="https://www.lazada.co.th/products/invalid.html",
+            caption=(
+                "แม่พิมพ์หล่อราวระเบียงคอนกรีต\n\n"
+                "#แม่พิมพ์ราวระเบียง #หล่อปูนระเบียง "
+                "#แม่พิมพ์คอนกรีต #เครื่องมือช่าง"
+            ),
+            ready_at="",
+            product_name="แม่พิมพ์หล่อราวระเบียงคอนกรีต",
+            hashtags=(
+                "#แม่พิมพ์ราวระเบียง", "#หล่อปูนระเบียง",
+                "#แม่พิมพ์คอนกรีต", "#เครื่องมือช่าง",
+            ),
+        )
+        valid = SimpleNamespace(
+            content_id=1,
+            ready_message_id="message-valid",
+            ready_video_url="https://cdn.example/valid.mp4",
+            shopee_url="https://shopee.co.th/product/1/1",
+            lazada_url="https://www.lazada.co.th/products/valid.html",
+            caption="พัดลมพกพา\n\n#พัดลมพกพา #ของใช้ในบ้าน #สินค้า #รีวิว",
+            ready_at="",
+            product_name="พัดลมพกพา",
+            hashtags=("#พัดลมพกพา", "#ของใช้ในบ้าน", "#สินค้า", "#รีวิว"),
+        )
+        downloaded = []
+        claimed = []
+
+        class FakeStudio:
+            def candidates(self, **_kwargs):
+                return [invalid, valid]
+
+            def current(self, content_id):
+                return invalid if content_id == invalid.content_id else valid
+
+        class FakeDiscord:
+            def fetch(self, message_id, *_args):
+                downloaded.append(message_id)
+                return SimpleNamespace(url="https://cdn.example/valid.mp4", attachment_id="att-valid")
+
+        class FakeLedger:
+            def used_content_ids(self, *_args, **_kwargs):
+                return set()
+
+            def page_has_sha(self, *_args):
+                return False
+
+            def claim_attempt(self, _page_id, content_id, *_args):
+                claimed.append(content_id)
+                return "attempt-valid"
+
+            def upsert_source(self, *_args):
+                return None
+
+            def record_source_archive(self, *_args):
+                return None
+
+            def transition(self, *_args):
+                return None
+
+            def advance_page_after_shadow(self, *_args):
+                return None
+
+        class FakeSpool:
+            def download(self, probe_id, *_args, **_kwargs):
+                return SimpleNamespace(
+                    path=Path("/spool") / probe_id / "source.mp4",
+                    bytes=200_000, sha256="d" * 64, duration=15.0,
+                    width=720, height=1280,
+                )
+
+            def adopt(self, _probe_id, _attempt_id):
+                return Path("/spool/attempt-valid")
+
+            def inspect(self, path, expected_sha=""):
+                return SimpleNamespace(
+                    path=path, bytes=200_000, sha256=expected_sha,
+                    duration=15.0, width=720, height=1280,
+                )
+
+            def archive_source(self, content_id, source):
+                return SimpleNamespace(
+                    path=Path("/archive") / f"content_{content_id}_{source.sha256}.mp4",
+                    bytes=source.bytes, sha256=source.sha256,
+                )
+
+            def cleanup(self, *_args):
+                return None
+
+        engine = PublisherEngine.__new__(PublisherEngine)
+        engine.config = cast(Any, SimpleNamespace(
+            source_max_bytes=262_144_000, keep_shadow_spool=False,
+        ))
+        engine.ledger = cast(Any, FakeLedger())
+        engine.studio = cast(Any, FakeStudio())
+        engine.discord = cast(Any, FakeDiscord())
+        engine.spool = cast(Any, FakeSpool())
+        page = cast(Any, SimpleNamespace(
+            page_id="1008898512617594", caption_template="{caption}",
+            timezone="Asia/Bangkok", daily_success_limit=0,
+            reuse_success_from_page_id="", interval_minutes=30,
+            avatar_enabled=False,
+        ))
+        result = engine._run_locked(page, shadow=True, trigger="scheduler", at=1_000)
+        self.assertEqual(result["studio_content_id"], valid.content_id)
+        self.assertEqual(downloaded, [valid.ready_message_id])
+        self.assertEqual(claimed, [valid.content_id])
+
     def test_source_is_archived_from_adopted_path_before_state_progresses(self):
         events = []
         source_sha = "d" * 64
@@ -1047,6 +1304,10 @@ class PublisherHelpersTests(unittest.TestCase):
             shopee_url="https://shopee.co.th/product/1/88",
             lazada_url="https://www.lazada.co.th/products/example-i88.html",
             ready_video_url="https://cdn.example/source.mp4",
+            caption="สินค้าน่าใช้ #รีวิว",
+            ready_at="",
+            product_name="สินค้าน่าใช้",
+            hashtags=("#รีวิว", "#สินค้า", "#ของใช้", "#แนะนำ"),
         )
 
         class FakeStudio:
@@ -1130,6 +1391,7 @@ class PublisherHelpersTests(unittest.TestCase):
         engine.spool = cast(Any, FakeSpool())
         page = cast(Any, SimpleNamespace(
             page_id="page-88",
+            caption_template="{caption}",
             timezone="Asia/Bangkok",
             daily_success_limit=0,
             reuse_success_from_page_id="",
@@ -1137,7 +1399,7 @@ class PublisherHelpersTests(unittest.TestCase):
             avatar_enabled=False,
         ))
         result = engine._run_locked(page, shadow=True, trigger="manual", at=1_000)
-        self.assertEqual(result["state"], "shadow_ready")
+        self.assertEqual(result["state"], "shadow_ready", result)
         self.assertLess(events.index("inspect_adopted"), events.index("archive_source"))
         self.assertLess(events.index("archive_source"), events.index("record_archive"))
         self.assertLess(events.index("record_archive"), events.index("transition:source_resolved"))

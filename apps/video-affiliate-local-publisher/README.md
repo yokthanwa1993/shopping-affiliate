@@ -32,8 +32,10 @@ Mac mini publisher สำหรับ organic Facebook Reel แบบ multi-page
 9. Graph readback post/comment ก่อน mark SQLite `success`
 10. advance `next_due_at` ตาม `interval_minutes` ของแต่ละ Page และ cleanup เฉพาะ spool; source archive คงถาวร
 11. scheduler ไล่ดู due Page ตามลำดับอย่างยุติธรรม: Page ที่ติด reconcile/lease/source policy ถูกข้ามเฉพาะรอบนั้น แต่ยังเริ่ม post attempt ได้สูงสุดหนึ่ง Page ต่อ tick จึงไม่ burst catch-up
+    - เพจเฉียบตรวจว่า metadata สามารถประกอบแคปชั่น 3 บรรทัดภายใน 130 ตัวอักษรได้ก่อนดาวน์โหลดวิดีโอและก่อนจอง slot; candidate ที่ไม่ผ่านจะถูกข้ามไปตัวถัดไปในรอบเดียวกัน จึงไม่ทำให้เสียรอบโพสต์ 30 นาที
 12. comment-only backlog แยก retry ทีละหนึ่ง attempt ต่อ tick ด้วย exponential backoff 5 นาทีถึง 6 ชั่วโมง; failure ทุกช่วงของ retry จะเลื่อนเวลารอบถัดไป และ Page ที่ lease ไม่ว่างจะถูกข้ามเพื่อไม่กีดกัน backlog อื่น; repair ใช้ story เดิมและไม่เรียก `/post`
 13. startup/tick classifier ย้าย `posting` ที่เก่าและไม่มี Facebook IDs ไป `stale_posting_review`; recovery ต้องอ่าน story+video สด ตรวจ Page, caption digest, attachment target และเวลาใกล้ attempt ก่อน bind IDs เข้ารายการเดิม แล้วเดิน final link/comment/readback เท่านั้น
+    - ถ้า `/post` สร้าง Reel สำเร็จแต่ bridge คืน source label ไม่ตรงจน attempt เป็น `post_outcome_unknown`, recovery รองรับการผูก exact existing story เดิมได้หลังตรวจทุกเงื่อนไขข้างต้น โดยห้ามเรียก `/post` ซ้ำ
 
 ### แคปชั่นเพจเฉียบสำหรับโพสต์ใหม่
 

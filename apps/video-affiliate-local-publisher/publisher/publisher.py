@@ -29,6 +29,7 @@ CHEARB_PAGE_ID = "1008898512617594"
 CAPTION_LINK_PIN_PREFIX = "📌 พิกัด : "
 CHEARB_CAPTION_HASHTAG_LIMIT = 3
 CHEARB_CAPTION_MAX_CHARS = 130
+CHEARB_MAX_SHORTLINK_PLACEHOLDER = "https://s.shopee.co.th/XXXXXXXXXX"
 CHEARB_GENERIC_PRODUCT_TAGS = {
     "ของใช้", "ของใช้ในบ้าน", "เครื่องมือช่าง", "อุปกรณ์ช่าง", "งานช่าง",
     "เฟอร์นิเจอร์", "ยานยนต์", "กีฬา", "อุปกรณ์กีฬา",
@@ -163,6 +164,26 @@ class PublisherEngine:
         if URL_PATTERN.search(caption):
             raise PublisherError("caption_visible_link_forbidden")
         return caption
+
+    @staticmethod
+    def validate_candidate_caption(page: PageConfig, item: StudioItem) -> None:
+        caption_item = item
+        if page.page_id == CHEARB_PAGE_ID:
+            # Shopee links currently vary by one character. Validate against the
+            # longest observed shape before downloading or claiming the slot so
+            # a bad Ready caption cannot consume an entire 30-minute interval.
+            caption_item = StudioItem(
+                content_id=item.content_id,
+                ready_message_id=item.ready_message_id,
+                ready_video_url=item.ready_video_url,
+                shopee_url=CHEARB_MAX_SHORTLINK_PLACEHOLDER,
+                lazada_url=item.lazada_url,
+                caption=item.caption,
+                ready_at=item.ready_at,
+                product_name=item.product_name,
+                hashtags=item.hashtags,
+            )
+        PublisherEngine.caption(page, caption_item)
 
     @staticmethod
     def _chearb_product_details(product_name: str,
@@ -450,7 +471,9 @@ class PublisherEngine:
         if not self.config.writes_enabled:
             raise PublisherError("external_writes_disabled")
         initial = self.ledger.attempt(attempt_id)
-        if str(initial["state"]) not in {"posting", "stale_posting_review"}:
+        if str(initial["state"]) not in {
+            "posting", "stale_posting_review", "post_outcome_unknown",
+        }:
             raise PublisherError("existing_story_recovery_state_invalid")
         page = self.page(str(initial["page_id"]))
         canonical, post_tail = self.canonical_story(page.page_id, story_id)
@@ -537,13 +560,17 @@ class PublisherEngine:
         if self._caption_digest(str(video.get("description") or "")) != expected_digest:
             raise PublisherError("existing_video_caption_mismatch")
         story_created = str(story.get("created_time") or "")
-        if not story_created or story_created != str(video.get("created_time") or ""):
-            raise PublisherError("existing_story_time_mismatch")
+        video_created = str(video.get("created_time") or "")
+        if not story_created or not video_created:
+            raise PublisherError("existing_story_time_missing")
         try:
             from datetime import datetime
             posted_at = int(datetime.fromisoformat(story_created.replace("Z", "+00:00")).timestamp())
+            video_posted_at = int(datetime.fromisoformat(video_created.replace("Z", "+00:00")).timestamp())
         except (TypeError, ValueError) as exc:
             raise PublisherError("existing_story_time_invalid") from exc
+        if abs(posted_at - video_posted_at) > 2 * 60:
+            raise PublisherError("existing_story_time_mismatch")
         created_at = int(initial["created_at"] or 0)
         if created_at <= 0 or abs(posted_at - created_at) > 15 * 60:
             raise PublisherError("existing_story_time_outside_attempt_window")
@@ -563,7 +590,7 @@ class PublisherEngine:
                     "error_code": "operator_verified_existing_story",
                     "error_detail_redacted": "exact_story_readback_passed; repost_forbidden",
                 })
-            elif current_state != "stale_posting_review":
+            elif current_state not in {"stale_posting_review", "post_outcome_unknown"}:
                 raise PublisherError("existing_story_recovery_state_changed")
             self.ledger.bind_existing_story(
                 attempt_id, fb_story_id=canonical, fb_post_tail=post_tail,
@@ -840,6 +867,11 @@ class PublisherEngine:
                 item = self.studio.current(candidate.content_id)
                 if item is None:
                     candidate_errors.append("source_no_longer_ready")
+                    continue
+                try:
+                    self.validate_candidate_caption(page, item)
+                except PublisherError as exc:
+                    candidate_errors.append(_error_code(exc))
                     continue
                 resolved = self.discord.fetch(
                     item.ready_message_id, item.shopee_url, item.lazada_url,
