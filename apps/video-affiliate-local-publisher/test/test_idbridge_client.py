@@ -23,7 +23,13 @@ class IDBridgeClientTests(unittest.TestCase):
             def do_POST(self):
                 if self.headers.get("X-Bridge-Token") != "secret": return self.reply({"error":"unauthorized"},401)
                 body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))) or b"{}")
-                if self.path == "/post": return self.reply({"ok":True,"source":"facebook_lite_eaad6","story_id":"p1_post","video_id":"video","post_url":"https://facebook.test/p1_post"})
+                if self.path == "/post":
+                    if body.get("publish_reel_draft") is True:
+                        return self.reply({"ok":True,"source":"postcron_reels","published_to_page":True})
+                    if body.get("reel_draft") is True:
+                        return self.reply({"ok":True,"source":"postcron_reels","story_id":"p1_post","video_id":"video","published_to_page":False})
+                    return self.reply({"ok":True,"source":"facebook_lite_eaad6","story_id":"p1_post","video_id":"video","post_url":"https://facebook.test/p1_post"})
+                if self.path.startswith("/graph?"): return self.reply({"success":True})
                 if self.path == "/page-comment": return self.reply({"ok":True,"id":"comment","author_expected":"page"})
                 if self.path == "/shorten": return self.reply({
                     "ok": True,
@@ -44,6 +50,9 @@ class IDBridgeClientTests(unittest.TestCase):
         self.assertEqual(self.client.shorten("https://shopee.co.th/product/1/2","15130770000","15130770000","c","p1","post"),"https://s.shopee.co.th/final")
         post=self.client.post("p1","http://127.0.0.1/video","caption","uid")
         self.assertEqual(post["source"],"facebook_lite_eaad6")
+        draft=self.client.post_reel_draft("p1","http://127.0.0.1/video","uid")
+        self.assertEqual(draft["video_id"],"video")
+        self.client.publish_reel_draft("p1","video","final caption","uid")
         self.assertEqual(self.client.page_comment("p1","p1_post","link","uid"),"comment")
 
     def test_http_error_preserves_sanitized_status_and_code(self):

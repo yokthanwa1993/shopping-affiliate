@@ -111,6 +111,19 @@ class IDBridgeClient:
             raise IDBridgeError("graph_readback_failed")
         return payload
 
+    def graph_post_as_page(self, account: str, page_id: str, path: str,
+                           body: Dict[str, Any]) -> Dict[str, Any]:
+        if not account or not page_id:
+            raise IDBridgeError("facebook_page_identity_missing")
+        payload = self._request(
+            "/graph", method="POST", timeout=45,
+            query={"account": account, "as_page": page_id, "path": path},
+            body=body,
+        )
+        if not isinstance(payload, dict) or payload.get("error"):
+            raise IDBridgeError("graph_page_write_failed")
+        return payload
+
     def shopee_accounts(self) -> List[Dict[str, Any]]:
         data = self._request("/accounts", timeout=30)
         if not isinstance(data, list):
@@ -190,6 +203,42 @@ class IDBridgeClient:
             "source": source, "story_id": story_id, "video_id": video_id,
             "post_url": str(payload.get("post_url") or "").strip(),
         }
+
+    def post_reel_draft(self, page_id: str, video_url: str, account: str,
+                        expected_source: str = "postcron_reels") -> Dict[str, str]:
+        payload = self._request("/post", method="POST", timeout=210, body={
+            "page_id": page_id,
+            "video_url": video_url,
+            "account": account,
+            "reel_draft": True,
+        })
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            code = payload.get("error") if isinstance(payload, dict) else "post_reel_draft_failed"
+            raise IDBridgeError("facebook_post_reel_draft_failed:" + redact_error(code))
+        source = str(payload.get("source") or "").strip()
+        story_id = str(payload.get("story_id") or "").strip()
+        video_id = str(payload.get("video_id") or "").strip()
+        if source != expected_source:
+            raise IDBridgeError("facebook_post_source_mismatch")
+        if not story_id or not video_id or payload.get("published_to_page") is not False:
+            raise IDBridgeError("facebook_reel_draft_identity_missing")
+        return {
+            "source": source,
+            "story_id": story_id,
+            "video_id": video_id,
+            "post_url": str(payload.get("post_url") or "").strip(),
+        }
+
+    def publish_reel_draft(self, page_id: str, video_id: str, message: str,
+                           account: str) -> None:
+        payload = self._request(
+            "/post", method="POST", timeout=90,
+            body={"page_id": page_id, "video_id": video_id,
+                  "message": message, "account": account,
+                  "publish_reel_draft": True},
+        )
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise IDBridgeError("facebook_reel_publish_unconfirmed")
 
     def page_comment(self, page_id: str, story_id: str, message: str, account: str) -> str:
         payload = self._request("/page-comment", method="POST", timeout=45, body={

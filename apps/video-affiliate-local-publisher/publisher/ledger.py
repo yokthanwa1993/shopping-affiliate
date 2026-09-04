@@ -13,19 +13,21 @@ class LedgerError(RuntimeError):
 
 
 POSTED_STATES = (
-    "existing_story_bound", "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
+    "draft_confirmed", "existing_story_bound", "post_confirmed", "final_shortlink_ok",
+    "comment_pending", "verifying",
     "post_success_comment_failed", "post_success_verification_failed", "success",
 )
 COMMENT_RETRY_BASE_SECONDS = 5 * 60
 COMMENT_RETRY_MAX_SECONDS = 6 * 60 * 60
 TERMINAL_STATES = (
     "failed_pre_post", "post_outcome_unknown", "post_success_comment_failed",
-    "post_success_verification_failed", "blocked_human_gate", "success", "shadow_ready",
+    "post_success_verification_failed", "publish_outcome_unknown",
+    "blocked_human_gate", "success", "shadow_ready",
 )
 PAGE_BLOCKING_STATES = (
-    "posting", "stale_posting_review", "existing_story_bound", "post_confirmed",
+    "posting", "stale_posting_review", "draft_confirmed", "existing_story_bound", "post_confirmed",
     "final_shortlink_ok", "comment_pending", "verifying",
-    "post_outcome_unknown", "post_success_verification_failed",
+    "post_outcome_unknown", "publish_outcome_unknown", "post_success_verification_failed",
 )
 ALLOWED_TRANSITIONS = {
     "claimed": {"source_resolved", "failed_pre_post"},
@@ -34,11 +36,13 @@ ALLOWED_TRANSITIONS = {
     "avatar_composing": {"avatar_ready", "failed_pre_post"},
     "avatar_ready": {"shortlink_preflight_ok", "shadow_ready", "failed_pre_post"},
     "shortlink_preflight_ok": {"posting", "failed_pre_post", "blocked_human_gate"},
-    "posting": {"post_confirmed", "stale_posting_review", "post_outcome_unknown"},
+    "posting": {"draft_confirmed", "post_confirmed", "stale_posting_review", "post_outcome_unknown"},
+    "draft_confirmed": {"final_shortlink_ok", "post_success_comment_failed"},
     "stale_posting_review": {"existing_story_bound", "post_outcome_unknown"},
     "existing_story_bound": {"final_shortlink_ok", "post_success_comment_failed"},
     "post_confirmed": {"final_shortlink_ok", "post_success_comment_failed"},
-    "final_shortlink_ok": {"comment_pending", "post_success_comment_failed"},
+    "final_shortlink_ok": {"comment_pending", "publish_outcome_unknown", "post_success_comment_failed"},
+    "publish_outcome_unknown": {"comment_pending"},
     "comment_pending": {"verifying", "post_success_comment_failed"},
     "verifying": {"success", "post_success_verification_failed"},
     "post_success_comment_failed": {"final_shortlink_ok", "comment_pending", "verifying"},
@@ -114,6 +118,7 @@ CREATE TABLE IF NOT EXISTS post_attempts(
   comment_id TEXT NOT NULL DEFAULT '',
   preflight_shortlink TEXT NOT NULL DEFAULT '',
   final_shortlink TEXT NOT NULL DEFAULT '',
+  final_caption TEXT NOT NULL DEFAULT '',
   posting_source TEXT NOT NULL DEFAULT '',
   error_code TEXT NOT NULL DEFAULT '',
   error_detail_redacted TEXT NOT NULL DEFAULT '',
@@ -128,11 +133,11 @@ CREATE TABLE IF NOT EXISTS post_attempts(
 DROP INDEX IF EXISTS ux_posted_page_content;
 CREATE UNIQUE INDEX ux_posted_page_content
   ON post_attempts(page_id,studio_content_id)
-  WHERE state IN ('existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
+  WHERE state IN ('draft_confirmed','existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
 DROP INDEX IF EXISTS ux_posted_page_sha;
 CREATE UNIQUE INDEX ux_posted_page_sha
   ON post_attempts(page_id,source_sha256)
-  WHERE source_sha256!='' AND state IN ('existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
+  WHERE source_sha256!='' AND state IN ('draft_confirmed','existing_story_bound','post_confirmed','final_shortlink_ok','comment_pending','verifying','post_success_comment_failed','post_success_verification_failed','success');
 CREATE TABLE IF NOT EXISTS leases(
   lease_key TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL,
@@ -184,6 +189,10 @@ class Ledger:
                 )
             if "comment_retry_at" not in attempt_columns:
                 conn.execute("ALTER TABLE post_attempts ADD COLUMN comment_retry_at INTEGER")
+            if "final_caption" not in attempt_columns:
+                conn.execute(
+                    "ALTER TABLE post_attempts ADD COLUMN final_caption TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute("""
                 UPDATE post_attempts
                 SET comment_retry_count=CASE
@@ -480,6 +489,7 @@ class Ledger:
         allowed_fields = {
             "source_sha256", "avatar_version", "fb_video_id", "fb_story_id", "fb_post_tail",
             "permalink", "comment_id", "preflight_shortlink", "final_shortlink", "posting_source",
+            "final_caption",
             "error_code", "error_detail_redacted", "comment_retry_count", "comment_retry_at",
             "posted_at", "completed_at",
         }

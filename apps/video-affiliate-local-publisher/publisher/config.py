@@ -36,6 +36,7 @@ class PageConfig:
     shopee_account: str
     affiliate_id: str
     facebook_account: str
+    reels_account: str
     power_editor_account: str
     posting_source: str
     avatar_enabled: bool
@@ -123,6 +124,7 @@ def _page(raw: Dict[str, Any]) -> PageConfig:
         shopee_account=_text(raw.get("shopee_account")),
         affiliate_id=_text(raw.get("affiliate_id")),
         facebook_account=_text(raw.get("facebook_account")),
+        reels_account=_text(raw.get("reels_account")) or _text(raw.get("facebook_account")),
         power_editor_account=_text(raw.get("power_editor_account")),
         posting_source=posting_source,
         avatar_enabled=_boolean(raw.get("avatar_enabled"), True),
@@ -178,7 +180,7 @@ def load_config(path: Optional[Path] = None) -> AppConfig:
                 continue
             required = [
                 page.campaign_sub1, page.shopee_account, page.affiliate_id,
-                page.facebook_account, page.power_editor_account,
+                page.facebook_account, page.reels_account, page.power_editor_account,
             ]
             if any(not value for value in required):
                 raise ConfigError(f"write_page_config_incomplete:{page.page_id}")
@@ -229,6 +231,7 @@ def safe_config_summary(config: AppConfig) -> Dict[str, Any]:
                 "avatar_present": page.avatar_path.is_file() if page.avatar_enabled else True,
                 "campaign_present": bool(page.campaign_sub1),
                 "facebook_account_present": bool(page.facebook_account),
+                "reels_account_present": bool(page.reels_account),
                 "power_editor_account_present": bool(page.power_editor_account),
             }
             for page in config.pages

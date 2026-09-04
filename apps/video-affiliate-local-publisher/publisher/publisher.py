@@ -25,6 +25,10 @@ class PublisherError(RuntimeError):
 
 
 URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+SHOPEE_ACCOUNT_BY_AFFILIATE = {
+    "15130770000": "1508173077",  # CHEARB
+    "15142270000": "5215994227",  # NEEZS
+}
 CHEARB_PAGE_ID = "1008898512617594"
 CAPTION_LINK_PIN_PREFIX = "📌 พิกัด : "
 CHEARB_CAPTION_HASHTAG_LIMIT = 3
@@ -406,15 +410,18 @@ class PublisherEngine:
             pass
 
     def _verify_live_readback(self, page: PageConfig, story_id: str,
-                              comment_id: str, expected_comment: str) -> Dict[str, str]:
+                              comment_id: str, expected_comment: str,
+                              expected_caption: str = "") -> Dict[str, str]:
         post = self.idbridge.graph_get(
             page.power_editor_account, story_id,
-            {"fields": "id,permalink_url,created_time,is_published"},
+            {"fields": "id,message,permalink_url,created_time,is_published"},
         )
         if str(post.get("id") or "") != story_id:
             raise PublisherError("post_readback_identity_mismatch")
         if post.get("is_published") is not True:
             raise PublisherError("post_readback_not_published")
+        if expected_caption and str(post.get("message") or "").strip() != expected_caption.strip():
+            raise PublisherError("post_readback_caption_mismatch")
         comment = self.idbridge.graph_get(
             page.power_editor_account, comment_id,
             {"fields": "id,parent,from,message"},
@@ -614,19 +621,86 @@ class PublisherEngine:
         if str(graph_page.get("id") or "") != page.page_id:
             raise PublisherError("power_editor_page_readback_failed")
         accounts = self.idbridge.shopee_accounts()
-        if not any(str(row.get("account") or row.get("spc_u") or "") == page.shopee_account for row in accounts):
+        expected_account = self._shopee_session_account(page)
+        available = {
+            str(row.get("account") or row.get("spc_u") or "") for row in accounts
+        }
+        if expected_account not in available and str(page.shopee_account) not in available:
             raise PublisherError("shopee_account_unavailable")
+
+    @staticmethod
+    def _shopee_session_account(page: PageConfig) -> str:
+        configured = str(page.shopee_account or "").strip()
+        expected = SHOPEE_ACCOUNT_BY_AFFILIATE.get(str(page.affiliate_id or "").strip())
+        if expected:
+            if configured not in {expected, str(page.affiliate_id).strip()}:
+                raise PublisherError("shopee_account_affiliate_mismatch")
+            return expected
+        return configured
 
     def _final_shortlink(self, page: PageConfig, source_url: str,
                          preflight_link: str, post_tail: str) -> str:
-        if page.page_id == CHEARB_PAGE_ID:
-            if not preflight_link:
-                raise PublisherError("chearb_shared_shortlink_missing")
-            return preflight_link
+        del preflight_link
         return self.idbridge.shorten(
-            source_url, page.shopee_account, page.affiliate_id,
+            source_url, self._shopee_session_account(page), page.affiliate_id,
             page.campaign_sub1, page.page_id, post_tail,
         )
+
+    @staticmethod
+    def _caption_item_with_shortlink(item: StudioItem, shortlink: str) -> StudioItem:
+        return StudioItem(
+            content_id=item.content_id,
+            ready_message_id=item.ready_message_id,
+            ready_video_url=item.ready_video_url,
+            shopee_url=shortlink,
+            lazada_url=item.lazada_url,
+            caption=item.caption,
+            ready_at=item.ready_at,
+            product_name=str(getattr(item, "product_name", "") or ""),
+            hashtags=tuple(getattr(item, "hashtags", ()) or ()),
+        )
+
+    def _source_item_for_attempt(self, attempt_id: str) -> StudioItem:
+        row = self.ledger.attempt(attempt_id)
+        source = dict(self.ledger.source_item(int(row["studio_content_id"])))
+        source_caption = str(source.get("caption") or "").strip()
+        lines = [line.strip() for line in source_caption.splitlines() if line.strip()]
+        hashtags: tuple[str, ...] = ()
+        if lines and lines[-1].startswith("#"):
+            hashtags = tuple(
+                token for token in lines.pop().split() if token.startswith("#")
+            )
+        product_name = " ".join(lines).strip()
+        return StudioItem(
+            content_id=int(row["studio_content_id"]),
+            ready_message_id=str(source.get("editor_message_id") or ""),
+            ready_video_url="",
+            shopee_url=str(source.get("shopee_url") or ""),
+            lazada_url=str(source.get("lazada_url") or ""),
+            caption=source_caption,
+            ready_at=str(source.get("ready_at") or ""),
+            product_name=product_name,
+            hashtags=hashtags,
+        )
+
+    def _publish_draft_with_final_caption(self, page: PageConfig, story_id: str,
+                                          video_id: str,
+                                          caption: str) -> Dict[str, str]:
+        self.idbridge.publish_reel_draft(
+            page.page_id, video_id, caption,
+            getattr(page, "reels_account", page.facebook_account),
+        )
+        post = self.idbridge.graph_get(
+            page.power_editor_account, story_id,
+            {"fields": "id,message,permalink_url,is_published"},
+        )
+        if str(post.get("id") or "") != story_id or post.get("is_published") is not True:
+            raise PublisherError("facebook_draft_publish_readback_failed")
+        if str(post.get("message") or "").strip() != caption.strip():
+            raise PublisherError("facebook_draft_caption_readback_failed")
+        return {
+            "post_url": str(post.get("permalink_url") or "").strip(),
+        }
 
     def _publish_real(self, page: PageConfig, item: StudioItem, attempt_id: str,
                       composed_path: Path) -> Dict[str, Any]:
@@ -634,55 +708,39 @@ class PublisherEngine:
             raise PublisherError("external_writes_disabled")
         self._preflight_identity(page)
         preflight_raw = self.idbridge.shorten(
-            item.shopee_url, page.shopee_account, page.affiliate_id,
+            item.shopee_url, self._shopee_session_account(page), page.affiliate_id,
             page.campaign_sub1, page.page_id, "",
         )
         preflight = (
             preflight_raw.removesuffix("?lp=aff")
             .removesuffix("&lp=aff")
         )
-        self.ledger.transition(attempt_id, "shortlink_preflight_ok", {"preflight_shortlink": preflight})
-        caption_item = item
-        if page.page_id == CHEARB_PAGE_ID:
-            caption_item = StudioItem(
-                content_id=item.content_id,
-                ready_message_id=item.ready_message_id,
-                ready_video_url=item.ready_video_url,
-                shopee_url=preflight,
-                lazada_url=item.lazada_url,
-                caption=item.caption,
-                ready_at=item.ready_at,
-                product_name=str(getattr(item, "product_name", "") or ""),
-                hashtags=tuple(getattr(item, "hashtags", ()) or ()),
-            )
-        caption = self.caption(page, caption_item)
+        self.ledger.transition(
+            attempt_id, "shortlink_preflight_ok", {"preflight_shortlink": preflight},
+        )
         with AssetServer() as server:
             video_url = server.register(composed_path)
             self.ledger.transition(attempt_id, "posting")
             try:
-                posted = self.idbridge.post(
-                    page.page_id, video_url, caption, page.facebook_account,
-                    page.posting_source,
+                posted = self.idbridge.post_reel_draft(
+                    page.page_id, video_url,
+                    getattr(page, "reels_account", page.facebook_account),
                 )
             except IDBridgeHTTPError as exc:
-                if exc.status == 403 and exc.code == "page_token_not_found":
+                if exc.status == 403 and exc.code in {
+                    "page_token_not_found", "postcron_page_token_not_found",
+                }:
                     self.ledger.transition(attempt_id, "post_outcome_unknown", {
                         "error_code": "post_outcome_unknown",
                         "error_detail_redacted": "idbridge_http_403:page_token_not_found",
                     })
                     self.ledger.resolve_unknown_no_post(
-                        attempt_id,
-                        "idbridge_rejected_before_upload",
+                        attempt_id, "idbridge_rejected_before_upload",
                     )
                     self._notify_failure(
-                        page.page_id,
-                        attempt_id,
-                        "operator_confirmed_no_post",
-                        exc,
+                        page.page_id, attempt_id, "operator_confirmed_no_post", exc,
                     )
                     raise
-                # Once /post may have reached Facebook, every other HTTP error remains
-                # outcome-unknown until reconciled. Never classify it as safe to retry.
                 self.ledger.transition(attempt_id, "post_outcome_unknown", {
                     "error_code": "post_outcome_unknown",
                     "error_detail_redacted": redact_error(exc),
@@ -690,8 +748,6 @@ class PublisherEngine:
                 self._notify_failure(page.page_id, attempt_id, "post_outcome_unknown", exc)
                 raise
             except IDBridgeError as exc:
-                # Once /post has been invoked, every transport or application error is
-                # outcome-unknown until reconciled. Never classify it as safe to retry.
                 self.ledger.transition(attempt_id, "post_outcome_unknown", {
                     "error_code": "post_outcome_unknown",
                     "error_detail_redacted": redact_error(exc),
@@ -699,24 +755,47 @@ class PublisherEngine:
                 self._notify_failure(page.page_id, attempt_id, "post_outcome_unknown", exc)
                 raise
         story_id, post_tail = self.canonical_story(page.page_id, posted["story_id"])
-        self.ledger.transition(attempt_id, "post_confirmed", {
+        self.ledger.transition(attempt_id, "draft_confirmed", {
             "fb_video_id": posted["video_id"],
             "fb_story_id": story_id,
             "fb_post_tail": post_tail,
             "permalink": posted.get("post_url", ""),
             "posting_source": posted["source"],
-            "posted_at": int(time.time()),
         })
-        self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
         try:
             final_link = self._final_shortlink(
                 page, item.shopee_url, preflight, post_tail,
             )
-            self.ledger.transition(attempt_id, "final_shortlink_ok", {"final_shortlink": final_link})
+            final_item = (
+                self._caption_item_with_shortlink(item, final_link)
+                if page.page_id == CHEARB_PAGE_ID else item
+            )
+            final_caption = self.caption(page, final_item)
+            self.ledger.transition(attempt_id, "final_shortlink_ok", {
+                "final_shortlink": final_link,
+                "final_caption": final_caption,
+            })
+            try:
+                published = self._publish_draft_with_final_caption(
+                    page, story_id, posted["video_id"], final_caption,
+                )
+            except Exception as exc:
+                self.ledger.transition(attempt_id, "publish_outcome_unknown", {
+                    "error_code": "publish_outcome_unknown",
+                    "error_detail_redacted": redact_error(exc),
+                })
+                self._notify_failure(
+                    page.page_id, attempt_id, "publish_outcome_unknown", exc,
+                )
+                raise
+            self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
             comment = page.comment_template.format(shortlink=final_link).strip()
             if final_link not in comment:
                 raise PublisherError("comment_template_missing_shortlink")
-            self.ledger.transition(attempt_id, "comment_pending")
+            self.ledger.transition(attempt_id, "comment_pending", {
+                "permalink": published.get("post_url", ""),
+                "posted_at": int(time.time()),
+            })
             if self.config.comment_delay_seconds:
                 time.sleep(self.config.comment_delay_seconds)
             comment_id = self.idbridge.page_comment(
@@ -731,9 +810,11 @@ class PublisherEngine:
                     "state": "success", "fb_story_id": story_id,
                     "fb_video_id": str(row["fb_video_id"] or posted["video_id"]),
                     "comment_id": str(row["comment_id"] or ""),
-                    "permalink": str(row["permalink"] or posted.get("post_url", "")),
+                    "permalink": str(row["permalink"] or ""),
                 }
-            if row["state"] != "post_success_comment_failed":
+            if str(row["state"]) not in {
+                "post_success_comment_failed", "publish_outcome_unknown",
+            }:
                 self.ledger.record_comment_failure(
                     attempt_id, _error_code(exc), redact_error(exc),
                 )
@@ -748,11 +829,13 @@ class PublisherEngine:
                 "state": "success", "fb_story_id": story_id,
                 "fb_video_id": str(current["fb_video_id"] or posted["video_id"]),
                 "comment_id": str(current["comment_id"] or comment_id),
-                "permalink": str(current["permalink"] or posted.get("post_url", "")),
+                "permalink": str(current["permalink"] or ""),
             }
         self.ledger.transition(attempt_id, "verifying", {"comment_id": comment_id})
         try:
-            readback = self._verify_live_readback(page, story_id, comment_id, comment)
+            readback = self._verify_live_readback(
+                page, story_id, comment_id, comment, final_caption,
+            )
         except Exception as exc:
             current = self.ledger.attempt(attempt_id)
             if str(current["state"]) == "success":
@@ -762,7 +845,7 @@ class PublisherEngine:
                     "state": "success", "fb_story_id": story_id,
                     "fb_video_id": str(current["fb_video_id"] or posted["video_id"]),
                     "comment_id": str(current["comment_id"] or comment_id),
-                    "permalink": str(current["permalink"] or posted.get("post_url", "")),
+                    "permalink": str(current["permalink"] or ""),
                 }
             self.ledger.record_verification_failure(
                 attempt_id, _error_code(exc), redact_error(exc),
@@ -770,7 +853,7 @@ class PublisherEngine:
             self._notify_failure(page.page_id, attempt_id, "post_success_verification_failed", exc)
             raise
         self.ledger.transition(attempt_id, "success", {
-            "permalink": readback.get("permalink") or posted.get("post_url", ""),
+            "permalink": readback.get("permalink") or str(current["permalink"] or ""),
             "error_code": "",
             "error_detail_redacted": "",
         })
@@ -943,6 +1026,7 @@ class PublisherEngine:
                     row = self.ledger.attempt(attempt_id)
                     if row["state"] not in {
                         "failed_pre_post", "post_outcome_unknown",
+                        "publish_outcome_unknown",
                         "post_success_comment_failed", "post_success_verification_failed",
                         "success",
                     }:
@@ -982,8 +1066,10 @@ class PublisherEngine:
         row = self.ledger.attempt(attempt_id)
         state = str(row["state"])
         recoverable = {
-            "existing_story_bound", "post_confirmed", "final_shortlink_ok", "comment_pending", "verifying",
-            "post_success_comment_failed", "post_success_verification_failed",
+            "draft_confirmed", "existing_story_bound", "post_confirmed",
+            "final_shortlink_ok", "comment_pending", "verifying",
+            "publish_outcome_unknown", "post_success_comment_failed",
+            "post_success_verification_failed",
         }
         if state not in recoverable:
             raise PublisherError("reconcile_state_invalid")
@@ -993,17 +1079,62 @@ class PublisherEngine:
         if not story_id:
             raise PublisherError("reconcile_story_missing")
         final_link = str(row["final_shortlink"] or "")
-        if state in {"existing_story_bound", "post_confirmed"} or not final_link:
+        initial_state = state
+        final_caption = str(dict(row).get("final_caption") or "")
+        if state == "publish_outcome_unknown":
+            post = self.idbridge.graph_get(
+                page.power_editor_account, story_id,
+                {"fields": "id,message,permalink_url,is_published"},
+            )
+            if (
+                str(post.get("id") or "") != story_id
+                or post.get("is_published") is not True
+                or str(post.get("message") or "").strip() != final_caption.strip()
+            ):
+                raise PublisherError("publish_outcome_requires_review")
+            self.ledger.transition(attempt_id, "comment_pending", {
+                "permalink": str(post.get("permalink_url") or ""),
+                "posted_at": int(time.time()),
+                "error_code": "",
+                "error_detail_redacted": "",
+            })
+            self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
+            state = "comment_pending"
+        if state in {"draft_confirmed", "existing_story_bound", "post_confirmed"} or not final_link:
             preflight_link = str(row["preflight_shortlink"] or "").strip()
-            source_url = ""
-            if page.page_id != CHEARB_PAGE_ID:
-                source = self.ledger.source_item(int(row["studio_content_id"]))
-                source_url = str(source["shopee_url"])
+            source = self.ledger.source_item(int(row["studio_content_id"]))
+            source_url = str(source["shopee_url"])
             final_link = self._final_shortlink(
                 page, source_url, preflight_link, str(row["fb_post_tail"] or ""),
             )
-            self.ledger.transition(attempt_id, "final_shortlink_ok", {"final_shortlink": final_link})
+            current_item = self._source_item_for_attempt(attempt_id)
+            final_item = (
+                self._caption_item_with_shortlink(current_item, final_link)
+                if page.page_id == CHEARB_PAGE_ID else current_item
+            )
+            final_caption = self.caption(page, final_item)
+            self.ledger.transition(attempt_id, "final_shortlink_ok", {
+                "final_shortlink": final_link,
+                "final_caption": final_caption,
+            })
             state = "final_shortlink_ok"
+        if state == "final_shortlink_ok" and initial_state not in {
+            "existing_story_bound", "post_confirmed",
+        }:
+            if not final_caption:
+                raise PublisherError("final_caption_missing")
+            published = self._publish_draft_with_final_caption(
+                page, story_id, str(row["fb_video_id"] or ""), final_caption,
+            )
+            self.ledger.transition(attempt_id, "comment_pending", {
+                "permalink": published.get("post_url", ""),
+                "posted_at": int(time.time()),
+            })
+            self.ledger.advance_page_after_post(page.page_id, page.interval_minutes)
+            state = "comment_pending"
+        elif state == "final_shortlink_ok":
+            self.ledger.transition(attempt_id, "comment_pending")
+            state = "comment_pending"
         comment = page.comment_template.format(shortlink=final_link).strip()
         if final_link not in comment:
             raise PublisherError("comment_template_missing_shortlink")
@@ -1034,8 +1165,15 @@ class PublisherEngine:
                     raise
         if not comment_id:
             raise PublisherError("reconcile_comment_missing")
+        expected_live_caption = (
+            final_caption
+            if final_caption and initial_state not in {"existing_story_bound", "post_confirmed"}
+            else ""
+        )
         try:
-            readback = self._verify_live_readback(page, story_id, comment_id, comment)
+            readback = self._verify_live_readback(
+                page, story_id, comment_id, comment, expected_live_caption,
+            )
         except Exception as exc:
             if state == "verifying":
                 self.ledger.record_verification_failure(
@@ -1150,6 +1288,9 @@ class PublisherEngine:
             "strict_ready": self.studio.strict_ready_count(),
             "ledger": self.ledger.summary(),
             "unknown_outcomes": len(self.ledger.attempts_in_states(["post_outcome_unknown"])),
+            "publish_unknown_outcomes": len(
+                self.ledger.attempts_in_states(["publish_outcome_unknown"])
+            ),
             "comment_backlog": len(self.ledger.attempts_in_states(["post_success_comment_failed"])),
             "due_comment_retries": len(self.ledger.due_comment_retries(limit=1000)),
             "verification_backlog": len(self.ledger.attempts_in_states(["post_success_verification_failed"])),
